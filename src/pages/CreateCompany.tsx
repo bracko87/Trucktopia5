@@ -6,25 +6,15 @@
 
 import React, { useEffect, useState } from 'react'
 import Layout from '../components/Layout'
-import { getTable, insertRow } from '../lib/supabase'
+import { CityRow, fetchCities, createCompanyWithBootstrap } from '../lib/db'
 import { useAuth } from '../context/AuthContext'
 import { useNavigate } from 'react-router'
 
 /**
- * CityRow
- *
- * Represents a city row in public.cities.
- */
-interface CityRow {
-  id: number
-  country: string
-  city: string
-}
-
-/**
  * CreateCompanyPage
  *
- * Allows a user to create their company, selecting country and city from public.cities.
+ * Allows a user to create their company, selecting country and city from public.cities,
+ * and bootstraps hubs and starter leases via createCompanyWithBootstrap.
  */
 export default function CreateCompanyPage() {
   const { user } = useAuth()
@@ -33,43 +23,62 @@ export default function CreateCompanyPage() {
   const [cities, setCities] = useState<CityRow[]>([])
   const [countries, setCountries] = useState<string[]>([])
   const [selectedCountry, setSelectedCountry] = useState<string>('')
-  const [selectedCity, setSelectedCity] = useState<string>('')
+  const [selectedCityId, setSelectedCityId] = useState<string>('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   /**
-   * fetchCities
+   * loadCities
    *
-   * Load cities from Supabase public.cities.
+   * Load cities from Supabase public.cities (using real schema).
    */
-  async function fetchCities() {
-    const res = await getTable('cities', '?select=country,city,id&order=country.asc')
-    const data = res.data || []
+  async function loadCities() {
+    const res = await fetchCities()
+    const data = (Array.isArray(res.data) ? res.data : []) as CityRow[]
     setCities(data)
-    const uniq = Array.from(new Set(data.map((d: CityRow) => d.country)))
-    setCountries(uniq)
-    if (uniq.length) setSelectedCountry(uniq[0])
+
+    const uniqCountries = Array.from(
+      new Set(
+        data
+          .map((c) => c.country_name)
+          .filter((v): v is string => typeof v === 'string' && v.length > 0)
+      )
+    )
+    setCountries(uniqCountries)
+
+    if (uniqCountries.length > 0) {
+      const firstCountry = uniqCountries[0]
+      setSelectedCountry(firstCountry)
+      const firstCity = data.find((c) => c.country_name === firstCountry)
+      if (firstCity && firstCity.id) {
+        setSelectedCityId(firstCity.id)
+      }
+    }
   }
 
   useEffect(() => {
-    fetchCities()
+    loadCities()
   }, [])
 
   useEffect(() => {
-    // when country changes, set the first city of that country by default
-    const first = cities.find((c) => c.country === selectedCountry)
-    if (first) setSelectedCity(first.city)
+    // When country changes, set the first city of that country by default
+    if (!selectedCountry || cities.length === 0) return
+    const first = cities.find((c) => c.country_name === selectedCountry && c.id)
+    if (first && first.id) {
+      setSelectedCityId(first.id)
+    }
   }, [selectedCountry, cities])
 
   /**
    * handleCreate
    *
-   * Insert a company row linked to the authenticated user.
+   * Creates a company for the current user and bootstraps hub + starter lease.
    */
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     setError('')
-    if (!companyName || !selectedCountry || !selectedCity) {
+
+    if (!companyName || !selectedCountry || !selectedCityId) {
       setError('Please complete all fields.')
       return
     }
@@ -77,16 +86,19 @@ export default function CreateCompanyPage() {
       setError('You must be signed in.')
       return
     }
-    setLoading(true)
-    const row = {
-      owner_id: user.id,
-      name: companyName,
-      country: selectedCountry,
-      city: selectedCity,
+
+    const selectedCity = cities.find((c) => c.id === selectedCityId)
+    if (!selectedCity) {
+      setError('Please select a valid city.')
+      return
     }
-    const res = await insertRow('companies', row)
+
+    setLoading(true)
+    const email = user.email || ''
+    const res = await createCompanyWithBootstrap(user.id, email, selectedCity, companyName)
     setLoading(false)
-    if (res && (res.status === 201 || res.status === 200)) {
+
+    if (res && (res.status === 200 || res.status === 201)) {
       nav('/dashboard')
     } else {
       setError('Unable to create company. Ensure the database and policies are configured.')
@@ -97,7 +109,10 @@ export default function CreateCompanyPage() {
     <Layout>
       <div className="max-w-2xl mx-auto">
         <h2 className="text-2xl font-bold mb-4">Create your Company</h2>
-        <p className="mb-4 text-black/70">Choose a company name and a hub city to start.</p>
+        <p className="mb-4 text-black/70">
+          Choose a company name and a hub city to start. New companies receive a starting balance
+          and a starter truck lease.
+        </p>
         {error && <div className="text-red-600 mb-3">{error}</div>}
         <form onSubmit={handleCreate} className="space-y-4 bg-white p-6 rounded shadow">
           <div>
@@ -127,15 +142,15 @@ export default function CreateCompanyPage() {
           <div>
             <label className="block text-sm font-medium">City</label>
             <select
-              value={selectedCity}
-              onChange={(e) => setSelectedCity(e.target.value)}
+              value={selectedCityId}
+              onChange={(e) => setSelectedCityId(e.target.value)}
               className="w-full border px-3 py-2 rounded"
             >
               {cities
-                .filter((c) => c.country === selectedCountry)
+                .filter((c) => c.country_name === selectedCountry)
                 .map((c) => (
-                  <option key={c.id} value={c.city}>
-                    {c.city}
+                  <option key={c.id} value={c.id}>
+                    {c.city_name}
                   </option>
                 ))}
             </select>

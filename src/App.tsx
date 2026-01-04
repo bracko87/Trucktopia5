@@ -10,6 +10,7 @@ import RegisterPage from './pages/Register'
 import CreateCompanyPage from './pages/CreateCompany'
 import DashboardPage from './pages/Dashboard'
 import LoginPage from './pages/Login'
+import SeedCitiesPage from './pages/SeedCities'
 import { AuthProvider } from './context/AuthContext'
 
 /**

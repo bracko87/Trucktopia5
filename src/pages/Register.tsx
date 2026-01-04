@@ -2,6 +2,11 @@
  * Register.tsx
  *
  * Registration page where users create an account.
+ *
+ * Purpose:
+ * - Provide a registration form and call AuthContext.signUp to register users.
+ * - Do NOT pre-insert public.users rows from the client (prevents anonymous rows with null auth_user_id).
+ * - Rely on AuthContext.signUp and ensureUserProfile to create/patch the DB profile server-side.
  */
 
 import React, { useState } from 'react'
@@ -12,22 +17,30 @@ import { useAuth } from '../context/AuthContext'
  * RegisterPage
  *
  * Presents a registration form with basic validation.
+ * This component intentionally does NOT create a public.users row client-side before sign up.
+ * The server-side ensureUserProfile logic (called from AuthContext.signUp) will handle creating
+ * or linking the DB profile so public.users.id == auth.uid() where possible.
  */
-export default function RegisterPage() {
+export default function RegisterPage(): JSX.Element {
   const nav = useNavigate()
   const { signUp } = useAuth()
   const [form, setForm] = useState({ username: '', email: '', password: '', password2: '' })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
 
   /**
    * handleSubmit
    *
-   * Validate form and call signUp, then redirect to create-company.
+   * Validate the form and call AuthContext.signUp.
+   * On success navigate to create-company. No client-side DB inserts are performed here.
+   *
+   * @param e - form submit event
    */
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError('')
+    setInfo('')
 
     if (form.password.length < 8) {
       setError('Password must be at least 8 characters.')
@@ -43,21 +56,45 @@ export default function RegisterPage() {
     }
 
     setLoading(true)
-    const res = await signUp(form.email, form.password, form.username)
-    setLoading(false)
-    if (res && (res.status === 200 || res.status === 201)) {
-      // proceed to create company
-      nav('/create-company')
-    } else {
-      setError('Registration failed. Please ensure email is unique.')
+
+    try {
+      // Call signUp from AuthContext. AuthContext is responsible for setting the JWT
+      // and calling ensureUserProfile so the DB user is created/linked server-side.
+      const res = await signUp(form.email, form.password, form.username)
+      setLoading(false)
+
+      // Provide user-friendly messages depending on the response.
+      if (res && (res.status === 200 || res.status === 201)) {
+        // Typical success. The backend may require email confirmation.
+        setInfo('Registration successful. If your provider requires email confirmation, check your inbox.')
+        // Proceed to next step of flow (company creation). create-company will rely on server linkage.
+        nav('/create-company')
+      } else if (res && res.status === 400) {
+        setError('Invalid registration data. Please check your input.')
+        console.warn('signUp returned 400:', res)
+      } else {
+        // Generic fallback: surface server message if available
+        const serverMsg = (res && (res.data?.message || res.data?.error || JSON.stringify(res.data))) || ''
+        setError(
+          serverMsg
+            ? `Registration failed: ${serverMsg}`
+            : 'Registration failed. Please ensure email is unique or check your inbox for confirmation.'
+        )
+        console.warn('signUp response:', res)
+      }
+    } catch (err: any) {
+      setLoading(false)
+      setError(err?.message || 'Registration failed due to network error.')
+      console.error('signUp error:', err)
     }
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-yellow-400">
+    <div className="min-h-screen flex items-center justify-center bg-slate-900">
       <div className="w-full max-w-md bg-white rounded shadow p-6">
         <h2 className="text-2xl font-bold mb-4">Create your Tracktopia account</h2>
         {error && <div className="mb-3 text-red-600">{error}</div>}
+        {info && <div className="mb-3 text-green-700">{info}</div>}
         <form onSubmit={handleSubmit} className="space-y-3">
           <div>
             <label className="block text-sm font-medium">Username</label>
@@ -116,6 +153,10 @@ export default function RegisterPage() {
             </button>
           </div>
         </form>
+        <div className="mt-3 text-xs text-gray-500">
+          {/* Helpful debug hint for developers */}
+          <div>Note: client will not create users rows directly. Server ensures profile linkage.</div>
+        </div>
       </div>
     </div>
   )

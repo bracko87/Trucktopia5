@@ -12,14 +12,16 @@ import { useAuth } from '../context/AuthContext'
 /**
  * CompanyRow
  *
- * Minimal company type.
+ * Minimal company type aligned with public.companies schema.
  */
 interface CompanyRow {
   id: string
   owner_id: string
-  name: string
-  country: string
-  city: string
+  name: string | null
+  hub_city: string | null
+  hub_country: string | null
+  balance?: number | null
+  balance_cents?: number | null
   created_at?: string
 }
 
@@ -36,24 +38,24 @@ export default function DashboardPage() {
   /**
    * fetchCompany
    *
-   * Load the company owned by the current user.
+   * Load the company owned by the current user (owner_id = public.users.id).
    */
   async function fetchCompany() {
     if (!user) return
     const res = await getTable('companies', `?select=*&owner_id=eq.${user.id}`)
     const data = Array.isArray(res.data) ? res.data : []
-    setCompany(data[0] || null)
+    setCompany((data[0] as CompanyRow | undefined) || null)
   }
 
   /**
    * fetchStats
    *
-   * Basic stats queries.
+   * Basic stats queries (global, not per-company).
    */
   async function fetchStats() {
     const [trucksRes, jobsRes, citiesRes] = await Promise.all([
-      getTable('trucks', '?select=id'),
-      getTable('jobs', '?select=id'),
+      getTable('user_trucks', '?select=id'),
+      getTable('job_offers', '?select=id'),
       getTable('cities', '?select=id'),
     ])
     setStats({
@@ -68,6 +70,13 @@ export default function DashboardPage() {
     fetchStats()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user])
+
+  const balanceValue =
+    company && company.balance_cents != null
+      ? company.balance_cents / 100
+      : company && company.balance != null
+      ? company.balance
+      : 0
 
   return (
     <Layout>
@@ -84,9 +93,15 @@ export default function DashboardPage() {
             <h3 className="font-semibold mb-2">Company</h3>
             {company ? (
               <div>
-                <div className="text-lg font-bold">{company.name}</div>
+                <div className="text-lg font-bold">{company.name || 'Unnamed company'}</div>
                 <div className="text-sm text-black/70">
-                  Hub: {company.city}, {company.country}
+                  Hub: {company.hub_city || '—'}, {company.hub_country || '—'}
+                </div>
+                <div className="mt-2 text-sm">
+                  Balance:{' '}
+                  <span className="font-semibold">
+                    ${balanceValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  </span>
                 </div>
                 <div className="mt-4">
                   <button className="px-3 py-2 bg-black text-yellow-400 rounded">Manage Fleet</button>
@@ -101,11 +116,11 @@ export default function DashboardPage() {
             <h3 className="font-semibold mb-2">Stats</h3>
             <div className="space-y-2">
               <div className="flex justify-between">
-                <div>Trucks</div>
+                <div>Trucks (global)</div>
                 <div className="font-bold">{stats.trucks}</div>
               </div>
               <div className="flex justify-between">
-                <div>Jobs</div>
+                <div>Jobs (global)</div>
                 <div className="font-bold">{stats.jobs}</div>
               </div>
               <div className="flex justify-between">
