@@ -245,8 +245,28 @@ export async function ensureUserProfile(authUserId: string, email: string, usern
 /**
  * ensureStarterLeaseForCompany
  *
- * Ensures that a given company has at most one starter lease
- * for the specified truck model.
+ * Ensures that a given company has at most one starter lease for the specified truck model.
+ * Additionally this function will (best-effort):
+ *  - create a corresponding user_trucks row for the starter truck (so the company actually has a truck instance)
+ *  - update companies.trucks to reflect the current count of user_trucks for the company
+ *
+ * Non-fatal: failures to create the user_truck or update the companies count will be ignored
+ * so company creation is not blocked.
+ *
+ * @param ownerUserId - game user id (public.users.id)
+ * @param companyId - company id
+ * @param truckModelId - starter truck model id
+ */
+/**
+ * ensureStarterLeaseForCompany
+ *
+ * Ensures that a given company has at most one starter lease for the specified truck model.
+ * Additionally this function will (best-effort):
+ *  - create a corresponding user_trucks row for the starter truck (so the company actually has a truck instance)
+ *  - update companies.trucks to reflect the current count of user_trucks for the company
+ *
+ * This variant uses the modular helper createUserTruck and syncCompanyTruckCount so
+ * the operations are clearer and any errors are surfaced in the returned structure.
  *
  * @param ownerUserId - game user id (public.users.id)
  * @param companyId - company id
@@ -257,13 +277,14 @@ async function ensureStarterLeaseForCompany(
   companyId: string,
   truckModelId: string
 ) {
+  // Check if a starter lease already exists for this company/model.
   const existingRes = await getTable(
     'user_leases',
     `?select=id&owner_company_id=eq.${companyId}&asset_model_id=eq.${truckModelId}`
   )
   const rows = Array.isArray(existingRes.data) ? existingRes.data : []
   if (rows.length > 0) {
-    return existingRes
+    return { status: existingRes.status, data: rows[0], alreadyExists: true }
   }
 
   // Create starter lease
@@ -277,7 +298,95 @@ async function ensureStarterLeaseForCompany(
     is_active: true,
   }
 
-  return insertRow('user_leases', payload)
+  const leaseRes = await insertRow('user_leases', payload)
+
+  // If lease insert failed, return result so caller can inspect.
+  if (!(leaseRes && (leaseRes.status === 200 || leaseRes.status === 201))) {
+    return { status: leaseRes?.status ?? 0, error: leaseRes?.error ?? 'lease insert failed', data: leaseRes?.data ?? null }
+  }
+
+  // Best-effort: create a corresponding user_trucks row so the company has an actual truck instance.
+  let truckRes: any = null
+  try {
+    const userTruckPayload: any = {
+      master_truck_id: truckModelId,
+      owner_company_id: companyId,
+      owner_user_id: ownerUserId,
+      acquisition_type: 'starter',
+      condition_score: 100,
+      mileage_km: 0,
+      status: 'available',
+      is_active: true,
+    }
+
+    // Create the user_truck using the trucks module helper if available, otherwise fallback to insertRow.
+    try {
+      // dynamic import-like resolution: prefer modular helper if present
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const trucksModule = require('./db/modules/trucks') as any
+      if (trucksModule && typeof trucksModule.createUserTruck === 'function') {
+        truckRes = await trucksModule.createUserTruck(userTruckPayload)
+      } else {
+        truckRes = await insertRow('user_trucks', userTruckPayload)
+      }
+    } catch (e) {
+      // fallback to direct insert if require() failed (safe-guard)
+      truckRes = await insertRow('user_trucks', userTruckPayload)
+    }
+
+    // If truck creation failed, include info but continue to attempt syncing count.
+    if (!(truckRes && (truckRes.status === 200 || truckRes.status === 201))) {
+      // attempt to surface the error; continue
+    }
+
+    // recompute the trucks count for the company and patch companies.trucks
+    try {
+      // prefer modular sync helper
+      let syncRes: any = null
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const trucksModule = require('./db/modules/trucks') as any
+        if (trucksModule && typeof trucksModule.syncCompanyTruckCount === 'function') {
+          syncRes = await trucksModule.syncCompanyTruckCount(companyId)
+        } else {
+          const countRes = await getTable('user_trucks', `?select=id&owner_company_id=eq.${companyId}`)
+          const count = Array.isArray(countRes.data) ? countRes.data.length : 0
+          syncRes = await supabaseFetch(`/rest/v1/companies?id=eq.${companyId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ trucks: count }),
+            headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+          })
+        }
+      } catch {
+        // fallback manual count/patch
+        const countRes = await getTable('user_trucks', `?select=id&owner_company_id=eq.${companyId}`)
+        const count = Array.isArray(countRes.data) ? countRes.data.length : 0
+        await supabaseFetch(`/rest/v1/companies?id=eq.${companyId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ trucks: count }),
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+        })
+      }
+    } catch (err) {
+      // ignore failures updating count but include in returned structure
+      return {
+        status: leaseRes.status,
+        data: leaseRes.data,
+        truck: truckRes,
+        countSyncError: (err as any)?.message ?? String(err),
+      }
+    }
+  } catch (err) {
+    // non-fatal: return lease result and the truck insert error for debugging
+    return {
+      status: leaseRes.status,
+      data: leaseRes.data,
+      truckError: (err as any)?.message ?? String(err),
+    }
+  }
+
+  // Success: return lease + truck results (truckRes may be null if creation failed)
+  return { status: leaseRes.status, lease: leaseRes.data, truck: truckRes?.data ?? truckRes }
 }
 
 /**
@@ -285,7 +394,7 @@ async function ensureStarterLeaseForCompany(
  *
  * Creates a company for the given user and bootstraps:
  * - main hub in public.hubs
- * - starter lease in public.user_leases
+ * - starter lease in public.user_leases (and a starter user_trucks row via ensureStarterLeaseForCompany)
  *
  * If the user already has a company (owner_id match), returns the existing one
  * and does not create bonuses a second time.
@@ -372,11 +481,11 @@ export async function createCompanyWithBootstrap(
     }
   }
 
-  // 4) Ensure starter lease (best-effort)
+  // 4) Ensure starter lease (best-effort) -> now also creates a starter user_trucks row and updates companies.trucks
   try {
     await ensureStarterLeaseForCompany(publicUserId, companyId, STARTER_TRUCK_MODEL_ID)
   } catch {
-    // Non-fatal; game can still function without the starter lease
+    // Non-fatal; game can still function without the starter lease/truck
   }
 
   // 5) Best-effort: update public.users row to set company_id for immediate consistency.
