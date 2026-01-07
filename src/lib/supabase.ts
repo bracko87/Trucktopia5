@@ -1,19 +1,28 @@
 /**
  * supabase.ts
  *
- * Lightweight Supabase REST helper methods using fetch.
+ * Lightweight Supabase helpers using both:
+ * - The official Supabase JS client (@supabase/supabase-js) for auth, realtime,
+ *   and table helpers.
+ * - A low-level supabaseFetch wrapper for existing REST-style code paths
+ *   that call `/rest/v1/...` or `/auth/v1/...` directly.
  *
  * Responsibilities:
- * - Manage in-memory and persisted user JWT so PostgREST can evaluate auth.uid()
- * - Provide supabaseFetch wrapper used by the app for REST/Gotrue calls
- * - Provide small helpers: authSignUp, authSignIn, getTable, insertRow
+ * - Manage in-memory and persisted user JWT so PostgREST can evaluate auth.uid().
+ * - Expose a shared Supabase JS client instance (`supabase`) created via createClient.
+ * - Provide supabaseFetch wrapper used by the app for REST/Gotrue calls.
+ * - Provide small helpers: authSignUp, authSignIn, getTable, insertRow.
  *
  * Persistence:
- * - Stores a minimal session object in localStorage under the key SB_SESSION_KEY
+ * - Stores a minimal session object in localStorage under the key SB_SESSION_KEY.
  *
- * Note:
+ * Notes:
  * - Do NOT include secrets in source in production. This file is tailored to the demo iframe env.
+ * - Existing callers of supabaseFetch / authSignIn / authSignUp remain supported.
+ * - New code can prefer the `supabase` client for richer features (realtime, typed queries).
  */
+
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 
 /**
  * Session storage key
@@ -41,14 +50,103 @@ type StoredSession = {
 let AUTH_TOKEN: string | null = null
 
 /**
+ * Environment helpers for base URL and anon key.
+ *
+ * Tries:
+ * - process.env[...] (Node)
+ * - globalThis[...] (browser global injection)
+ * - provided fallback
+ *
+ * @param nodeKey - environment variable key for Node.js
+ * @param globalKey - globalThis key in browser
+ * @param fallback - default value when nothing is set
+ * @returns resolved environment value
+ */
+function getEnv(nodeKey: string, globalKey: string, fallback: string) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const proc: any = typeof process !== 'undefined' ? (process as any) : undefined
+    if (proc && proc.env && (proc.env[nodeKey] || proc.env[globalKey])) {
+      return proc.env[nodeKey] || proc.env[globalKey]
+    }
+  } catch {
+    // ignore
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g: any = globalThis as any
+  if (g && (g[globalKey] || g[nodeKey])) {
+    return g[globalKey] || g[nodeKey]
+  }
+
+  return fallback
+}
+
+let SUPABASE_URL = getEnv(
+  'REACT_APP_SUPABASE_URL',
+  'SUPABASE_URL',
+  'https://iiunrkztuhhbdgxzqqgq.supabase.co'
+)
+const SUPABASE_ANON_KEY = getEnv(
+  'REACT_APP_SUPABASE_ANON_KEY',
+  'SUPABASE_ANON_KEY',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
+)
+
+/**
+ * normalizeUrl
+ *
+ * Ensure the Supabase URL is in a safe canonical form:
+ * - Prepend https:// if protocol is missing.
+ * - Strip trailing slash.
+ *
+ * @param url - raw URL string
+ * @returns normalized URL
+ */
+function normalizeUrl(url: string) {
+  let u = String(url || '').trim()
+  if (!u) return u
+  if (!/^https?:\/\//i.test(u)) u = `https://${u}`
+  if (u.endsWith('/')) u = u.slice(0, -1)
+  return u
+}
+
+SUPABASE_URL = normalizeUrl(SUPABASE_URL)
+
+/**
+ * supabase
+ *
+ * Primary Supabase JS client created via createClient. Used for:
+ * - Auth flows (sign up / sign in / sign out)
+ * - Typed table queries (supabase.from('table').select(...))
+ * - Realtime channels (supabase.channel(...))
+ *
+ * Notes:
+ * - We still expose supabaseFetch for existing REST-style callers.
+ * - Session is bridged from our custom storage into this client in initAuthFromStorage
+ *   and setAuthToken so RLS sees auth.uid() correctly for both styles of usage.
+ */
+export const supabase: SupabaseClient<any> = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: {
+    persistSession: true,
+  },
+})
+
+/**
  * setAuthToken
  *
  * Store the provided JWT in-memory and persist a minimal session to localStorage.
+ * Also attempts to sync the Supabase JS client's auth session so that:
+ * - REST calls via supabaseFetch have Authorization header.
+ * - Supabase client calls (supabase.from, realtime channels) share the same session.
  *
  * @param token - JWT access token string or null to clear
  * @param opts - optional refresh token/expires to persist with session
  */
-export function setAuthToken(token: string | null, opts?: { refresh_token?: string | null; expires_at?: number | null }) {
+export function setAuthToken(
+  token: string | null,
+  opts?: { refresh_token?: string | null; expires_at?: number | null }
+) {
   AUTH_TOKEN = token || null
 
   if (typeof window !== 'undefined') {
@@ -71,12 +169,31 @@ export function setAuthToken(token: string | null, opts?: { refresh_token?: stri
       }
     }
   }
+
+  // Best-effort sync with Supabase JS auth session.
+  if (token) {
+    void supabase.auth
+      .setSession({
+        access_token: token,
+        // When refresh_token is not known, an empty string will simply fail to refresh;
+        // the important part is that the access token is applied for the current session.
+        refresh_token: opts?.refresh_token || '',
+      })
+      .catch(() => {
+        // Ignore auth sync errors; REST-style calls via AUTH_TOKEN will still work.
+      })
+  } else {
+    void supabase.auth.signOut().catch(() => {
+      // ignore sign-out errors
+    })
+  }
 }
 
 /**
  * clearAuthToken
  *
  * Clear the in-memory auth token and remove persisted session.
+ * Also signs out from the Supabase JS client.
  */
 export function clearAuthToken() {
   AUTH_TOKEN = null
@@ -85,6 +202,10 @@ export function clearAuthToken() {
   } catch {
     // ignore
   }
+
+  void supabase.auth.signOut().catch(() => {
+    // ignore sign-out errors
+  })
 }
 
 /**
@@ -102,7 +223,9 @@ export function getAuthToken() {
  * initAuthFromStorage
  *
  * Try to read persisted session from localStorage and set AUTH_TOKEN.
- * This runs on module init so components can rely on a restored token if present.
+ * Also pushes the stored session into the Supabase JS client so that:
+ * - supabaseFetch uses the JWT for Authorization header.
+ * - supabase.from(...) / realtime also run under the same RLS session.
  */
 function initAuthFromStorage() {
   try {
@@ -110,47 +233,21 @@ function initAuthFromStorage() {
     const v = window.localStorage.getItem(SB_SESSION_KEY)
     if (!v) return
     const parsed: StoredSession = JSON.parse(v)
-    if (parsed && parsed.access_token) AUTH_TOKEN = parsed.access_token
+    if (parsed && parsed.access_token) {
+      AUTH_TOKEN = parsed.access_token
+      void supabase.auth
+        .setSession({
+          access_token: parsed.access_token,
+          refresh_token: parsed.refresh_token || '',
+        })
+        .catch(() => {
+          // ignore auth sync errors
+        })
+    }
   } catch {
     // ignore parse errors
   }
 }
-
-/**
- * Environment helpers for base URL and anon key
- */
-function getEnv(nodeKey: string, globalKey: string, fallback: string) {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const proc: any = typeof process !== 'undefined' ? (process as any) : undefined
-    if (proc && proc.env && (proc.env[nodeKey] || proc.env[globalKey])) {
-      return proc.env[nodeKey] || proc.env[globalKey]
-    }
-  } catch {
-    // ignore
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const g: any = globalThis as any
-  if (g && (g[globalKey] || g[nodeKey])) {
-    return g[globalKey] || g[nodeKey]
-  }
-
-  return fallback
-}
-
-let SUPABASE_URL = getEnv('REACT_APP_SUPABASE_URL', 'SUPABASE_URL', 'https://iiunrkztuhhbdgxzqqgq.supabase.co')
-const SUPABASE_ANON_KEY = getEnv('REACT_APP_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM')
-
-function normalizeUrl(url: string) {
-  let u = String(url || '').trim()
-  if (!u) return u
-  if (!/^https?:\/\//i.test(u)) u = `https://${u}`
-  if (u.endsWith('/')) u = u.slice(0, -1)
-  return u
-}
-
-SUPABASE_URL = normalizeUrl(SUPABASE_URL)
 
 /**
  * aliasTableName
@@ -185,7 +282,7 @@ function aliasTableName(table: string) {
  * Generic helper to call Supabase REST/Gotrue endpoints.
  *
  * - Adds apikey header (anon key) always.
- * - Adds Authorization: Bearer <JWT> ONLY when a real user JWT is available.
+ * - Adds Authorization: Bearer &lt;JWT&gt; ONLY when a real user JWT is available.
  * - Returns a structured { status, data, error? } object and never throws.
  *
  * @param path - REST path after base URL (e.g. '/rest/v1/cities' or '/auth/v1/token')
@@ -231,7 +328,8 @@ export async function supabaseFetch(path: string, opts: RequestInit = {}) {
 /**
  * Helper: authSignUp
  *
- * Sign up a new user via GoTrue endpoint.
+ * Sign up a new user via GoTrue endpoint using REST.
+ * Existing callers expect the REST-style response shape, so we keep this wrapper.
  *
  * @param email - user email
  * @param password - user password
@@ -248,8 +346,14 @@ export async function authSignUp(email: string, password: string, data?: Record<
 /**
  * Helper: authSignIn
  *
- * Sign in using password grant. Returns session-like object when successful:
- * { access_token, refresh_token, user }
+ * Sign in using password grant via GoTrue REST endpoint.
+ * Returns a session-like object when successful:
+ * { access_token, refresh_token, user, ... }
+ *
+ * NOTE:
+ * - After calling this, callers should invoke setAuthToken(...) with the returned
+ *   access_token and refresh_token so both supabaseFetch and the Supabase JS client
+ *   share the same authenticated session.
  *
  * @param email - user email
  * @param password - user password
@@ -303,6 +407,6 @@ export async function getCurrentUser() {
 }
 
 /**
- * init module: attempt to restore persisted session
+ * init module: attempt to restore persisted session and sync with Supabase client
  */
 initAuthFromStorage()
