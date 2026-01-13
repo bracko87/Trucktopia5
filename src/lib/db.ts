@@ -9,7 +9,7 @@
  *   update an existing public.users row (matched by email) to attach auth_user_id
  *   and name when an auth user is available.
  * - When creating a company, perform a best-effort sync to set the users.company_id
- *   so the frontend doesn't rely solely on DB triggers.
+ *   so the frontend does not rely solely on DB triggers.
  */
 
 import { getTable, insertRow, supabaseFetch } from './supabase'
@@ -48,8 +48,18 @@ export interface CompanyRow {
   balance_cents?: number
   created_at?: string
   name?: string | null
+  /**
+   * Denormalized auth owner column introduced by migration 031.
+   * Should match auth.uid() for the owning user.
+   */
+  owner_auth_user_id?: string | null
 }
 
+/**
+ * CityRow
+ *
+ * Interface representing a row in the cities table.
+ */
 /**
  * CityRow
  *
@@ -63,6 +73,22 @@ export interface CityRow {
   lat?: number | null
   lon?: number | null
   created_at?: string
+}
+
+/**
+ * CargoTypeRow
+ *
+ * Minimal interface representing a row in the cargo_types table.
+ * Includes icon_url which stores an optional HTTP(S) URL for a small icon
+ * representing this cargo type (used by the UI as decoration).
+ */
+export interface CargoTypeRow {
+  id?: string
+  code?: string | null
+  name?: string | null
+  description?: string | null
+  created_at?: string | null
+  icon_url?: string | null
 }
 
 /**
@@ -81,6 +107,11 @@ export interface HubRow {
   city_id?: string | null
   owner_id?: string | null
   created_at?: string
+  /**
+   * Denormalized auth owner column introduced by migration 031.
+   * Should match auth.uid() for the owning user.
+   */
+  owner_auth_user_id?: string | null
 }
 
 /**
@@ -288,83 +319,117 @@ async function ensureStarterLeaseForCompany(
   }
 
   // Create starter lease
+  // Include lease_start / lease_end to satisfy DB CHECK constraint requiring a 60-week lease window.
+  const nowIso = new Date().toISOString()
+  const sixtyWeeksMs = 60 * 7 * 24 * 60 * 60 * 1000 // 60 weeks in ms (420 days)
   const payload = {
     asset_model_id: truckModelId,
     asset_type: 'truck',
     owner_company_id: companyId,
     owner_user_id: ownerUserId,
+    owner_user_auth_id: ownerUserId,
     acquisition_type: 'starter',
     status: 'active',
     is_active: true,
+    lease_start: nowIso,
+    lease_end: new Date(Date.now() + sixtyWeeksMs).toISOString(),
   }
 
   const leaseRes = await insertRow('user_leases', payload)
 
   // If lease insert failed, return result so caller can inspect.
   if (!(leaseRes && (leaseRes.status === 200 || leaseRes.status === 201))) {
-    return { status: leaseRes?.status ?? 0, error: leaseRes?.error ?? 'lease insert failed', data: leaseRes?.data ?? null }
+    return {
+      status: leaseRes?.status ?? 0,
+      error: leaseRes?.error ?? 'lease insert failed',
+      data: leaseRes?.data ?? null,
+    }
   }
 
   // Best-effort: create a corresponding user_trucks row so the company has an actual truck instance.
   let truckRes: any = null
   try {
-    const userTruckPayload: any = {
-      master_truck_id: truckModelId,
-      owner_company_id: companyId,
-      owner_user_id: ownerUserId,
-      acquisition_type: 'starter',
-      condition_score: 100,
-      mileage_km: 0,
-      status: 'available',
-      is_active: true,
-    }
+    // Avoid creating duplicate starter trucks if one already exists for this company/model.
+    const existingTruckRes = await getTable(
+      'user_trucks',
+      `?select=id&owner_company_id=eq.${companyId}&master_truck_id=eq.${truckModelId}&acquisition_type=eq.starter`
+    )
+    const existingTruckRows = Array.isArray(existingTruckRes.data) ? existingTruckRes.data : []
 
-    // Create the user_truck using the trucks module helper if available, otherwise fallback to insertRow.
-    try {
-      // dynamic import-like resolution: prefer modular helper if present
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const trucksModule = require('./db/modules/trucks') as any
-      if (trucksModule && typeof trucksModule.createUserTruck === 'function') {
-        truckRes = await trucksModule.createUserTruck(userTruckPayload)
-      } else {
+    if (existingTruckRows.length === 0) {
+      const userTruckPayload: any = {
+        master_truck_id: truckModelId,
+        owner_company_id: companyId,
+        owner_user_id: ownerUserId,
+        owner_user_auth_id: ownerUserId, // explicit denorm, do not rely on triggers
+        acquisition_type: 'starter',
+        condition_score: 100,
+        mileage_km: 0,
+        status: 'available',
+        is_active: true,
+      }
+
+      // Create the user_truck using the trucks module helper if available, otherwise fallback to insertRow.
+      try {
+        // dynamic import-like resolution: prefer modular helper if present
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const trucksModule = require('./db/modules/trucks') as any
+        if (trucksModule && typeof trucksModule.createUserTruck === 'function') {
+          truckRes = await trucksModule.createUserTruck(userTruckPayload)
+        } else {
+          truckRes = await insertRow('user_trucks', userTruckPayload)
+        }
+      } catch {
+        // fallback to direct insert if require() failed (safe-guard)
         truckRes = await insertRow('user_trucks', userTruckPayload)
       }
-    } catch (e) {
-      // fallback to direct insert if require() failed (safe-guard)
-      truckRes = await insertRow('user_trucks', userTruckPayload)
-    }
 
-    // If truck creation failed, include info but continue to attempt syncing count.
-    if (!(truckRes && (truckRes.status === 200 || truckRes.status === 201))) {
-      // attempt to surface the error; continue
+      // If truck creation failed, include info but continue to attempt syncing count.
+      if (!(truckRes && (truckRes.status === 200 || truckRes.status === 201))) {
+        // error is non-fatal; continue
+      }
+    } else {
+      // Reuse existing starter truck information in the returned structure.
+      truckRes = existingTruckRes
     }
 
     // recompute the trucks count for the company and patch companies.trucks
     try {
       // prefer modular sync helper
-      let syncRes: any = null
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const trucksModule = require('./db/modules/trucks') as any
         if (trucksModule && typeof trucksModule.syncCompanyTruckCount === 'function') {
-          syncRes = await trucksModule.syncCompanyTruckCount(companyId)
+          await trucksModule.syncCompanyTruckCount(companyId)
         } else {
-          const countRes = await getTable('user_trucks', `?select=id&owner_company_id=eq.${companyId}`)
+          const countRes = await getTable(
+            'user_trucks',
+            `?select=id&owner_company_id=eq.${companyId}`
+          )
           const count = Array.isArray(countRes.data) ? countRes.data.length : 0
-          syncRes = await supabaseFetch(`/rest/v1/companies?id=eq.${companyId}`, {
+          await supabaseFetch(`/rest/v1/companies?id=eq.${companyId}`, {
             method: 'PATCH',
             body: JSON.stringify({ trucks: count }),
-            headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+            headers: {
+              'Content-Type': 'application/json',
+              Prefer: 'return=representation',
+            },
           })
         }
       } catch {
         // fallback manual count/patch
-        const countRes = await getTable('user_trucks', `?select=id&owner_company_id=eq.${companyId}`)
+        const countRes = await getTable(
+          'user_trucks',
+          `?select=id&owner_company_id=eq.${companyId}`
+        )
         const count = Array.isArray(countRes.data) ? countRes.data.length : 0
         await supabaseFetch(`/rest/v1/companies?id=eq.${companyId}`, {
           method: 'PATCH',
           body: JSON.stringify({ trucks: count }),
-          headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+          headers: {
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
         })
       }
     } catch (err) {
@@ -396,12 +461,18 @@ async function ensureStarterLeaseForCompany(
  * - main hub in public.hubs
  * - starter lease in public.user_leases (and a starter user_trucks row via ensureStarterLeaseForCompany)
  *
- * If the user already has a company (owner_id match), returns the existing one
+ * If the user already has a company, returns the existing one
  * and does not create bonuses a second time.
  *
  * Performs a best-effort update to public.users row to set company_id for immediate consistency.
  *
- * @param userId - game user id OR auth user id (we will ensure a linked public.users row and use its id)
+ * IMPORTANT:
+ * - The userId parameter is treated as the auth user id (auth.uid()).
+ * - For new users we ensure public.users.id === auth_user_id === userId so that:
+ *   - companies.owner_id references users.id
+ *   - companies.owner_auth_user_id stores auth.uid()
+ *
+ * @param userId - auth user id from Supabase (auth.uid())
  * @param email - user email (stored on company.email)
  * @param city - selected CityRow to use as hub
  * @param companyName - chosen company name
@@ -415,20 +486,32 @@ export async function createCompanyWithBootstrap(
   const INITIAL_BALANCE_CENTS = 1000000 // 10,000 * 100
   const STARTER_TRUCK_MODEL_ID = 'd87583a5-1bf0-4451-ac90-32318b7b1093'
 
-  // Ensure we have a linked public.users row (and that public.users.id == auth uid when possible).
-  // If userId is an auth uid, ensureUserProfile will create/patch a public.users row and return it.
-  let publicUserId = userId
+  // Treat incoming userId as auth user id.
+  const authUserId = userId
+
+  // Ensure we have a linked public.users row.
+  // For new users this will create users.id == authUserId.
+  let publicUserId = authUserId
   try {
-    const ensured = await ensureUserProfile(userId, email, null)
+    const ensured = await ensureUserProfile(authUserId, email, null)
     if (ensured && ensured.data && ensured.data.id) {
-      publicUserId = ensured.data.id
+      publicUserId = ensured.data.id as string
     }
   } catch {
-    // ignore; we'll proceed with provided userId (best-effort)
+    // best-effort only
   }
 
-  // 1) Check if company already exists for this user (owner_id == publicUserId)
-  const existingRes = await getTable('companies', `?select=*&owner_id=eq.${publicUserId}`)
+  // 1) Check if company already exists for this auth user.
+  // Prefer new denormalized column, fall back to owner_id for safety.
+  const existingRes = await getTable(
+    'companies',
+    `?select=*` +
+      `&or=(owner_auth_user_id.eq.${encodeURIComponent(authUserId)},owner_id.eq.${encodeURIComponent(
+        publicUserId
+      )})` +
+      `&limit=1`
+  )
+
   const existingCompanies = Array.isArray(existingRes.data) ? existingRes.data : []
   if (existingCompanies.length > 0) {
     return {
@@ -440,7 +523,8 @@ export async function createCompanyWithBootstrap(
     }
   }
 
-  // 2) Insert company with initial balance and hub city/country
+  // 2) Insert company with initial balance and hub city/country.
+  // We explicitly set owner_auth_user_id so new RLS policies work.
   const companyPayload: CompanyRow = {
     owner_id: publicUserId,
     email,
@@ -448,6 +532,7 @@ export async function createCompanyWithBootstrap(
     hub_city: city.city_name,
     hub_country: city.country_name,
     balance_cents: INITIAL_BALANCE_CENTS,
+    owner_auth_user_id: authUserId,
   }
 
   const companyRes = await insertCompany(companyPayload)
@@ -462,48 +547,105 @@ export async function createCompanyWithBootstrap(
     return { status: 500, data: null, error: 'Missing company id from insert response' }
   }
 
-  // 3) Create main hub (best-effort; failures should not block company creation)
-  if (city.id) {
-    const hubPayload: HubRow = {
-      owner_id: companyId,
-      city_id: city.id,
-      city: city.city_name,
-      country: city.country_name,
-      is_main: true,
-      hub_level: 1,
-      lat: (city.lat as number | null) ?? null,
-      lon: (city.lon as number | null) ?? null,
+  const bootstrapErrors: string[] = []
+
+  // 3) Robust hub handling to avoid duplicates:
+  // We NEVER insert a hub here unless absolutely no hub exists.
+  // Instead, we assume a DB trigger may have created a placeholder hub row.
+  // We then PATCH the earliest main hub for this company with accurate city info.
+  try {
+    const hubsRes = await getTable(
+      'hubs',
+      `?select=*` +
+        `&owner_id=eq.${encodeURIComponent(companyId)}` +
+        `&is_main=eq.true` +
+        `&order=created_at.asc` +
+        `&limit=1`
+    )
+    const hubs = Array.isArray(hubsRes.data) ? hubsRes.data : []
+    const existingHub = hubs[0]
+
+    if (existingHub) {
+      // Patch the existing hub created by trigger (or earlier run) with accurate info.
+      const patchPayload: Partial<HubRow> = {
+        city: city.city_name,
+        country: city.country_name,
+        is_main: true,
+        owner_auth_user_id: authUserId,
+      }
+
+      if (city.id) patchPayload.city_id = city.id
+      if (typeof city.lat !== 'undefined') patchPayload.lat = (city.lat as number) ?? null
+      if (typeof city.lon !== 'undefined') patchPayload.lon = (city.lon as number) ?? null
+
+      try {
+        await supabaseFetch(`/rest/v1/hubs?id=eq.${encodeURIComponent(existingHub.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(patchPayload),
+          headers: {
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
+        })
+      } catch (err) {
+        bootstrapErrors.push(`hub_patch:${(err as any)?.message ?? String(err)}`)
+      }
+    } else {
+      // Fallback: if no hub exists at all (e.g. trigger missing), insert a single hub.
+      const hubPayload: HubRow = {
+        owner_id: companyId,
+        city_id: city.id ?? null,
+        city: city.city_name,
+        country: city.country_name,
+        is_main: true,
+        hub_level: 1,
+        lat: (city.lat as number | null) ?? null,
+        lon: (city.lon as number | null) ?? null,
+        owner_auth_user_id: authUserId,
+      }
+
+      try {
+        await insertHub(hubPayload)
+      } catch (err) {
+        bootstrapErrors.push(`hub_create:${(err as any)?.message ?? String(err)}`)
+      }
     }
-    try {
-      await insertHub(hubPayload)
-    } catch {
-      // Non-fatal; hub creation can fail without breaking company creation
-    }
+  } catch (err) {
+    bootstrapErrors.push(`hub_lookup:${(err as any)?.message ?? String(err)}`)
   }
 
-  // 4) Ensure starter lease (best-effort) -> now also creates a starter user_trucks row and updates companies.trucks
+  // 4) Ensure starter lease (best-effort) -> also creates a starter user_trucks row and updates companies.trucks.
   try {
     await ensureStarterLeaseForCompany(publicUserId, companyId, STARTER_TRUCK_MODEL_ID)
-  } catch {
-    // Non-fatal; game can still function without the starter lease/truck
+  } catch (err) {
+    bootstrapErrors.push(`lease:${(err as any)?.message ?? String(err)}`)
   }
 
   // 5) Best-effort: update public.users row to set company_id for immediate consistency.
   try {
-    await supabaseFetch(`/rest/v1/users?id=eq.${publicUserId}`, {
+    await supabaseFetch(`/rest/v1/users?id=eq.${encodeURIComponent(publicUserId)}`, {
       method: 'PATCH',
       body: JSON.stringify({ company_id: companyId }),
-      headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
     })
-  } catch {
-    // ignore; DB trigger should still keep things consistent eventually
+  } catch (err) {
+    bootstrapErrors.push(`user_patch:${(err as any)?.message ?? String(err)}`)
   }
 
-  return {
+  const result: any = {
     status: companyRes.status,
     data: {
       company,
       alreadyExists: false,
     },
   }
+
+  if (bootstrapErrors.length > 0) {
+    result.bootstrapErrors = bootstrapErrors
+  }
+
+  return result
 }

@@ -25,6 +25,7 @@ import {
   MapPin,
   ChevronLeft,
   ChevronRight,
+  LogOut,
 } from 'lucide-react'
 import { useNavigate } from 'react-router'
 
@@ -82,6 +83,7 @@ function SidebarItem({ label, subtitle, to, icon, collapsed }: SidebarItemProps)
  */
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
+  const nav = useNavigate()
 
   const items: Array<{ label: string; subtitle?: string; to: string; icon: React.ReactNode }> = [
     { label: 'My Company', subtitle: 'Overview & settings', to: '/dashboard', icon: <Home size={18} className="text-white" /> },
@@ -99,6 +101,19 @@ export default function Sidebar() {
    */
   function toggleCollapsed() {
     setCollapsed((s) => !s)
+  }
+
+  /**
+   * signOut
+   *
+   * Simple sign out handler: perform minimal client action and navigate to /login.
+   * Replace or extend this with real auth logic if needed.
+   */
+  function signOut() {
+    // placeholder: integrate real sign-out flow here
+    // eslint-disable-next-line no-console
+    console.debug('Sign out clicked')
+    nav('/login')
   }
 
   return (
@@ -135,13 +150,39 @@ export default function Sidebar() {
           ))}
         </nav>
 
-        {/* Footer: anchored to bottom to eliminate blank space */}
+        {/* Footer: anchored to bottom to eliminate blank space and render sign out below menu */}
         <div className="p-3 mt-auto">
-          {!collapsed ? (
-            <div className="text-xs text-white/60">© Trucktopia</div>
-          ) : (
-            <div className="text-xs text-center text-white/60">©</div>
-          )}
+          <div className="flex flex-col gap-2">
+            {!collapsed ? (
+              <>
+                <div className="text-xs text-white/60">© Trucktopia</div>
+
+                {/* Sign out button placed below navigation and copyright */}
+                <button
+                  onClick={signOut}
+                  className="w-full mt-2 px-3 py-2 rounded bg-yellow-400 text-black font-medium hover:bg-yellow-500 transition"
+                >
+                  <div className="flex items-center gap-2 justify-center">
+                    <LogOut size={16} />
+                    <span>Sign out</span>
+                  </div>
+                </button>
+              </>
+            ) : (
+              <div className="flex flex-col items-center gap-2">
+                <div className="text-xs text-center text-white/60">©</div>
+
+                {/* Collapsed small square sign out (icon-only) */}
+                <button
+                  onClick={signOut}
+                  aria-label="Sign out"
+                  className="p-2 rounded bg-yellow-400 text-black hover:bg-yellow-500 transition"
+                >
+                  <LogOut size={16} />
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </aside>

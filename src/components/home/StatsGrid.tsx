@@ -2,9 +2,10 @@
  * StatsGrid.tsx
  *
  * Small stats grid showing live counts: Active Users, Active Trucks, Total Jobs, Total Cities.
+ * Includes a smooth number animation that correctly responds to updates from props.
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Users, Truck, Briefcase, MapPin } from 'lucide-react'
 
 /**
@@ -21,6 +22,8 @@ interface Stats {
 
 /**
  * StatsGridProps
+ *
+ * Props for the StatsGrid component.
  */
 interface StatsGridProps {
   stats: Stats
@@ -30,6 +33,10 @@ interface StatsGridProps {
  * StatCard
  *
  * Small card to display a single stat.
+ *
+ * @param props.icon - icon node
+ * @param props.label - label text
+ * @param props.value - numeric value to show
  */
 function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
   return (
@@ -48,18 +55,38 @@ function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string
 /**
  * StatsGrid
  *
- * Renders four stat cards in a responsive grid.
+ * Renders four stat cards in a responsive grid. Implements a number animation
+ * that interpolates from the current animated values to the new target values
+ * provided in props.stats. Uses a ref to avoid stale closure issues inside
+ * the interval callback.
+ *
+ * @param props.stats - target stats to animate to
  */
 export default function StatsGrid({ stats }: StatsGridProps) {
-  const [anim, setAnim] = useState(stats)
+  const [anim, setAnim] = useState<Stats>(stats)
+
+  /**
+   * animRef
+   *
+   * Keeps the latest animated values available to the interval callback to
+   * avoid stale closures. Updated whenever `anim` changes.
+   */
+  const animRef = useRef<Stats>(anim)
 
   useEffect(() => {
-    // simple smooth update animation for numbers
+    animRef.current = anim
+  }, [anim])
+
+  useEffect(() => {
+    // Smooth update animation for numbers (runs whenever incoming stats change)
     const step = 6
     const keys: (keyof Stats)[] = ['activeUsers', 'activeTrucks', 'totalJobs', 'totalCities']
+
     const interval = setInterval(() => {
       let done = true
-      const next = { ...anim }
+      // Start from the most recent animated values
+      const next: Stats = { ...animRef.current }
+
       keys.forEach((k) => {
         const target = stats[k]
         if (next[k] < target) {
@@ -70,11 +97,15 @@ export default function StatsGrid({ stats }: StatsGridProps) {
           done = false
         }
       })
+
+      // Apply the next animated frame and update the ref via the state update
       setAnim(next)
+
       if (done) clearInterval(interval)
     }, 40)
+
     return () => clearInterval(interval)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Only re-run when the incoming target stats change
   }, [stats])
 
   return (

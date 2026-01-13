@@ -1,14 +1,21 @@
 /**
  * TruckCard.tsx
  *
- * Single-row truck card used in the trucks list. Reads model-related fields
- * from denormalized columns on public.user_trucks and accepts optional modelInfo.
+ * Single-row truck card used in the trucks list. Shows truck info and an
+ * expandable details panel. Allows editing name, registration and hub assignment
+ * for owned trucks. When isMarket=true the card is read-only.
  *
- * Uses cargo_type_id / cargo_type_name instead of the previous textual model_load_type.
+ * Enhanced with maintenance UI:
+ * - Shows Last maintenance (date-only) and Next maintenance (remaining km)
+ * - Adds "Maintenance" button that opens MaintenanceModal
+ * - Visual warning & suspension states based on remaining km:
+ *    - Normal: remaining > 0
+ *    - Warning: 0 >= remaining > -3000
+ *    - Suspended: remaining <= -3000 -> card overlay + only maintenance actionable
  */
 
 import React, { useEffect, useState } from 'react'
-import { Gauge, Calendar, MapPin, Menu } from 'lucide-react'
+import { Gauge, Calendar, MapPin, Menu, Edit3, Check, X } from 'lucide-react'
 import EditableField from './EditableField'
 import StatChip from './StatChip'
 import { supabaseFetch, getTable } from '../../lib/supabase'
@@ -17,6 +24,10 @@ import TruckSpecModal from './TruckSpecModal'
 import TruckComponentsModal from './TruckComponentsModal'
 import SellTruckModal from './SellTruckModal'
 import InsuranceModal from './InsuranceModal'
+import RegistrationInput from '../common/RegistrationInput'
+import TruckInsurance from './TruckInsurance'
+import MaintenanceModal from './MaintenanceModal'
+import { computeMaintenanceCost } from '../../services/maintenanceService'
 
 /**
  * ModelInfo
@@ -33,13 +44,7 @@ interface ModelInfo {
   year?: number | null
   cargo_type_id?: string | null
   cargo_type_name?: string | null
-  /**
-   * Secondary cargo type id
-   */
   cargo_type_id_secondary?: string | null
-  /**
-   * Secondary cargo type name
-   */
   cargo_type_secondary_name?: string | null
   max_load_kg?: number | null
   fuel_tank_capacity_l?: number | null
@@ -55,12 +60,6 @@ interface TruckCardProps {
   modelInfo?: ModelInfo
   defaultName?: string
   defaultRegistration?: string
-  /**
-   * isMarket
-   *
-   * When true the card represents a marketplace model and must be readonly.
-   * Updates should be disabled and no REST persistence must run.
-   */
   isMarket?: boolean
 }
 
@@ -96,6 +95,8 @@ function statusClass(s: string) {
       return 'bg-amber-50 text-amber-700 ring-amber-100'
     case 'maintenance':
       return 'bg-rose-50 text-rose-700 ring-rose-100'
+    case 'suspended':
+      return 'bg-rose-600 text-white ring-rose-700'
     default:
       return 'bg-gray-50 text-gray-700 ring-gray-100'
   }
@@ -117,85 +118,6 @@ function parseRegistration(reg?: string | null): [string, string] {
 }
 
 /**
- * EditableRegistration
- *
- * Inline component that renders a locked 2-letter prefix and editable numeric
- * digits (1-4). Calls onSave with full registration (prefix + digits).
- *
- * When isMarket=true the parent will not render this component and will show
- * a static registration instead.
- *
- * @param props - component props
- */
-function EditableRegistration({
-  value,
-  defaultValue,
-  onSave,
-  maxDigits = 4,
-}: {
-  value?: string | null
-  defaultValue?: string | null
-  onSave: (reg: string) => void
-  maxDigits?: number
-}) {
-  const initial = value ?? defaultValue ?? null
-  const [prefix, setPrefix] = useState<string>('XX')
-  const [digits, setDigits] = useState<string>('')
-
-  useEffect(() => {
-    const [p, d] = parseRegistration(initial)
-    setPrefix(p)
-    setDigits(d.slice(0, maxDigits))
-  }, [initial, maxDigits])
-
-  /**
-   * handleDigitsChange
-   *
-   * Accept digits only and enforce max length.
-   *
-   * @param next - new input text
-   */
-  function handleDigitsChange(next: string) {
-    const filtered = next.replace(/\D/g, '').slice(0, maxDigits)
-    setDigits(filtered)
-  }
-
-  /**
-   * handleSave
-   *
-   * Emit registration string to parent.
-   */
-  function handleSave() {
-    onSave(`${prefix}${digits}`)
-  }
-
-  return (
-    <div className="inline-flex items-center gap-2">
-      <span className="px-2 py-1 rounded-l-md bg-slate-100 text-xs font-mono text-slate-700 border border-r-0 border-slate-200">
-        {prefix}
-      </span>
-      <input
-        aria-label="Registration digits"
-        value={digits}
-        onChange={(e) => handleDigitsChange(e.target.value)}
-        onBlur={handleSave}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-          if (e.key === 'Escape') {
-            const [, d] = parseRegistration(initial)
-            setDigits(d.slice(0, maxDigits))
-          }
-        }}
-        className="w-20 px-2 py-1 rounded-r-md border border-slate-200 text-sm font-mono"
-        inputMode="numeric"
-        pattern="[0-9]*"
-        maxLength={maxDigits}
-      />
-    </div>
-  )
-}
-
-/**
  * HubOption
  *
  * Minimal hub representation used in the selector.
@@ -211,11 +133,8 @@ interface HubOption {
 /**
  * TruckCard
  *
- * Main exported component. Shows truck info and allows editing name, registration
- * and hub (city) assignment for owned trucks. When isMarket=true the card is
- * read-only and no persistence calls are made.
- *
- * Uses cargo_type_name displayed instead of the old model_load_type text.
+ * Shows truck info and allows editing name, registration and hub (city)
+ * assignment for owned trucks. When isMarket=true the card is read-only.
  *
  * @param props - TruckCardProps
  */
@@ -226,138 +145,212 @@ export default function TruckCard({
   defaultRegistration,
   isMarket = false,
 }: TruckCardProps) {
-  // Safe fallbacks
-  const id = truck.id ?? ''
-  const status = ((truck.status as unknown as string) ?? 'unknown').toLowerCase()
-  const mileage = (truck.mileage_km as unknown as number) ?? (truck as unknown as any)?.mileage ?? 0
-  const conditionScore = (truck.condition_score as unknown as number) ?? 0
+  // Basic derived values
+  const id = truck?.id ?? ''
+  const status = ((truck?.status as unknown as string) ?? 'unknown').toLowerCase()
+  const mileage = (truck?.mileage_km as unknown as number) ?? (truck as any)?.mileage ?? 0
+  const conditionScore = (truck?.condition_score as unknown as number) ?? 0
 
-  // Editable name (local state)
-  const [name, setName] = useState<string>((truck as any).name ?? defaultName ?? '')
+  // Maintenance related state
+  const [lastMaintenanceAt, setLastMaintenanceAt] = useState<string | null>((truck as any)?.last_maintenance_at ?? null)
+  const [nextMaintenanceKm, setNextMaintenanceKm] = useState<number | null>((truck as any)?.next_maintenance_km ?? null)
+  const [maintenanceModalOpen, setMaintenanceModalOpen] = useState(false)
+  const [maintenanceEstimates, setMaintenanceEstimates] = useState<any>(null)
+
+  // Cargo icons and other existing states...
+  const [cargoIconUrl, setCargoIconUrl] = useState<string | null>(null)
+  const [cargoIconUrlSecondary, setCargoIconUrlSecondary] = useState<string | null>(null)
+
+  // Editable name
+  const [name, setName] = useState<string>((truck as any)?.name ?? defaultName ?? '')
   const [savingName, setSavingName] = useState<boolean>(false)
+  const [editingName, setEditingName] = useState<boolean>(false)
+  const [editInput, setEditInput] = useState<string>(name)
 
-  // Editable registration (prefix locked)
-  const [registration, setRegistration] = useState<string | null>(((truck as any).registration as string) ?? defaultRegistration ?? null)
+  // Registration state
+  const [registration, setRegistration] = useState<string | null>(((truck as any)?.registration as string) ?? defaultRegistration ?? null)
   const [savingRegistration, setSavingRegistration] = useState<boolean>(false)
+  const [registrationDigits, setRegistrationDigits] = useState<string>('')
 
-  // Hub (city) assignment
-  const [hubCity, setHubCity] = useState<string | null>((truck as any).hub ?? (truck as any).hub_city ?? null)
+  useEffect(() => {
+    const [, d] = parseRegistration(registration ?? defaultRegistration ?? null)
+    setRegistrationDigits(d.slice(0, 4))
+  }, [registration, defaultRegistration])
+
+  // Hub selection
+  const [hubCity, setHubCity] = useState<string | null>((truck as any)?.hub ?? (truck as any)?.hub_city ?? null)
   const [hubs, setHubs] = useState<HubOption[]>([])
   const [loadingHubs, setLoadingHubs] = useState<boolean>(false)
   const [savingHub, setSavingHub] = useState<boolean>(false)
-
-  // Selected hub id (for the new "Apply" flow)
   const [selectedHubId, setSelectedHubId] = useState<string>('')
 
-  // Location (city/hub) - id and name so we can persist location_city_id FK
-  const [locationCityId, setLocationCityId] = useState<string | null>((truck as any).location_city_id ?? null)
-  const [locationCityName, setLocationCityName] = useState<string | null>((truck as any).location_city_name ?? null)
+  // Acquisition type (new)
+  const [acquisitionType, setAcquisitionType] = useState<string | null>(((truck as any)?.acquisition_type as string) ?? null)
 
-  const rawModelId = (truck.master_truck_id as unknown as string) ?? null
-
-  // Expanded state (controls the full-card expansion)
+  // UI state
   const [expanded, setExpanded] = useState<boolean>(false)
-
-  // Actions panel open state (kept for compatibility with small dropdown usage)
   const [actionsOpen, setActionsOpen] = useState<boolean>(false)
-
-  // Modal open state for logs
   const [showLogs, setShowLogs] = useState<boolean>(false)
-
-  // Modal open state for specifications (new)
   const [showSpecs, setShowSpecs] = useState<boolean>(false)
-
-  // Modal open state for components
   const [showComponents, setShowComponents] = useState<boolean>(false)
-
-  // Modal open state for selling the truck
   const [showSell, setShowSell] = useState<boolean>(false)
-
-  // Modal open state for truck insurance
   const [showInsurance, setShowInsurance] = useState<boolean>(false)
 
-  /**
-   * openInsurance
-   *
-   * Open insurance modal (defined in component scope to avoid runtime reference errors).
-   */
-  function openInsurance() {
-    setShowInsurance(true)
-  }
+  const rawModelId = (truck as any)?.master_truck_id ?? null
 
-  /**
-   * closeInsurance
-   *
-   * Close insurance modal.
-   */
-  function closeInsurance() {
-    setShowInsurance(false)
-  }
-
-  // Derive a fallback model display from denormalized columns on the truck row
+  // Model display
   const derivedModelName =
-    ((truck as any).model_make ? `${(truck as any).model_make} ${(truck as any).model_model ?? ''}`.trim() : (truck as any).model_model ?? null) ?? null
+    truck?.model_make ? `${truck.model_make} ${truck.model_model ?? ''}`.trim() : truck?.model_model ?? null
 
   const modelDisplay = formatModelDisplay(
     modelInfo ?? {
-      make: (truck as any).model_make ?? null,
-      model: (truck as any).model_model ?? null,
-      country: (truck as any).model_country ?? null,
-      class: (truck as any).model_class ?? null,
-      max_payload: (truck as any).model_max_load_kg ?? null,
-      tonnage: (truck as any).model_tonnage ?? null,
-      year: (truck as any).model_year ?? null,
-      cargo_type_id: (truck as any).cargo_type_id ?? null,
-      cargo_type_name: (truck as any).cargo_type_name ?? null,
-      cargo_type_id_secondary: (truck as any).cargo_type_id_secondary ?? null,
-      cargo_type_secondary_name: (truck as any).cargo_type_secondary_name ?? null,
-      fuel_tank_capacity_l: (truck as any).model_fuel_tank_capacity_l ?? null,
-      fuel_type: (truck as any).model_fuel_type ?? null,
-      image_url: (truck as any).model_image_url ?? null,
+      make: truck?.model_make ?? null,
+      model: truck?.model_model ?? null,
+      country: truck?.model_country ?? null,
+      class: truck?.model_class ?? null,
+      max_payload: truck?.model_max_load_kg ?? null,
+      tonnage: truck?.model_tonnage ?? null,
+      year: truck?.model_year ?? null,
+      cargo_type_id: truck?.cargo_type_id ?? null,
+      cargo_type_name: truck?.cargo_type_name ?? null,
+      cargo_type_id_secondary: truck?.cargo_type_id_secondary ?? null,
+      cargo_type_secondary_name: truck?.cargo_type_secondary_name ?? null,
+      fuel_tank_capacity_l: truck?.model_fuel_tank_capacity_l ?? null,
+      fuel_type: truck?.model_fuel_type ?? null,
+      image_url: truck?.model_image_url ?? null,
     },
     derivedModelName ?? rawModelId ?? 'Unknown model'
   )
 
   /**
-   * fetchLatestRow
+   * loadCargoIconsFromModel
    *
-   * Fetch the latest name, registration, hub and location_city_id for this truck row so edits persist across reloads.
-   *
-   * This is only relevant for owned user trucks. Skip for market items.
-   *
-   * @returns void
+   * Resolve cargo_type_id(s) using modelInfo or master_truck_id then fetch icon_urls.
+   * Caches results on window.__cargoIconCache.
    */
+  useEffect(() => {
+    let mounted = true
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const globalCache = (window as any).__cargoIconCache || ((window as any).__cargoIconCache = {} as Record<string, string | null>)
+
+    async function fetchCargoIconByCargoTypeId(id?: string | null) {
+      if (!id) return null
+      const cacheKey = `cargoId:${id}`
+      if (globalCache[cacheKey] !== undefined) return globalCache[cacheKey]
+      try {
+        const res: any = await getTable('cargo_types', `?select=icon_url&id=eq.${encodeURIComponent(id)}&limit=1`)
+        const rows = Array.isArray(res?.data) ? res.data : []
+        const icon = rows[0]?.icon_url ?? null
+        globalCache[cacheKey] = icon
+        return icon
+      } catch {
+        globalCache[cacheKey] = null
+        return null
+      }
+    }
+
+    async function resolveCargoTypeIdsFromModel() {
+      let primary: string | null | undefined = modelInfo?.cargo_type_id ?? null
+      let secondary: string | null | undefined = modelInfo?.cargo_type_id_secondary ?? null
+      const modelId = (truck as any)?.master_truck_id ?? null
+      if ((!primary || !secondary) && modelId) {
+        try {
+          const res: any = await getTable(
+            'truck_models',
+            `?select=cargo_type_id,cargo_type_id_secondary&id=eq.${encodeURIComponent(String(modelId))}&limit=1`
+          )
+          const rows = Array.isArray(res?.data) ? res.data : []
+          if (rows.length > 0) {
+            primary = primary ?? (rows[0]?.cargo_type_id ?? null)
+            secondary = secondary ?? (rows[0]?.cargo_type_id_secondary ?? null)
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return { primary: primary ?? null, secondary: secondary ?? null }
+    }
+
+    async function load() {
+      if (!mounted) return
+      const { primary, secondary } = await resolveCargoTypeIdsFromModel()
+      let iconPrimary = null
+      let iconSecondary = null
+      if (primary) iconPrimary = await fetchCargoIconByCargoTypeId(String(primary))
+      if (secondary) iconSecondary = await fetchCargoIconByCargoTypeId(String(secondary))
+
+      if (!iconPrimary) {
+        const cargoTypeName = (truck as any)?.cargo_type_name ?? modelInfo?.cargo_type_name ?? (truck as any)?.cargo_type ?? null
+        if (cargoTypeName) {
+          try {
+            const res: any = await getTable('cargo_types', `?select=icon_url&name=eq.${encodeURIComponent(String(cargoTypeName))}&limit=1`)
+            let rows = Array.isArray(res?.data) ? res.data : []
+            if (rows.length === 0) {
+              const res2: any = await getTable('cargo_types', `?select=icon_url&name=ilike.*${encodeURIComponent(String(cargoTypeName))}*&limit=1`)
+              rows = Array.isArray(res2?.data) ? res2.data : []
+            }
+            iconPrimary = rows[0]?.icon_url ?? null
+            if (iconPrimary) globalCache[`name:${cargoTypeName}`] = iconPrimary
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      if (!mounted) return
+      setCargoIconUrl(iconPrimary ?? null)
+      setCargoIconUrlSecondary(iconSecondary ?? null)
+      // eslint-disable-next-line no-console
+      console.debug('cargo icon lookup from model', { master_truck_id: (truck as any)?.master_truck_id, primary, secondary, iconPrimary, iconSecondary })
+    }
+
+    void load()
+    return () => {
+      mounted = false
+    }
+  }, [truck?.master_truck_id, modelInfo?.cargo_type_id, modelInfo?.cargo_type_id_secondary, modelInfo?.cargo_type_name, truck?.cargo_type_name])
+
+  // Refresh editable fields from API for owned trucks
   useEffect(() => {
     if (isMarket) return
     let mounted = true
     async function fetchLatestRow() {
       if (!id) return
       try {
+        // Use a safe join to fetch the city name (avoid requesting a non-existing column)
         const res = await supabaseFetch(
-          `/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}&select=name,registration,hub,location_city_id,location_city_name,cargo_type_id,cargo_type_name`,
-          {
-            method: 'GET',
-          }
+          `/rest/v1/user_trucks?id=eq.${encodeURIComponent(
+            id
+          )}&select=name,registration,hub,location_city_id,last_maintenance_at,next_maintenance_km,mileage_km,cities:location_city_id(city_name),acquisition_type&limit=1`,
+          { method: 'GET' }
         )
         if (!mounted) return
         if (res && Array.isArray(res.data) && res.data.length > 0) {
-          const row = res.data[0] as {
-            name?: string | null
-            registration?: string | null
-            hub?: string | null
-            location_city_id?: string | null
-            location_city_name?: string | null
-            cargo_type_id?: string | null
-            cargo_type_name?: string | null
-          }
+          const row = res.data[0] as any
           if (typeof row.name === 'string') setName(row.name)
           if (typeof row.registration === 'string') setRegistration(row.registration)
           if (typeof row.hub === 'string') setHubCity(row.hub)
-          if (typeof row.location_city_id === 'string') setLocationCityId(row.location_city_id)
-          if (typeof row.location_city_name === 'string') setLocationCityName(row.location_city_name)
+
+          // If the join returned a city row, prefer it as the displayed location (safe fallback to hub)
+          if (row.cities && Array.isArray(row.cities) && row.cities.length > 0 && row.cities[0]?.city_name) {
+            setHubCity(row.cities[0].city_name)
+          }
+
+          if (typeof row.last_maintenance_at === 'string') {
+            setLastMaintenanceAt(row.last_maintenance_at)
+          }
+          if (row.next_maintenance_km !== undefined && row.next_maintenance_km !== null) {
+            setNextMaintenanceKm(Number(row.next_maintenance_km))
+          }
+          if (typeof row.mileage_km === 'number') {
+            // update displayed mileage if changed
+          }
+          // Acquisition type (new): update if available
+          if (typeof row.acquisition_type === 'string') {
+            setAcquisitionType(row.acquisition_type)
+          }
         }
       } catch (err) {
-        // ignore fetch errors, keep local state
         // eslint-disable-next-line no-console
         console.error('Failed to fetch latest truck row', err)
       }
@@ -368,28 +361,17 @@ export default function TruckCard({
     }
   }, [id, isMarket])
 
-  /**
-   * loadHubsForOwner
-   *
-   * Load hubs for the owning company so the user can relocate the truck.
-   *
-   * This is only relevant for owned trucks; skip for market listings.
-   *
-   * @returns void
-   */
+  // Load hubs for owner
   useEffect(() => {
     if (isMarket) return
     let mounted = true
     async function load() {
       setLoadingHubs(true)
       try {
-        const ownerCompanyId = (truck as any).owner_company_id ?? (truck as any).owner_id ?? null
-        let res
-        if (ownerCompanyId) {
-          res = await getTable('hubs', `?select=id,city,country,is_main,city_id&owner_id=eq.${ownerCompanyId}&order=is_main.desc,city.asc`)
-        } else {
-          res = await getTable('hubs', `?select=id,city,country,is_main,city_id&order=is_main.desc,city.asc`)
-        }
+        const ownerCompanyId = truck?.owner_company_id ?? truck?.owner_id ?? null
+        const res = ownerCompanyId
+          ? await getTable('hubs', `?select=id,city,country,is_main,city_id&owner_id=eq.${ownerCompanyId}&order=is_main.desc,city.asc`)
+          : await getTable('hubs', `?select=id,city,country,is_main,city_id&order=is_main.desc,city.asc`)
         const rows = Array.isArray(res.data) ? res.data : []
         if (!mounted) return
         const mapped = rows.map((r: any) => ({ id: r.id, city: r.city, country: r.country, is_main: r.is_main, city_id: r.city_id }))
@@ -411,9 +393,6 @@ export default function TruckCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [truck, isMarket])
 
-  /**
-   * keep selectedHubId in sync when hubCity changes externally
-   */
   useEffect(() => {
     const idForCity = hubs.find((h) => h.city === hubCity)?.id ?? ''
     setSelectedHubId(idForCity)
@@ -423,10 +402,6 @@ export default function TruckCard({
    * handleSaveName
    *
    * Persist truck name to public.user_trucks.name via Supabase REST.
-   *
-   * For market listings this is a no-op.
-   *
-   * @param newName - new truck name
    */
   async function handleSaveName(newName: string) {
     if (isMarket) {
@@ -461,10 +436,6 @@ export default function TruckCard({
    * handleSaveRegistration
    *
    * Persist registration to public.user_trucks.registration.
-   *
-   * For market listings this is a no-op.
-   *
-   * @param newReg - new registration (prefix+digits)
    */
   async function handleSaveRegistration(newReg: string) {
     if (isMarket) {
@@ -496,66 +467,18 @@ export default function TruckCard({
   }
 
   /**
-   * resolveCityIdByName
-   *
-   * Try to find a cities.id by exact city name. Returns null when not found.
-   *
-   * @param cityName - city name to lookup
-   * @returns city id string or null
-   */
-  async function resolveCityIdByName(cityName?: string | null): Promise<string | null> {
-    if (!cityName) return null
-    try {
-      const cityRes = await getTable('cities', `?select=id&city_name=eq.${encodeURIComponent(cityName)}&limit=1`)
-      const cityRows = Array.isArray(cityRes.data) ? cityRes.data : []
-      if (cityRows.length > 0 && cityRows[0].id) {
-        return cityRows[0].id
-      }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.debug('City lookup failed for', cityName, err)
-    }
-    return null
-  }
-
-  /**
-   * makePrefixFromCity
-   *
-   * Create a 2-letter prefix from a city name (letters only, uppercase). Pads with X if needed.
-   *
-   * @param city - city name
-   * @returns 2-letter uppercase string
-   */
-  function makePrefixFromCity(city?: string | null) {
-    if (!city) return 'XX'
-    const letters = city.replace(/[^A-Za-z]/g, '').toUpperCase()
-    if (letters.length >= 2) return letters.slice(0, 2)
-    if (letters.length === 1) return `${letters}X`
-    return 'XX'
-  }
-
-  /**
    * handleChangeHub
    *
-   * Persist selected hub (city name) to public.user_trucks.hub column and also
-   * update location_city_id to the selected hub's city_id so the FK is kept in sync.
-   *
-   * For market listings this is a no-op (local state only).
-   *
-   * @param hubId - selected hub id (or empty string for none)
+   * Persist selected hub (city name) to public.user_trucks.hub and update location_city_id.
    */
   async function handleChangeHub(hubId: string) {
     const prevHub = hubCity
-    const prevLocationId = locationCityId
+    const prevLocationId = null
     const prevRegistration = registration
 
     const selected = hubId ? hubs.find((h) => h.id === hubId) : undefined
     const selectedCity = selected?.city ?? null
     let selectedCityId = selected?.city_id ?? null
-
-    if (!selectedCityId && selectedCity) {
-      selectedCityId = await resolveCityIdByName(selectedCity)
-    }
 
     const [, currentDigits] = parseRegistration(registration ?? defaultRegistration ?? null)
     const newPrefix = makePrefixFromCity(selectedCity)
@@ -563,8 +486,7 @@ export default function TruckCard({
     const newRegistration = `${newPrefix}${newDigits}`
 
     setHubCity(selectedCity)
-    setLocationCityId(selectedCityId ?? null)
-    setLocationCityName(selectedCity ?? null)
+    setNextMaintenanceKm(nextMaintenanceKm ?? nextMaintenanceKm)
     setRegistration(newRegistration)
 
     if (isMarket) {
@@ -588,7 +510,6 @@ export default function TruckCard({
 
       if (!res || res.status < 200 || res.status >= 300) {
         setHubCity(prevHub)
-        setLocationCityId(prevLocationId)
         setRegistration(prevRegistration)
         // eslint-disable-next-line no-console
         console.error('Failed to persist hub/location/registration', res)
@@ -596,13 +517,14 @@ export default function TruckCard({
         if (res.data && Array.isArray(res.data) && res.data.length > 0) {
           const returned = res.data[0] as any
           if (returned.registration) setRegistration(returned.registration)
-          if (returned.location_city_id) setLocationCityId(returned.location_city_id)
+          if (returned.location_city_id) {
+            // nothing
+          }
           if (returned.hub) setHubCity(returned.hub)
         }
       }
     } catch (err) {
       setHubCity(prevHub)
-      setLocationCityId(prevLocationId)
       setRegistration(prevRegistration)
       // eslint-disable-next-line no-console
       console.error('Error saving hub/location/registration', err)
@@ -611,113 +533,147 @@ export default function TruckCard({
     }
   }
 
-  /**
-   * ensurePrefixFromHub
-   *
-   * When the truck already has a hub assigned but the registration prefix is 'XX'
-   * (or different), compute the hub-based prefix and persist it.
-   *
-   * Skip for market items.
-   */
-  useEffect(() => {
-    if (isMarket) return
-    let mounted = true
-    async function ensurePrefixFromHub() {
-      if (!id) return
-      if (!hubCity) return
-      if (savingRegistration || savingHub) return
-
-      const [currentPrefix, currentDigits] = parseRegistration(registration ?? defaultRegistration ?? null)
-      const desiredPrefix = makePrefixFromCity(hubCity)
-      if (!desiredPrefix || desiredPrefix === currentPrefix) return
-
-      const newReg = `${desiredPrefix}${currentDigits && currentDigits.length > 0 ? currentDigits : '1'}`
-      setRegistration(newReg)
-      setSavingRegistration(true)
-      try {
-        const res = await supabaseFetch(`/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ registration: newReg }),
-          headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
-        })
-        if (!mounted) return
-        if (!res || res.status < 200 || res.status >= 300) {
-          const [, d] = parseRegistration(registration ?? defaultRegistration ?? null)
-          setRegistration(`${currentPrefix}${d}`)
-          // eslint-disable-next-line no-console
-          console.error('Failed to persist registration on ensurePrefixFromHub', res)
-        } else if (res.data && Array.isArray(res.data) && res.data.length > 0) {
-          const returned = res.data[0] as any
-          if (returned.registration) setRegistration(returned.registration)
-        }
-      } catch (err) {
-        const [, d] = parseRegistration(registration ?? defaultRegistration ?? null)
-        setRegistration(`${currentPrefix}${d}`)
-        // eslint-disable-next-line no-console
-        console.error('Error ensuring registration prefix from hub', err)
-      } finally {
-        if (mounted) setSavingRegistration(false)
-      }
-    }
-
-    ensurePrefixFromHub()
-    return () => {
-      mounted = false
-    }
-  }, [hubCity, id, registration, defaultRegistration, savingRegistration, savingHub, isMarket])
-
   // Location display fallback
-  const location = locationCityName ?? (truck as any).location_city_name ?? hubCity ?? '—'
+  const location = (truck as any)?.location_city_name ?? hubCity ?? '—'
 
-  /**
-   * handleToggleExpand
-   *
-   * Toggle the expanded card panel that reveals more information and options.
-   */
   function handleToggleExpand() {
     if (actionsOpen) setActionsOpen(false)
     setExpanded((s) => !s)
   }
 
+  /**
+   * Visual maintenance state derived values
+   */
+  const remainingKm = nextMaintenanceKm !== null && nextMaintenanceKm !== undefined ? Math.round((nextMaintenanceKm as number) - (Number(truck?.mileage_km ?? mileage) || 0)) : null
+  const isWarning = remainingKm !== null && remainingKm <= 0 && remainingKm > -3000
+  const isSuspended = remainingKm !== null && remainingKm <= -3000
+  const isInRepair = (truck?.status ?? '').toLowerCase() === 'in_repair' || (truck?.status ?? '').toLowerCase() === 'maintenance'
+
+  /**
+   * openMaintenance
+   *
+   * Opens the maintenance modal and preloads estimates.
+   */
+  async function openMaintenance() {
+    setMaintenanceModalOpen(true)
+    try {
+      const estimates = await computeMaintenanceCost(
+        {
+          id,
+          mileage_km: Number(truck?.mileage_km ?? mileage),
+          purchase_date: truck?.purchase_date ?? truck?.created_at,
+          model: { class: truck?.model_class ?? modelInfo?.class },
+        } as any,
+        'city'
+      )
+      setMaintenanceEstimates(estimates)
+    } catch {
+      setMaintenanceEstimates(null)
+    }
+  }
+
   return (
-    <div className="modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200" role="article" aria-label={`Truck ${id || 'unknown'}`}>
+    <div className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200 ${isSuspended ? 'opacity-70 grayscale' : ''}`} role="article" aria-label={`Truck ${id || 'unknown'}`}>
+      {/* Suspended overlay when truck is blocked - visually dim card but keep maintenance button accessible */}
+      {isSuspended && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+          <div className="text-rose-700 bg-white/40 px-3 py-1 rounded-md font-semibold">Suspended — maintenance required</div>
+        </div>
+      )}
+
       <div className="flex items-center gap-4 p-3 w-full">
         <div className="h-12 w-1 rounded-full bg-gradient-to-b from-sky-400 to-emerald-400" />
 
         <div className="flex items-center gap-3 min-w-0 flex-1">
-          <div className="min-w-0">
-            <div className="flex items-center gap-3">
-              <div className="text-xs text-slate-500">Truck Model:</div>
-              <div className="text-sm font-medium truncate">{modelDisplay}</div>
-
-              <div className="text-xs text-slate-500 ml-4">Reg:</div>
-              <div className="ml-1">
-                {isMarket ? (
-                  <div className="inline-flex items-center gap-2">
-                    <span className="px-2 py-1 rounded-l-md bg-slate-100 text-xs font-mono text-slate-700 border border-r-0 border-slate-200">
-                      {parseRegistration(registration ?? defaultRegistration ?? null)[0]}
-                    </span>
-                    <span className="w-20 px-2 py-1 rounded-r-md border border-slate-200 text-sm font-mono">
-                      {parseRegistration(registration ?? defaultRegistration ?? null)[1]}
-                    </span>
-                  </div>
-                ) : (
-                  <EditableRegistration value={registration} defaultValue={defaultRegistration ?? undefined} onSave={handleSaveRegistration} />
-                )}
+          <div className="min-w-0 w-full">
+            <div className="flex items-center gap-3 w-full">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="text-xs text-slate-500">Truck Model:</div>
+                <div className="text-sm font-medium truncate">{modelDisplay}</div>
               </div>
 
               <div className="inline-flex items-center gap-2 ml-4 min-w-0">
                 <div className="text-xs text-slate-500">Truck Name:</div>
-                <div>{isMarket ? <div className="text-sm text-slate-800 truncate">{name || 'Unnamed truck'}</div> : <EditableField value={name} placeholder="Unnamed truck" onSave={handleSaveName} loading={savingName} />}</div>
+                <div className="min-w-0 flex items-center gap-2">
+                  {!editingName ? (
+                    <>
+                      <div className="text-sm font-medium truncate min-w-0">{name ?? defaultName ?? '—'}</div>
+                      {!isMarket && !isSuspended && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingName(true)
+                            setEditInput(name ?? defaultName ?? '')
+                          }}
+                          className="p-1 rounded hover:bg-gray-100 text-slate-500"
+                          aria-label="Edit truck name"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        setEditingName(false)
+                        handleSaveName(editInput)
+                      }}
+                      className="flex items-center gap-2"
+                    >
+                      <input
+                        value={editInput}
+                        onChange={(e) => setEditInput(e.target.value)}
+                        className="text-sm font-medium truncate min-w-0 px-2 py-1 border border-slate-200 rounded bg-white"
+                        aria-label="Edit truck name input"
+                      />
+                      <button type="submit" className="p-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white" aria-label="Save name">
+                        <Check className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingName(false)
+                          setEditInput(name ?? defaultName ?? '')
+                        }}
+                        className="p-1 rounded hover:bg-gray-100 text-slate-500"
+                        aria-label="Cancel edit"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </form>
+                  )}
+                </div>
               </div>
             </div>
           </div>
         </div>
 
+        {/* Cargo type icons */}
+        <div className="flex items-center gap-3 ml-4 flex-shrink-0">
+          <div className="flex items-center gap-3">
+            {cargoIconUrl ? (
+              <img
+                src={cargoIconUrl}
+                alt="Cargo type"
+                className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
+                style={{ flexShrink: 0 }}
+              />
+            ) : null}
+
+            {cargoIconUrlSecondary ? (
+              <img
+                src={cargoIconUrlSecondary}
+                alt="Secondary cargo type"
+                className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
+                style={{ flexShrink: 0 }}
+              />
+            ) : null}
+          </div>
+        </div>
+
         <div className="flex items-center gap-4 ml-6 flex-shrink-0">
           <StatChip icon={<Gauge className="w-4 h-4 text-slate-400" />} label="Condition" value={`${conditionScore}`} className="min-w-[88px]" />
-
-          <StatChip icon={<Calendar className="w-4 h-4 text-slate-400" />} label="Mileage" value={`${mileage}`} className="min-w-[88px]" />
 
           <div className="w-20 flex items-center justify-center flex-shrink-0">
             <div className={`px-2 py-1 rounded-full text-xs font-medium ${statusClass(status)} ring-1 text-center`}>
@@ -757,82 +713,99 @@ export default function TruckCard({
 
             <div>
               <div className="text-xs text-slate-500">Producer</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.make ?? (truck as any).model_make ?? (truck as any).make ?? (truck as any).producer ?? '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{modelInfo?.make ?? truck?.model_make ?? truck?.make ?? truck?.producer ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Country</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.country ?? (truck as any).model_country ?? (truck as any).manufactured_country ?? (truck as any).origin_country ?? (truck as any).country ?? '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{modelInfo?.country ?? truck?.model_country ?? truck?.manufactured_country ?? truck?.origin_country ?? truck?.country ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Class</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.class ?? (truck as any).model_class ?? (truck as any).truck_class ?? (truck as any).class ?? '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{modelInfo?.class ?? truck?.model_class ?? truck?.truck_class ?? truck?.class ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Year</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.year ?? (truck as any).model_year ?? (truck as any).year ?? (truck as any).production_year ?? '—'}</div>
+              {/* Prefer the denormalized year from user_trucks.model_year for active trucks,
+                  fall back to joined modelInfo.year or other year fields when absent. */}
+              <div className="text-sm font-medium text-slate-800">{(truck?.model_year ?? modelInfo?.year) ?? truck?.year ?? truck?.production_year ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Max payload</div>
-              <div className="text-sm font-medium text-slate-800">{(modelInfo as any)?.max_load_kg ?? (truck as any).model_max_load_kg ?? (truck as any).max_payload_kg ?? (truck as any).payload_kg ?? '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{(modelInfo as any)?.max_load_kg ?? truck?.model_max_load_kg ?? truck?.max_payload_kg ?? truck?.payload_kg ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Tonnage in (t)</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.tonnage ?? (truck as any).model_tonnage ?? (truck as any).tonnage ?? (truck as any).gross_tonnage ?? '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{modelInfo?.tonnage ?? truck?.model_tonnage ?? truck?.tonnage ?? truck?.gross_tonnage ?? '—'}</div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Cargo type</div>
               <div className="text-sm font-medium text-slate-800">
                 <div className="flex items-center gap-2">
-                  {/* Primary cargo type badge */}
-                  {(modelInfo?.cargo_type_id ?? (truck as any).cargo_type_id) ? (
+                  {(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) ? (
                     <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                      {modelInfo?.cargo_type_name ?? (truck as any).cargo_type_name ?? '—'}
+                      {modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? '—'}
                     </span>
                   ) : null}
 
-                  {/* Secondary cargo type badge */}
-                  {(modelInfo?.cargo_type_id_secondary ?? (truck as any).cargo_type_id_secondary) ? (
+                  {(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? (
                     <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                      {modelInfo?.cargo_type_secondary_name ?? (truck as any).cargo_type_secondary_name ?? '—'}
+                      {modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? '—'}
                     </span>
                   ) : null}
 
-                  {/* Fallback when neither present */}
-                  {!(modelInfo?.cargo_type_id ?? (truck as any).cargo_type_id) && !(modelInfo?.cargo_type_id_secondary ?? (truck as any).cargo_type_id_secondary) ? '—' : null}
+                  {!(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) && !(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? '—' : null}
                 </div>
               </div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Purchase date</div>
-              <div className="text-sm font-medium text-slate-800">{(truck as any).purchase_date ? new Date((truck as any).purchase_date).toLocaleString() : (truck as any).created_at ? new Date((truck as any).created_at).toLocaleString() : '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{truck?.purchase_date ? new Date(truck.purchase_date).toLocaleString() : truck?.created_at ? new Date(truck.created_at).toLocaleString() : '—'}</div>
+            </div>
+
+            {/* Acquisition type (new)
+              Map raw acquisition_type values to either "Purchased" or "Leased". */}
+            <div>
+              <div className="text-xs text-slate-500">Acquisition type</div>
+              <div className="text-sm font-medium text-slate-800">
+                {(() => {
+                  // Normalize and map a variety of possible raw values to two display values.
+                  const raw = acquisitionType ?? (truck?.acquisition_type ?? null)
+                  if (!raw) return 'Purchased'
+                  const v = String(raw).toLowerCase()
+                  if (v.includes('lease') || v.includes('leased') || v.includes('rental') || v.includes('rent')) return 'Leased'
+                  // Treat all other cases (starter, used, purchased, buy, etc.) as Purchased
+                  return 'Purchased'
+                })()}
+              </div>
             </div>
 
             <div>
-              <div className="text-xs text-slate-500">Mileage</div>
+              <div className="text-xs text-slate-500">Mileage in (km)</div>
               <div className="text-sm font-medium text-slate-800">{mileage != null ? `${mileage}` : '—'}</div>
             </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Fuel level</div>
-              <div className="text-sm font-medium text-slate-800">{(truck as any).fuel_level_l ? `${(truck as any).fuel_level_l} L` : '—'}</div>
-            </div>
-
+            {/* Last maintenance (date-only) */}
             <div>
               <div className="text-xs text-slate-500">Last maintenance</div>
-              <div className="text-sm font-medium text-slate-800">{(truck as any).last_maintenance_at ? new Date((truck as any).last_maintenance_at).toLocaleString() : '—'}</div>
+              <div className="text-sm font-medium text-slate-800">{lastMaintenanceAt ? new Date(lastMaintenanceAt).toLocaleDateString() : (truck?.created_at ? new Date(truck.created_at).toLocaleDateString() : '—')}</div>
             </div>
 
+            {/* Next maintenance (remaining km) */}
             <div>
               <div className="text-xs text-slate-500">Next maintenance (km)</div>
-              <div className="text-sm font-medium text-slate-800">{(truck as any).next_maintenance_km ?? '—'}</div>
+              <div className={`text-sm font-medium ${remainingKm === null ? 'text-slate-800' : remainingKm > 0 ? 'text-slate-800' : remainingKm > -3000 ? 'text-amber-700' : 'text-rose-700'}`}>
+                {remainingKm === null ? (nextMaintenanceKm !== null ? `${Number(nextMaintenanceKm).toLocaleString()} km` : '—') : `${remainingKm.toLocaleString()} km`}
+              </div>
             </div>
+
+            <TruckInsurance userTruckId={id} className="col-span-1 sm:col-span-1" />
 
             <div>
               <div className="text-xs text-slate-500">Hub</div>
@@ -841,7 +814,7 @@ export default function TruckCard({
           </div>
 
           <div className="mt-3 flex items-center gap-3 justify-end">
-            {/* Hub selector + Apply moved here so it's in-line with action buttons */}
+            {/* Hub selector + Registration input aligned on the same row */}
             <div className="mr-auto flex items-center gap-2">
               <div className="text-xs text-slate-500 hidden sm:block">Hub</div>
 
@@ -863,6 +836,22 @@ export default function TruckCard({
                     ))}
                   </select>
 
+                  <RegistrationInput
+                    value={registrationDigits}
+                    onChange={(d) => {
+                      setRegistrationDigits(d)
+                      const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
+                      setRegistration(`${prefix}${d}`)
+                    }}
+                    region={parseRegistration(registration ?? defaultRegistration ?? null)[0]}
+                    onSave={() => {
+                      const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
+                      handleSaveRegistration(`${prefix}${registrationDigits}`)
+                    }}
+                    disabled={savingRegistration || isMarket}
+                    className="ml-3"
+                  />
+
                   <button
                     type="button"
                     onClick={() => {
@@ -878,77 +867,70 @@ export default function TruckCard({
               )}
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                console.debug('Components for', id)
-                // Keep the details panel expanded when opening components
-                setShowComponents(true)
-              }}
-              className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2"
-            >
-              Truck Components
+            {/* Buttons - disable non-maintenance actions when suspended */}
+            <button type="button" onClick={() => setShowComponents(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+              Components
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                // Open the Truck specifications modal (fetches truck_models row including image)
-                setShowSpecs(true)
-                // Keep the details panel expanded (do not collapse)
-              }}
-              className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2"
-            >
-              Truck specifications
+            <button type="button" onClick={() => setShowSpecs(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+              Specifications
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                // Open logs modal for this truck and keep details expanded
-                setShowLogs(true)
-              }}
-              className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2"
-            >
-              View logs
+            <button type="button" onClick={() => setShowLogs(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+              Logs
             </button>
 
-            <button
-              type="button"
-              onClick={openInsurance}
-              className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2"
-            >
+            <button type="button" onClick={() => setShowInsurance(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
               Insurance
             </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                // Open Sell Truck modal (moved to last position)
-                setShowSell(true)
-              }}
-              className="px-3 py-1 text-sm bg-red-600 hover:bg-red-700 border border-red-600 rounded text-white flex items-center gap-2"
-            >
-              Sell Truck
+            {/* Maintenance button always active (even for suspended trucks) */}
+            <button type="button" onClick={openMaintenance} className="px-3 py-1 text-sm bg-amber-600 hover:bg-amber-700 border border-amber-600 rounded text-white flex items-center gap-2">
+              Maintenance
+            </button>
+
+            <button type="button" onClick={() => setShowSell(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} border ${isSuspended ? 'border-slate-200' : 'border-red-600'} rounded text-white flex items-center gap-2`} disabled={isSuspended}>
+              Sell
             </button>
           </div>
         </div>
       </div>
 
-      {/* Logs modal (keeps TruckCard layout unchanged) */}
       <LogModal truckId={id} open={showLogs} onClose={() => setShowLogs(false)} />
-
-      {/* Truck specifications modal */}
       <TruckSpecModal modelId={rawModelId} open={showSpecs} onClose={() => setShowSpecs(false)} />
-
-      {/* Truck components modal */}
       <TruckComponentsModal truckId={id} open={showComponents} onClose={() => setShowComponents(false)} />
-
-      {/* Insurance modal */}
-      <InsuranceModal truckId={id} condition={conditionScore} open={showInsurance} onClose={closeInsurance} />
-
-      {/* Sell truck modal */}
+      <InsuranceModal truckId={id} condition={conditionScore} open={showInsurance} onClose={() => setShowInsurance(false)} />
       <SellTruckModal truckId={id} condition={conditionScore} open={showSell} onClose={() => setShowSell(false)} />
+      <MaintenanceModal truckId={id} open={maintenanceModalOpen} onClose={() => setMaintenanceModalOpen(false)} onDone={() => {
+        // Refresh minimal fields after maintenance
+        (async () => {
+          try {
+            const res = await supabaseFetch(`/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}&select=last_maintenance_at,next_maintenance_km,mileage_km`)
+            if (res && Array.isArray(res.data) && res.data.length > 0) {
+              const r = res.data[0] as any
+              if (r.last_maintenance_at) setLastMaintenanceAt(r.last_maintenance_at)
+              if (r.next_maintenance_km !== undefined && r.next_maintenance_km !== null) setNextMaintenanceKm(Number(r.next_maintenance_km))
+            }
+          } catch {
+            // noop
+          }
+        })()
+      }} />
     </div>
   )
+}
+
+/**
+ * makePrefixFromCity
+ *
+ * Create a 2-letter prefix from a city name (letters only, uppercase). Pads with X if needed.
+ *
+ * @param city - string
+ */
+function makePrefixFromCity(city?: string | null) {
+  if (!city) return 'XX'
+  const letters = city.replace(/[^A-Za-z]/g, '').toUpperCase()
+  if (letters.length >= 2) return letters.slice(0, 2)
+  if (letters.length === 1) return `${letters}X`
+  return 'XX'
 }

@@ -176,6 +176,10 @@ export async function updateTruck(truckId: string, patch: Record<string, any>) {
  *  - Additionally fetch rows where owner_company_id == public.users.company_id (if present)
  *  - Avoid duplicates and map nested truck_models -> model
  *
+ * IMPORTANT:
+ *  - For active trucks shown on the Trucks page we prefer the year coming from user_trucks.model_year
+ *    (a denormalized/override value) when available. Only fall back to truck_models.year when absent.
+ *
  * @param authUserId - Supabase GoTrue auth user id (auth.uid())
  * @returns TruckCardRow[] (empty array on error)
  */
@@ -191,7 +195,7 @@ export async function fetchTrucksForAuthUser(authUserId: string): Promise<TruckC
     const ownerCompanyId = publicUser?.company_id ?? null
 
     const selectFragment =
-      'select=id,master_truck_id,owner_user_id,owner_company_id,name,registration,purchase_date,created_at,mileage_km,fuel_level_l,condition_score,status,location_city_id,location_city_name,truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)'
+      'select=id,master_truck_id,owner_user_id,owner_company_id,name,registration,purchase_date,created_at,mileage_km,model_year,fuel_level_l,condition_score,status,location_city_id,location_city_name,truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)'
 
     const results: any[] = []
 
@@ -213,26 +217,30 @@ export async function fetchTrucksForAuthUser(authUserId: string): Promise<TruckC
       results.push(...byUser)
     }
 
-    if (ownerCompanyId) {
-      const byCompany = await fetchForFilter('owner_company_id', ownerCompanyId)
-      const existing = new Set(results.map((t) => String(t.id)))
-      for (const t of byCompany) {
-        if (!existing.has(String(t.id))) results.push(t)
-      }
-    }
+    // NOTE:
+    // We intentionally do NOT fetch company-only trucks (owner_company_id = company_id, owner_user_id is null)
+    // here, because the RLS policies do not allow the current user to update those rows.
+    // The UI would show non-editable "ghost" trucks. Instead, we rely on creating a starter
+    // user_trucks row that is explicitly owned by this user (owner_user_id), see
+    // createCompanyWithBootstrap in db.ts.
 
-    // Map into TruckCardRow shape
+    // Map into TruckCardRow shape. Prefer user_trucks.model_year when present for active trucks.
     const mapped: TruckCardRow[] = results.map((r: any) => {
       const model = r.truck_models ?? null
+      const resolvedYear =
+        r.model_year !== undefined && r.model_year !== null
+          ? (typeof r.model_year === 'number' ? r.model_year : Number(r.model_year))
+          : (model && model.year !== undefined ? (typeof model.year === 'number' ? model.year : Number(model.year)) : null)
+
       return {
         id: String(r.id),
         name: r.name ?? null,
         registration: r.registration ?? null,
         purchase_date: r.purchase_date ?? null,
         created_at: r.created_at ?? null,
-        mileage_km: typeof r.mileage_km === 'number' ? r.mileage_km : (r.mileage_km ? Number(r.mileage_km) : null),
-        fuel_level_l: typeof r.fuel_level_l === 'number' ? r.fuel_level_l : (r.fuel_level_l ? Number(r.fuel_level_l) : null),
-        condition_score: typeof r.condition_score === 'number' ? r.condition_score : (r.condition_score ? Number(r.condition_score) : null),
+        mileage_km: typeof r.mileage_km === 'number' ? r.mileage_km : r.mileage_km ? Number(r.mileage_km) : null,
+        fuel_level_l: typeof r.fuel_level_l === 'number' ? r.fuel_level_l : r.fuel_level_l ? Number(r.fuel_level_l) : null,
+        condition_score: typeof r.condition_score === 'number' ? r.condition_score : r.condition_score ? Number(r.condition_score) : null,
         status: r.status ?? null,
         location_city_id: r.location_city_id ?? null,
         location_city_name: r.location_city_name ?? null,
@@ -245,9 +253,19 @@ export async function fetchTrucksForAuthUser(authUserId: string): Promise<TruckC
               class: model.class ?? null,
               max_payload: model.max_payload ?? null,
               tonnage: model.tonnage ?? null,
-              year: model.year ?? null,
+              year: resolvedYear,
             }
-          : null,
+          : {
+              // No joined model; still set year from user_trucks if available
+              id: r.master_truck_id,
+              make: null,
+              model: null,
+              country: null,
+              class: null,
+              max_payload: null,
+              tonnage: null,
+              year: resolvedYear ?? null,
+            },
         _raw: r,
       }
     })
@@ -278,7 +296,7 @@ export async function getUserTrucksWithModels(): Promise<any[]> {
     // Use select with join to truck_models. Avoid adding owner_user_id filters here;
     // RLS will restrict results appropriately for the logged-in session.
     const qs = encodeURI(
-      `/rest/v1/user_trucks?select=*,truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)&order=created_at.desc&limit=500`
+      `/rest/v1/user_trucks?select=*,model_year,truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)&order=created_at.desc&limit=500`
     )
     const res = await supabaseFetch(qs)
 

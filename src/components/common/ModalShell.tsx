@@ -8,7 +8,7 @@
  * - Exposes size, title and footer props so content components remain small and focused.
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 
@@ -25,6 +25,10 @@ export interface ModalShellProps {
    * Optional title rendered in the header.
    */
   title?: string
+  /**
+   * Optional id applied to the outer dialog element for accessibility and aria-controls.
+   */
+  id?: string
   /**
    * Modal size controls max width.
    */
@@ -102,15 +106,20 @@ export default function ModalShell({
   onClose,
   children,
   title,
+  id,
   size = 'md',
   footer,
   showCloseButton = true,
   className = '',
 }: ModalShellProps): JSX.Element | null {
   const [mounted, setMounted] = useState(false)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const lastActiveEl = useRef<HTMLElement | null>(null)
 
   useEffect(() => {
     if (!open) return
+    // capture the previously focused element so we can restore focus on close
+    lastActiveEl.current = document.activeElement as HTMLElement | null
     // mount animation + disable body scroll
     requestAnimationFrame(() => setMounted(true))
     const prev = typeof document !== 'undefined' ? document.body.style.overflow : ''
@@ -118,12 +127,34 @@ export default function ModalShell({
     return () => {
       setMounted(false)
       if (typeof document !== 'undefined') document.body.style.overflow = prev
+      // restore focus to previous element
+      try {
+        lastActiveEl.current?.focus()
+      } catch {
+        //
+      }
     }
   }, [open])
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose()
+      // trap focus inside modal for Tab/Shift+Tab
+      if (e.key === 'Tab' && panelRef.current) {
+        const focusable = panelRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+        )
+        if (focusable.length === 0) return
+        const first = focusable[0]
+        const last = focusable[focusable.length - 1]
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault()
+          first.focus()
+        }
+      }
     }
     if (open) {
       window.addEventListener('keydown', onKey)
@@ -132,11 +163,33 @@ export default function ModalShell({
     return
   }, [open, onClose])
 
+  useEffect(() => {
+    // when opened, focus first focusable element or the panel itself
+    if (open) {
+      requestAnimationFrame(() => {
+        try {
+          const panel = panelRef.current
+          if (!panel) return
+          const focusable = panel.querySelectorAll<HTMLElement>(
+            'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+          )
+          if (focusable.length > 0) {
+            focusable[0].focus()
+          } else {
+            panel.focus()
+          }
+        } catch {
+          //
+        }
+      })
+    }
+  }, [open])
+
   if (!open) return null
 
   const backdropClass = `fixed inset-0 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ${mounted ? 'opacity-100' : 'opacity-0'}`
   const panelSize = sizeClassFor(size)
-  const panelClass = `relative w-full ${panelSize} max-h-[85vh] overflow-auto bg-white rounded-lg shadow-2xl ring-1 ring-slate-200 transform transition-all duration-200 ${mounted ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-4 scale-98'} ${className}`
+  const panelClass = `relative w-full ${panelSize} max-h-[85vh] overflow-auto bg-white rounded-lg shadow-2xl ring-1 ring-slate-200 text-black transform transition-all duration-200 ${mounted ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-4 scale-98'} ${className}`
 
   const portalRoot = getOrCreatePortalRoot()
 
@@ -158,9 +211,9 @@ export default function ModalShell({
   const footerNode = footer ? <div className="px-4 py-3 border-t">{footer}</div> : null
 
   return createPortal(
-    <div aria-modal="true" role="dialog" className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div aria-modal="true" role="dialog" id={id} className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className={backdropClass} onClick={onClose} />
-      <div className={panelClass} onClick={(e) => e.stopPropagation()}>
+      <div ref={panelRef} tabIndex={-1} className={panelClass} onClick={(e) => e.stopPropagation()}>
         {header}
         <div className="p-4">{children}</div>
         {footerNode}

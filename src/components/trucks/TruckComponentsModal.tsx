@@ -15,6 +15,7 @@ import React, { useEffect, useState } from 'react'
 import { X, RefreshCw, Search, Filter } from 'lucide-react'
 import ModalShell from '../common/ModalShell'
 import { supabaseFetch, supabase } from '../../lib/supabase'
+import { useTruckOverallCondition } from '../../hooks/useTruckOverallCondition'
 
 /**
  * UserTruckComponentRow
@@ -137,6 +138,10 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Live overall condition hook (computed from components)
+  const { value: overallValue, display: overallDisplay, loading: overallLoading, refresh: refreshOverall } =
+    useTruckOverallCondition(truckId)
+
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [sort, setSort] = useState<'newest' | 'oldest'>('newest')
@@ -231,8 +236,23 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
   return (
     <ModalShell open={open} onClose={onClose} title="Truck Components" size="lg" footer={footer}>
       <div className="flex items-start justify-between px-0">
-        <div />
+        {/* Left: live overall condition summary */}
+        <div className="flex items-center gap-4">
+          <div className="text-left">
+            <div className="text-xs text-slate-500">Overall Condition</div>
+            <div className="text-2xl font-semibold text-slate-800">{overallLoading ? '…' : overallDisplay ?? '0'}</div>
+            <div className="w-36 h-2 bg-slate-100 rounded mt-2 overflow-hidden">
+              <div
+                className="h-2 bg-gradient-to-r from-emerald-400 to-sky-500"
+                style={{ width: `${Math.max(0, Math.min(100, (overallLoading ? 0 : overallValue) || 0))}%` }}
+                aria-hidden
+              />
+            </div>
+            <div className="text-xs text-slate-400 mt-1">Live average of component scores</div>
+          </div>
+        </div>
 
+        {/* Right: actions */}
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -258,6 +278,29 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
             title="Drive to Repair Garage"
           >
             Drive to Repair Garage
+          </button>
+
+          {/* New helper button: reload components and notify other parts of the UI */}
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                // reload components for this modal
+                await loadComponentsWithNames(truckId)
+              } catch (err) {
+                // noop
+              }
+              // Notify other UI pieces (hooks listen for this event)
+              try {
+                window.dispatchEvent(new CustomEvent('truck-components-updated', { detail: { truckId } }))
+              } catch (e) {
+                // noop
+              }
+            }}
+            className="px-3 py-1 rounded bg-sky-600 hover:bg-sky-700 text-white text-sm flex items-center gap-2"
+            title="Refresh overall condition"
+          >
+            Refresh overall
           </button>
 
           <button onClick={onClose} aria-label="Close components" className="p-2 rounded hover:bg-slate-100 text-slate-600">

@@ -22,8 +22,6 @@
  * - New code can prefer the `supabase` client for richer features (realtime, typed queries).
  */
 
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
-
 /**
  * Session storage key
  */
@@ -41,6 +39,8 @@ type StoredSession = {
   refresh_token?: string | null
   expires_at?: number | null
 }
+
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 
 /**
  * In-memory auth token used for authenticated REST calls.
@@ -277,12 +277,57 @@ function aliasTableName(table: string) {
 }
 
 /**
+ * Helper: rewriteSelectForUserTrucks
+ *
+ * Fix queries that request a top-level "model" column on user_trucks (which does not exist).
+ * Replace only top-level token "model" with "model_model" while preserving nested
+ * expressions like truck_models(...,model,...) unchanged.
+ *
+ * @param selectValue - the raw select=... value (everything after select= and before &)
+ * @returns adjusted select value
+ */
+function rewriteSelectForUserTrucks(selectValue: string): string {
+  if (!selectValue) return selectValue
+
+  const tokens: string[] = []
+  let buf = ''
+  let depth = 0
+  for (let i = 0; i < selectValue.length; i++) {
+    const ch = selectValue[i]
+    if (ch === '(') {
+      depth++
+      buf += ch
+      continue
+    }
+    if (ch === ')') {
+      depth = Math.max(0, depth - 1)
+      buf += ch
+      continue
+    }
+    if (ch === ',' && depth === 0) {
+      tokens.push(buf.trim())
+      buf = ''
+      continue
+    }
+    buf += ch
+  }
+  if (buf.trim()) tokens.push(buf.trim())
+
+  const mapped = tokens.map((t) => {
+    // Replace only if token is exactly "model"
+    if (t === 'model') return 'model_model'
+    return t
+  })
+  return mapped.join(',')
+}
+
+/**
  * supabaseFetch
  *
  * Generic helper to call Supabase REST/Gotrue endpoints.
  *
  * - Adds apikey header (anon key) always.
- * - Adds Authorization: Bearer &lt;JWT&gt; ONLY when a real user JWT is available.
+ * - Adds Authorization: Bearer <JWT> ONLY when a real user JWT is available.
  * - Returns a structured { status, data, error? } object and never throws.
  *
  * @param path - REST path after base URL (e.g. '/rest/v1/cities' or '/auth/v1/token')
@@ -291,7 +336,40 @@ function aliasTableName(table: string) {
 export async function supabaseFetch(path: string, opts: RequestInit = {}) {
   try {
     const p = path.startsWith('/') ? path : `/${path}`
-    const url = `${SUPABASE_URL}${p}`
+
+    let url = `${SUPABASE_URL}${p}`
+
+    // If this is a REST call against user_trucks and includes a select=... query
+    // then patch any top-level "model" token to "model_model" to avoid PostgREST 42703.
+    // This is a defensive shim so older frontend calls that still request `model`
+    // don't crash the entire request.
+    try {
+      const restPrefix = '/rest/v1/user_trucks'
+      const urlObjIndex = url.indexOf(restPrefix)
+      if (urlObjIndex !== -1) {
+        // isolate query string part (after '?')
+        const qIndex = url.indexOf('?', urlObjIndex)
+        if (qIndex !== -1 && qIndex + 1 < url.length) {
+          const base = url.slice(0, qIndex + 1)
+          const query = url.slice(qIndex + 1)
+          // find select= value
+          const selectMatch = /(^|&)(select)=([^&]*)/.exec(query)
+          if (selectMatch && selectMatch[3]) {
+            const originalSelect = selectMatch[3]
+            const replacedSelect = rewriteSelectForUserTrucks(originalSelect)
+            if (replacedSelect !== originalSelect) {
+              // rebuild query with replaced select
+              const newQuery = query.replace(originalSelect, replacedSelect)
+              url = base + newQuery
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Defensive: if our shim fails, fall back to the original url (do not block request).
+      // eslint-disable-next-line no-console
+      console.debug('supabaseFetch select rewrite failed', e)
+    }
 
     const headers: Record<string, string> = {
       accept: 'application/json',

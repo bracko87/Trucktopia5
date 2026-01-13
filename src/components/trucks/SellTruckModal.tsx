@@ -1,28 +1,25 @@
 /**
  * SellTruckModal.tsx
  *
- * Modal that presents sell offers for a truck based on its condition score.
+ * Modal that presents sell offers for a truck.
  *
  * Responsibilities:
- * - Compute a set of offers derived from the truck condition.
- * - Render the offers and allow the user to accept one (placeholder action).
- * - Use ModalShell for consistent presentation.
+ * - Fetch the user_trucks row for the truck being sold.
+ * - Compute deterministic detailed offers using computeDetailedOffersFromUserTruck.
+ * - Render offers using OfferCard and allow the user to accept one.
  */
 
-import React from 'react'
+import React, { useEffect, useState } from 'react'
 import ModalShell from '../common/ModalShell'
-
-/**
- * Offer
- *
- * Simple shape describing a sell offer.
- */
-interface Offer {
-  id: string
-  label: string
-  price: number
-  note?: string
-}
+import OfferCard from './OfferCard'
+import {
+  fetchUserTruck,
+  computeDetailedOffersFromUserTruck,
+  computeOffersFromUserTruck,
+  acceptOffer,
+  UserTruckRow,
+  Offer,
+} from '../../services/sellService'
 
 /**
  * SellTruckModalProps
@@ -31,113 +28,114 @@ interface Offer {
  */
 export interface SellTruckModalProps {
   truckId: string
-  condition: number
+  condition?: number
   open: boolean
   onClose: () => void
 }
 
 /**
- * formatCurrency
- *
- * Format a number as a simple currency string.
- *
- * @param n - amount in USD
- * @returns formatted string
- */
-function formatCurrency(n: number) {
-  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
-}
-
-/**
- * computeOffers
- *
- * Create three deterministic offers based on the truck condition.
- *
- * - higher condition produces better offers.
- * - we return an array of Offer objects.
- *
- * @param condition - 0..100
- * @returns Offer[]
- */
-function computeOffers(condition: number): Offer[] {
-  const base = 20000 // base value for a reference truck in good condition
-  const condFactor = Math.max(0, Math.min(100, condition)) / 100
-  // Dealer (fast, lower), Private sale (better), Auction/Marketplace (highest)
-  const dealer = Math.round(base * (0.5 + 0.25 * condFactor)) // 50%..75%
-  const privateSale = Math.round(base * (0.7 + 0.4 * condFactor)) // 70%..110%
-  const marketplace = Math.round(base * (0.8 + 0.6 * condFactor)) // 80%..140%
-
-  return [
-    { id: 'dealer', label: 'Dealer buy (instant)', price: dealer, note: 'Fast sale, instant payout' },
-    { id: 'private', label: 'Direct/private sale', price: privateSale, note: 'Best balance between speed and price' },
-    { id: 'market', label: 'Marketplace / auction', price: marketplace, note: 'Highest potential price, may take time' },
-  ]
-}
-
-/**
- * getConditionColor
- *
- * Return a Tailwind color class for the condition percentage.
- *
- * @param c - condition number
- * @returns string Tailwind text color class
- */
-function getConditionColor(c: number) {
-  if (c > 80) return 'text-emerald-600'
-  if (c > 60) return 'text-green-600'
-  if (c > 40) return 'text-amber-600'
-  if (c > 20) return 'text-orange-600'
-  return 'text-red-600'
-}
-
-/**
  * SellTruckModal
  *
- * Present a list of offers and allow the user to accept one.
+ * Present a list of offers computed from the user_trucks row and allow the user to accept one.
+ *
+ * Behavior:
+ * - When opened, fetch the user_trucks row for truckId.
+ * - Build 4-5 offers that are close in price; settlement windows vary (instant, 2-5 days, 7-14 days).
+ * - Dealer offer can be below the 50% new-price floor but is instant.
  *
  * @param props - SellTruckModalProps
  */
-export default function SellTruckModal({ truckId, condition, open, onClose }: SellTruckModalProps): JSX.Element | null {
-  const offers = computeOffers(condition)
+export default function SellTruckModal({ truckId, condition = 100, open, onClose }: SellTruckModalProps) {
+  const [truck, setTruck] = useState<UserTruckRow | null>(null)
+  const [offers, setOffers] = useState<Offer[]>([])
+  const [loading, setLoading] = useState(false)
+  const [acceptingId, setAcceptingId] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    async function load() {
+      if (!open || !truckId) return
+      setLoading(true)
+      setError(null)
+      try {
+        const t = await fetchUserTruck(truckId)
+        if (!mounted) return
+        setTruck(t)
+        if (t) {
+          // prefer detailed generator when full row available
+          setOffers(computeDetailedOffersFromUserTruck(t))
+        } else {
+          // fallback to simpler generator using provided condition only
+          const fallback: UserTruckRow = {
+            id: truckId,
+            condition_score: Math.max(0, Math.min(100, condition)),
+            purchase_price: undefined,
+            purchase_date: undefined,
+            mileage_km: undefined,
+          }
+          setOffers(computeOffersFromUserTruck(fallback))
+        }
+      } catch (err: any) {
+        setError(err?.message ?? String(err))
+        const fallback: UserTruckRow = {
+          id: truckId,
+          condition_score: Math.max(0, Math.min(100, condition)),
+          purchase_price: undefined,
+          purchase_date: undefined,
+          mileage_km: undefined,
+        }
+        setOffers(computeOffersFromUserTruck(fallback))
+      } finally {
+        if (mounted) setLoading(false)
+      }
+    }
+    load()
+    return () => {
+      mounted = false
+    }
+  }, [open, truckId, condition])
+
+  /**
+   * handleAccept
+   *
+   * Call acceptOffer and close modal on success.
+   *
+   * @param offer - offer being accepted
+   */
+  async function handleAccept(offer: Offer) {
+    setAcceptingId(offer.id)
+    setError(null)
+    try {
+      const res = await acceptOffer(truckId, offer)
+      if (res.success) {
+        onClose()
+      } else {
+        setError(res.message ?? 'Sale failed')
+      }
+    } catch (err: any) {
+      setError(err?.message ?? String(err))
+    } finally {
+      setAcceptingId(null)
+    }
+  }
 
   return (
     <ModalShell open={open} onClose={onClose} title="Sell truck" size="md" footer={null}>
       <div className="space-y-3">
-        <div className="text-sm text-slate-600">
-          This truck (id: <span className="font-mono text-xs text-slate-700">{truckId || '—'}</span>) has a condition score of{' '}
-          <span className={`font-semibold ${getConditionColor(condition)}`}>{condition}%</span>.
-        </div>
+        {/* Top info line intentionally hidden per request */}
 
-        <div className="grid grid-cols-1 gap-3">
-          {offers.map((o) => (
-            <div key={o.id} className="p-3 border rounded-md bg-white shadow-sm flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium text-slate-900">{o.label}</div>
-                <div className="text-xs text-slate-500">{o.note}</div>
-              </div>
+        {loading ? (
+          <div className="text-sm text-slate-500">Loading offers…</div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3">
+            {offers.map((o) => (
+              <OfferCard key={o.id} offer={o} disabled={!!acceptingId} onAccept={() => handleAccept(o)} />
+            ))}
+          </div>
+        )}
 
-              <div className="flex items-center gap-3">
-                <div className="text-right">
-                  <div className="text-lg font-semibold text-slate-900">{formatCurrency(o.price)}</div>
-                  <div className="text-xs text-slate-500">Estimated</div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    // Placeholder action: in a real app this would trigger the sale flow (API call)
-                    // eslint-disable-next-line no-console
-                    console.log('Accepted offer', o, 'for truck', truckId)
-                    onClose()
-                  }}
-                  className="px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm"
-                >
-                  Accept
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
+        {error ? <div className="text-sm text-red-600">{error}</div> : null}
 
         <div className="pt-2 flex justify-end">
           <button onClick={onClose} className="px-3 py-1 rounded border border-slate-200 bg-white hover:bg-slate-100 text-sm">

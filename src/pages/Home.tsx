@@ -31,24 +31,39 @@ export default function HomePage() {
   /**
    * fetchStats
    *
-   * Load counts from Supabase tables to display live numbers.
+   * Read the pre-aggregated counts row from a stats_counts table/view and map it
+   * to the local stats state. This avoids querying protected underlying tables
+   * directly (which triggers RLS / 401). We try several common view names for
+   * robustness and select only the count columns for id=1.
    */
   async function fetchStats() {
+    const candidates = ['stats_counts_table', 'stats_counts', 'stats_counts_view', 'stats_counts_table_view']
+
     try {
-      const [usersRes, trucksRes, jobsRes, citiesRes] = await Promise.all([
-        getTable('users', '?select=id'),
-        getTable('trucks', '?select=id'),
-        getTable('jobs', '?select=id'),
-        getTable('cities', '?select=id'),
-      ])
-      setStats({
-        activeUsers: Array.isArray(usersRes.data) ? usersRes.data.length : 0,
-        activeTrucks: Array.isArray(trucksRes.data) ? trucksRes.data.length : 0,
-        totalJobs: Array.isArray(jobsRes.data) ? jobsRes.data.length : 0,
-        totalCities: Array.isArray(citiesRes.data) ? citiesRes.data.length : 0,
-      })
+      for (const name of candidates) {
+        try {
+          const res = await getTable(name, '?select=users_count,trucks_count,jobs_count,cities_count&id=eq.1')
+          const rows = Array.isArray(res.data) ? res.data : []
+          if (rows.length > 0) {
+            const row = rows[0] as any
+            setStats({
+              activeUsers: Number(row.users_count ?? 0),
+              activeTrucks: Number(row.trucks_count ?? 0),
+              totalJobs: Number(row.jobs_count ?? 0),
+              totalCities: Number(row.cities_count ?? 0),
+            })
+            return
+          }
+        } catch (e) {
+          // try next candidate
+          // eslint-disable-next-line no-console
+          console.debug(`HomePage: stats fetch failed for ${name}`, e)
+        }
+      }
     } catch (err) {
-      // fail silently - keep zeros for demo
+      // fail silently for demo
+      // eslint-disable-next-line no-console
+      console.debug('HomePage: fetchStats unexpected error', err)
     }
   }
 

@@ -12,6 +12,7 @@
 
 import React, { useEffect, useState } from 'react'
 import TruckCard from './TruckCard'
+import MarketTruckCard from './MarketTruckCard'
 import { getTruckModelsBatch } from '../../lib/db/modules/truckModels'
 
 /**
@@ -140,7 +141,11 @@ export default function TrucksList({ trucks }: TrucksListProps) {
 
         return (
           <div key={t.id ?? JSON.stringify(t)} className="w-full">
-            <TruckCard truck={t} modelInfo={modelInfo} isMarket={isMarket} />
+            {isMarket ? (
+              <MarketTruckCard marketItem={t} modelId={rawModelId} />
+            ) : (
+              <TruckCard truck={t} modelInfo={modelInfo} isMarket={isMarket} />
+            )}
           </div>
         )
       })}

@@ -23,34 +23,95 @@ import NewTrucksMarketPage from './pages/NewTrucksMarket'
 import MyJobsPage from './pages/MyJobs'
 import FinancesPage from './pages/Finances'
 import MapPage from './pages/Map'
-import { AuthProvider } from './context/AuthContext'
+
+/* Settings pages (new) */
+import SettingsProfilePage from './pages/Settings/Profile'
+import SettingsInboxPage from './pages/Settings/Inbox'
+import SettingsCustomizePage from './pages/Settings/CustomizeCompany'
+import SettingsPreferencesPage from './pages/Settings/Preferences'
+import SettingsHelpPage from './pages/Settings/Help'
+import SettingsContactPage from './pages/Settings/Contact'
+import SettingsInvitePage from './pages/Settings/Invite'
+import SettingsProPage from './pages/Settings/Pro'
+import { AuthProvider, useAuth } from './context/AuthContext'
+import CargoIconSizeStyle from './components/CargoIconSizeStyle'
+import PopupCleaner from './components/PopupCleaner'
+import LocalizationPatch from './components/LocalizationPatch'
+import ReturnToTrucksButtonInjector from './components/common/ReturnToTrucksButtonInjector'
+import { GameTimeProvider } from './lib/time'
+import React from 'react'
 
 /**
  * App
  *
  * Defines application routes. Uses HashRouter for SPA routing inside the iframe environment.
  *
+ * A small style injector (CargoIconSizeStyle) is mounted at the app root to
+ * adjust cargo icon sizes without changing component markup or design.
+ *
+ * LocalizationPatch is mounted here to apply a targeted UI text replacement
+ * across the app without editing many files individually.
+ *
  * @returns The application router with routes for available pages.
+ */
+function AppTimeWrapper({ children }: { children: React.ReactNode }) {
+  // must be called inside AuthProvider
+  const { user } = useAuth()
+  const localPrefs = (() => {
+    try {
+      return JSON.parse(localStorage.getItem('app_preferences_v1') || '{}')
+    } catch {
+      return {}
+    }
+  })()
+  const tz = user?.timeZone || localPrefs?.timeZone || 'UTC'
+  return <GameTimeProvider timeZone={tz}>{children}</GameTimeProvider>
+}
+
+/**
+ * App
+ *
+ * Defines application routes. Uses HashRouter for SPA routing inside the iframe environment.
  */
 export default function App() {
   return (
     <HashRouter>
       <AuthProvider>
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/register" element={<RegisterPage />} />
-          <Route path="/create-company" element={<CreateCompanyPage />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/trucks" element={<TrucksPage />} />
-          <Route path="/trailers" element={<TrailersPage />} />
-          <Route path="/staff" element={<StaffPage />} />
-          <Route path="/market" element={<MarketPage />} />
-          <Route path="/new-trucks-market" element={<NewTrucksMarketPage />} />
-          <Route path="/my-jobs" element={<MyJobsPage />} />
-          <Route path="/finances" element={<FinancesPage />} />
-          <Route path="/map" element={<MapPage />} />
-        </Routes>
+        <AppTimeWrapper>
+          {/* Slight global style override for cargo icons (keeps layout unchanged) */}
+          <CargoIconSizeStyle />
+
+          {/* Apply runtime UI text replacement for a single confusing label */}
+          <LocalizationPatch />
+
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/register" element={<RegisterPage />} />
+            <Route path="/create-company" element={<CreateCompanyPage />} />
+            <Route path="/dashboard" element={<DashboardPage />} />
+            <Route path="/login" element={<LoginPage />} />
+            <Route path="/trucks" element={<TrucksPage />} />
+            <Route path="/trailers" element={<TrailersPage />} />
+            <Route path="/staff" element={<StaffPage />} />
+            <Route path="/market" element={<MarketPage />} />
+            <Route path="/new-trucks-market" element={<NewTrucksMarketPage />} />
+            <Route path="/my-jobs" element={<MyJobsPage />} />
+            <Route path="/finances" element={<FinancesPage />} />
+            <Route path="/map" element={<MapPage />} />
+
+            {/* Settings pages */}
+            <Route path="/settings/profile" element={<SettingsProfilePage />} />
+            <Route path="/settings/inbox" element={<SettingsInboxPage />} />
+            <Route path="/settings/customize" element={<SettingsCustomizePage />} />
+            <Route path="/settings/preferences" element={<SettingsPreferencesPage />} />
+            <Route path="/settings/help" element={<SettingsHelpPage />} />
+            <Route path="/settings/contact" element={<SettingsContactPage />} />
+            <Route path="/settings/invite" element={<SettingsInvitePage />} />
+            <Route path="/settings/pro" element={<SettingsProPage />} />
+          </Routes>
+
+          <PopupCleaner />
+        </AppTimeWrapper>
       </AuthProvider>
     </HashRouter>
   )
