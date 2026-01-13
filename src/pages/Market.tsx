@@ -3,14 +3,9 @@
  *
  * Market page showing available job offers.
  *
- * Responsibilities:
- * - Fetch job offers from GET /api/jobs
- * - Allow filtering, sorting and basic selection
- * - Allow accepting a job via POST /api/jobs/{job_id}/accept
- *
- * Notes:
- * - This UI is client-only; server-side validation / atomic operations should
- *   be implemented server-side in production.
+ * Uses a smart API_BASE resolver to call the correct backend depending on the
+ * runtime host, and shares the same page layout/template as the Trucks page
+ * (full width layout, white card sections, header style).
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -21,14 +16,37 @@ import AcceptModal from '../components/market/AcceptModal'
 import { useAuth } from '../context/AuthContext'
 
 /**
+ * API_BASE
+ *
+ * Smart base URL selection for the backend API based on runtime hostname.
+ * - Local dev (localhost) → http://localhost:8888
+ * - Netlify frontend (trucktopia5.netlify.app) → https://www.trucktopi.org
+ * - Sider editor (sider.ai) → https://www.trucktopi.org
+ * - Fallback → https://www.trucktopi.org
+ */
+const API_BASE: string = (() => {
+  if (typeof window === 'undefined') {
+    return process.env.NODE_ENV === 'development' ? 'http://localhost:8888' : 'https://www.trucktopi.org'
+  }
+
+  const host = window.location.hostname
+
+  if (host.includes('localhost')) return 'http://localhost:8888'
+  if (host.includes('trucktopia5.netlify.app')) return 'https://www.trucktopi.org'
+  if (host.includes('sider.ai')) return 'https://www.trucktopi.org'
+
+  return 'https://www.trucktopi.org'
+})()
+
+/**
  * fetchJobs
  *
- * Fetch open jobs from the backend API.
+ * Fetch open jobs from the backend API using the resolved API_BASE.
  *
- * @returns an array of JobRow
+ * @returns Promise<JobRow[]>
  */
 async function fetchJobs(): Promise<JobRow[]> {
-  const res = await fetch('/api/jobs')
+  const res = await fetch(`${API_BASE}/api/jobs`)
   if (!res.ok) {
     throw new Error(`Failed to fetch jobs: ${res.status}`)
   }
@@ -39,14 +57,14 @@ async function fetchJobs(): Promise<JobRow[]> {
 /**
  * acceptJobRequest
  *
- * Calls the accept endpoint for a job.
+ * Calls the accept endpoint for a job on the chosen backend.
  *
  * @param jobId - id of the job to accept
  * @param userId - id of the accepting user
- * @param truckId - truck id string (may be empty)
+ * @param truckId - optional truck id string
  */
 async function acceptJobRequest(jobId: string, userId: string, truckId?: string) {
-  const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/accept`, {
+  const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/accept`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ user_id: userId, truck_id: truckId ?? null }),
@@ -61,7 +79,11 @@ async function acceptJobRequest(jobId: string, userId: string, truckId?: string)
 /**
  * MarketPage
  *
- * Main page component for the Market.
+ * Main page component for the Market. Uses the same layout/template style
+ * as the Trucks page (fullWidth Layout, white card filter area, consistent
+ * header).
+ *
+ * @returns JSX.Element
  */
 export default function MarketPage(): JSX.Element {
   const { user } = useAuth()
@@ -117,6 +139,8 @@ export default function MarketPage(): JSX.Element {
 
   /**
    * Helper: compute numeric "best reward" for a job used for filtering/sorting.
+   *
+   * @param j - job row
    */
   function jobBestReward(j: JobRow) {
     return Math.max(j.reward_trailer_cargo ?? 0, j.reward_load_cargo ?? 0)
@@ -127,25 +151,20 @@ export default function MarketPage(): JSX.Element {
    */
   const filteredSortedJobs = useMemo(() => {
     const out = jobs.filter((j) => {
-      // min reward
       if (filters.minReward !== null) {
         if (jobBestReward(j) < filters.minReward) return false
       }
-      // max distance
       if (filters.maxDistance !== null) {
         const d = j.distance_km ?? 0
         if (d > filters.maxDistance) return false
       }
-      // transport mode
       if (filters.transportMode !== 'all' && j.transport_mode !== filters.transportMode) return false
-      // cargo type
       if (filters.cargoType !== 'all') {
         if ((j.cargo_type ?? j.cargo_item ?? '').toLowerCase() !== filters.cargoType.toLowerCase()) return false
       }
       return true
     })
 
-    // sort
     out.sort((a, b) => {
       switch (filters.sortBy) {
         case 'reward_desc':
@@ -173,6 +192,8 @@ export default function MarketPage(): JSX.Element {
    * onAccept
    *
    * Trigger accept modal for a job.
+   *
+   * @param job - JobRow selected
    */
   function onAccept(job: JobRow) {
     setActionError(null)
@@ -180,6 +201,8 @@ export default function MarketPage(): JSX.Element {
   }
 
   /**
+   * confirmAccept
+   *
    * Confirm accept flow: call API and remove job from list on success.
    *
    * @param truckId - truck id provided by user
@@ -199,7 +222,6 @@ export default function MarketPage(): JSX.Element {
     }
     try {
       await acceptJobRequest(jobId, user.id, truckId || undefined)
-      // remove job from local list
       setJobs((prev) => prev.filter((j) => j.id !== jobId))
       setSuccessMessage('Job accepted')
     } catch (err: any) {
@@ -207,14 +229,13 @@ export default function MarketPage(): JSX.Element {
       setActionError(err?.message ?? 'Failed to accept job')
     } finally {
       setAcceptingJobId(null)
-      // clear success message after a short delay
       setTimeout(() => setSuccessMessage(null), 3500)
     }
   }
 
   return (
-    <Layout>
-      <div className="max-w-5xl mx-auto p-6 space-y-6">
+    <Layout fullWidth>
+      <div className="space-y-6">
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold">Market – Available Jobs</h1>
@@ -222,21 +243,21 @@ export default function MarketPage(): JSX.Element {
           </div>
         </header>
 
-        <section>
+        <section className="bg-white p-6 rounded-lg shadow-sm w-full">
           <FilterBar filters={filters} cargoTypes={cargoTypes} onChange={setFilters} />
         </section>
 
-        <section>
-          {loading && <div className="p-6 bg-white rounded shadow text-center text-slate-600">Loading jobs…</div>}
-          {error && <div className="p-4 bg-rose-50 border border-rose-100 rounded text-rose-700">Error: {error}</div>}
+        <section className="bg-white p-6 rounded-lg shadow-sm w-full">
+          {loading && <div className="text-sm text-slate-600">Loading jobs…</div>}
+          {error && <div className="text-sm text-rose-700">Error: {error}</div>}
           {actionError && <div className="p-3 bg-rose-50 border border-rose-100 rounded text-rose-700">{actionError}</div>}
           {successMessage && <div className="p-3 bg-emerald-50 border border-emerald-100 rounded text-emerald-700">{successMessage}</div>}
 
           {!loading && !error && filteredSortedJobs.length === 0 && (
-            <div className="p-6 bg-white rounded shadow text-center text-slate-500">No matching job offers at the moment.</div>
+            <div className="text-sm text-slate-500">No matching job offers at the moment.</div>
           )}
 
-          <div className="space-y-3">
+          <div className="space-y-3 mt-4">
             {filteredSortedJobs.map((job) => (
               <JobCard key={job.id} job={job} onView={() => alert('View details — placeholder')} onAccept={onAccept} />
             ))}
