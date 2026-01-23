@@ -14,7 +14,7 @@ import Layout from '../components/Layout'
  */
 export default function TrailersPage() {
   return (
-    <Layout>
+    <Layout fullWidth>
       <div className="space-y-4">
         <header>
           <h1 className="text-2xl font-bold">Trailers</h1>

@@ -1,21 +1,24 @@
+# Netlify config for this repo (build & local dev)
+# Created by Sider Web Creator
 [build]
   command = "npm run build"
-  functions = "netlify/functions"
   publish = "dist"
 
-# Proxy all /api/* requests to the production backend so the frontend can
-# safely call fetch('/api/...') in all environments (Netlify, local preview, etc).
-[[redirects]]
-  from = "/api/*"
-  to = "https://www.trucktopi.org/api/:splat"
-  status = 200
-  force = true
+# Local dev server settings (custom framework)
+[dev]
+  command = "npm run dev"
+  port = 3000
+  targetPort = 3000
+  framework = "#custom"
 
-# Keep the serverless function mapping (if you still use the jobs function
-# locally or for specific routes). Netlify will use the first matching rule,
-# so specific routes can be placed after the generic rule if needed.
-[[redirects]]
-  from = "/.netlify/functions/*"
-  to = "/.netlify/functions/:splat"
-  status = 200
-  force = true
+# If you use Vite, uncomment and adjust:
+# [dev]
+#   command = "npm run dev"
+#   port = 3000
+#   targetPort = 5173
+
+# If you use react-scripts, uncomment and adjust:
+# [dev]
+#   command = "npm start"
+#   port = 3000
+#   targetPort = 3000

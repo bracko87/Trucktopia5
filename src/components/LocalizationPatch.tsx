@@ -1,91 +1,109 @@
 /**
  * LocalizationPatch.tsx
  *
- * Small runtime patch component that searches the DOM for an exact UI string
- * "Next maintenance (km)" and replaces it with the requested wording:
- * "Next maintenance check in (km)".
+ * Runtime UI text replacer used to change small display strings without editing many files.
  *
- * This avoids editing every component that may contain the old text by applying
- * a safe, idempotent DOM replacement and observing future changes so the new
- * wording stays applied for dynamic updates.
+ * This component scans visible text nodes and replaces exact matches of "Market"
+ * with "Job Market". It avoids replacing text inside code/pre/script/style elements
+ * and continues to watch the DOM for dynamic updates.
  */
 
 import React, { useEffect } from 'react'
 
 /**
+ * isIgnorableNode
+ *
+ * Determine whether a node is inside an element where we should not modify text.
+ *
+ * @param node - DOM node to check
+ * @returns boolean indicating if the node should be ignored
+ */
+function isIgnorableNode(node: Node | null): boolean {
+  if (!node || !node.parentElement) return false
+  const ignorableTags = new Set(['CODE', 'PRE', 'SCRIPT', 'STYLE', 'TEXTAREA'])
+  let el: HTMLElement | null = node.parentElement
+  while (el) {
+    if (ignorableTags.has(el.tagName)) return true
+    el = el.parentElement
+  }
+  return false
+}
+
+/**
+ * replaceExactTextNodes
+ *
+ * Walk the DOM subtree and replace text nodes whose trimmed content exactly
+ * matches the source string. Replacement preserves surrounding whitespace.
+ *
+ * @param root - root node to scan
+ * @param from - exact source text to match (trimmed)
+ * @param to - replacement text
+ */
+function replaceExactTextNodes(root: Node, from: string, to: string) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null)
+  const matches: Text[] = []
+
+  let n = walker.nextNode()
+  while (n) {
+    const textNode = n as Text
+    const raw = textNode.nodeValue ?? ''
+    // preserve leading/trailing whitespace while comparing trimmed content
+    const leading = raw.match(/^\s*/)?.[0] ?? ''
+    const trailing = raw.match(/\s*$/)?.[0] ?? ''
+    const trimmed = raw.trim()
+    if (trimmed === from && !isIgnorableNode(textNode)) {
+      matches.push(textNode)
+    }
+    n = walker.nextNode()
+  }
+
+  for (const t of matches) {
+    const raw = t.nodeValue ?? ''
+    const leading = raw.match(/^\s*/)?.[0] ?? ''
+    const trailing = raw.match(/\s*$/)?.[0] ?? ''
+    t.nodeValue = `${leading}${to}${trailing}`
+  }
+}
+
+/**
  * LocalizationPatch
  *
- * A component that performs a one-time and live DOM text replacement for a
- * specific phrase. It uses a MutationObserver to keep the replacement in sync
- * with dynamic updates.
+ * React component that performs a tiny runtime string replacement ("Market" -> "Job Market")
+ * across visible text nodes and keeps observing the DOM for changes.
  *
- * Note: This is intentionally lightweight and targeted (single exact string).
+ * Mount this once at app root.
  */
 export default function LocalizationPatch(): JSX.Element | null {
   useEffect(() => {
-    let raf = 0
-    let observer: MutationObserver | null = null
-    const TARGET = 'Next maintenance (km)'
-    const REPLACEMENT = 'Next maintenance check in (km)'
+    if (typeof document === 'undefined') return
 
-    /**
-     * replaceInNode
-     *
-     * Replace exact text content in matching elements. Only replaces when the
-     * trimmed textContent exactly matches the target to avoid accidental edits.
-     *
-     * @param root - root element to search under
-     */
-    function replaceInNode(root: ParentNode = document) {
-      // Use a breadth-first search of element nodes to minimize matches to visible elements
-      const els = (root as Element).querySelectorAll ? (root as Element).querySelectorAll('*') : []
-      for (let i = 0; i < els.length; i++) {
-        const el = els[i] as Element
-        // Only operate on elements whose textContent is a simple exact match
-        const txt = el.textContent?.trim()
-        if (txt === TARGET) {
-          // Replace the visible text while preserving element attributes
-          // Use textContent to avoid injecting HTML
-          el.textContent = REPLACEMENT
-        }
+    const runReplace = () => {
+      try {
+        replaceExactTextNodes(document.body, 'Market', 'Job Market')
+      } catch (err) {
+        // swallow errors to avoid breaking the app UI
+        // eslint-disable-next-line no-console
+        console.error('LocalizationPatch error', err)
       }
     }
 
-    /**
-     * scheduledReplace
-     *
-     * Debounced replace to run inside RAF to avoid layout thrashing during heavy mutations.
-     */
-    function scheduledReplace(root?: ParentNode) {
-      if (raf) cancelAnimationFrame(raf)
-      raf = requestAnimationFrame(() => {
-        replaceInNode(root ?? document)
-      })
-    }
+    // initial pass
+    runReplace()
 
-    // Initial pass
-    scheduledReplace(document)
-
-    // Observe for dynamic changes in the page and re-apply replacement when needed
-    observer = new MutationObserver((mutations) => {
-      // If any mutation could have introduced the target text, run a replacement.
-      // To keep work minimal, only run when text nodes or added nodes appear.
-      for (const m of mutations) {
-        if (m.type === 'characterData' || m.type === 'childList' || m.type === 'subtree') {
-          scheduledReplace(m.target as ParentNode || document)
-          break
-        }
-      }
+    // observe for dynamic updates
+    const obs = new MutationObserver((mutations) => {
+      // For small apps it's fine to re-run a full pass; keep simple and robust.
+      runReplace()
     })
 
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+    obs.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    })
 
-    return () => {
-      if (observer) observer.disconnect()
-      if (raf) cancelAnimationFrame(raf)
-    }
+    return () => obs.disconnect()
   }, [])
 
-  // This component renders nothing visible.
   return null
 }

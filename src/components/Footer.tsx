@@ -206,7 +206,7 @@ export default function Footer() {
 
   return (
     <footer className="mt-auto bg-gradient-to-r from-amber-400 to-amber-500 border-t border-black/10 text-black py-4 px-6">
-      <div className="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-3">
+      <div className="w-full max-w-none flex flex-col sm:flex-row justify-between items-center gap-3">
         {/* Left: decorative emblem + copyright */}
         <div className="flex items-center gap-4">
           {/* Emblem: circular badge with truck icon and subtle stripes */}

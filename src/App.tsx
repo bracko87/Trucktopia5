@@ -18,6 +18,7 @@ import LoginPage from './pages/Login'
 import TrucksPage from './pages/Trucks'
 import TrailersPage from './pages/Trailers'
 import StaffPage from './pages/Staff'
+import StaffMarketPage from './pages/StaffMarket'
 import MarketPage from './pages/Market'
 import NewTrucksMarketPage from './pages/NewTrucksMarket'
 import MyJobsPage from './pages/MyJobs'
@@ -40,19 +41,18 @@ import LocalizationPatch from './components/LocalizationPatch'
 import ReturnToTrucksButtonInjector from './components/common/ReturnToTrucksButtonInjector'
 import { GameTimeProvider } from './lib/time'
 import React from 'react'
+import './lib/safeInsertPatch'
+import './lib/globalCityHelper'
+import CityModal from './components/city/CityModal'
+import CityClickHandler from './components/city/CityClickHandler'
 
 /**
- * App
+ * AppTimeWrapper
  *
- * Defines application routes. Uses HashRouter for SPA routing inside the iframe environment.
+ * Wraps children with GameTimeProvider using user's timezone or local preferences.
  *
- * A small style injector (CargoIconSizeStyle) is mounted at the app root to
- * adjust cargo icon sizes without changing component markup or design.
- *
- * LocalizationPatch is mounted here to apply a targeted UI text replacement
- * across the app without editing many files individually.
- *
- * @returns The application router with routes for available pages.
+ * @param props children React nodes to render within the time provider.
+ * @returns JSX.Element
  */
 function AppTimeWrapper({ children }: { children: React.ReactNode }) {
   // must be called inside AuthProvider
@@ -72,6 +72,8 @@ function AppTimeWrapper({ children }: { children: React.ReactNode }) {
  * App
  *
  * Defines application routes. Uses HashRouter for SPA routing inside the iframe environment.
+ *
+ * @returns The application router with routes for available pages.
  */
 export default function App() {
   return (
@@ -93,6 +95,7 @@ export default function App() {
             <Route path="/trucks" element={<TrucksPage />} />
             <Route path="/trailers" element={<TrailersPage />} />
             <Route path="/staff" element={<StaffPage />} />
+            <Route path="/staff-market" element={<StaffMarketPage />} />
             <Route path="/market" element={<MarketPage />} />
             <Route path="/new-trucks-market" element={<NewTrucksMarketPage />} />
             <Route path="/my-jobs" element={<MyJobsPage />} />
@@ -109,6 +112,15 @@ export default function App() {
             <Route path="/settings/invite" element={<SettingsInvitePage />} />
             <Route path="/settings/pro" element={<SettingsProPage />} />
           </Routes>
+
+          {/* Global city click delegator (no UI) */}
+          <CityClickHandler />
+
+          {/* Global city modal (mounted once at app root) */}
+          <CityModal />
+
+          {/* Global helper to inject "Return to Trucks" buttons in some screens */}
+          <ReturnToTrucksButtonInjector />
 
           <PopupCleaner />
         </AppTimeWrapper>

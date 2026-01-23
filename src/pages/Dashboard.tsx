@@ -79,7 +79,7 @@ export default function DashboardPage() {
       : 0
 
   return (
-    <Layout>
+    <Layout fullWidth>
       <div className="space-y-6">
         <header className="flex items-center justify-between">
           <div>

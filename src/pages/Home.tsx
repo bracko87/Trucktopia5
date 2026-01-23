@@ -36,6 +36,15 @@ export default function HomePage() {
    * directly (which triggers RLS / 401). We try several common view names for
    * robustness and select only the count columns for id=1.
    */
+  /**
+   * fetchStats
+   *
+   * Read pre-aggregated counts from several common view/table names. If a
+   * pre-aggregated row is not available, fall back to reading the job_offers
+   * table directly via PostgREST and obtain the total row count using the
+   * Content-Range header (Range: 0-0). This ensures the "Total Jobs" card
+   * shows the real number of rows in job_offers even when no stats view exists.
+   */
   async function fetchStats() {
     const candidates = ['stats_counts_table', 'stats_counts', 'stats_counts_view', 'stats_counts_table_view']
 
@@ -61,9 +70,59 @@ export default function HomePage() {
         }
       }
     } catch (err) {
-      // fail silently for demo
       // eslint-disable-next-line no-console
       console.debug('HomePage: fetchStats unexpected error', err)
+    }
+
+    /**
+     * Fallback: query job_offers directly using PostgREST and read the
+     * Content-Range header to obtain the total number of rows.
+     *
+     * Note: we embed the public REST URL and anon key here to match the other
+     * market code which also uses the public REST endpoint. This is a pragmatic
+     * fallback for the preview environment.
+     */
+    try {
+      const API_BASE = 'https://iiunrkztuhhbdgxzqqgq.supabase.co'
+      const SUPABASE_ANON_KEY =
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
+
+      const url = `${API_BASE}/rest/v1/job_offers?select=id`
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          // Request minimal rows but ask for range so PostgREST returns Content-Range
+          Range: '0-0',
+        },
+      })
+
+      if (res.ok) {
+        // Content-Range example: "0-0/123"
+        const cr = res.headers.get('content-range') || res.headers.get('Content-Range')
+        if (cr) {
+          const parts = cr.split('/')
+          const total = parts.length === 2 ? Number(parts[1]) : NaN
+          if (!Number.isNaN(total)) {
+            setStats((s) => ({ ...s, totalJobs: total }))
+            return
+          }
+        }
+
+        // As a last resort, if Content-Range is missing, parse JSON length with a large Range
+        const data = await res.json().catch(() => null)
+        if (Array.isArray(data)) {
+          setStats((s) => ({ ...s, totalJobs: data.length }))
+          return
+        }
+      } else {
+        // eslint-disable-next-line no-console
+        console.debug('HomePage: job_offers count fetch failed', res.status, await res.text().catch(() => ''))
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.debug('HomePage: job_offers count fallback error', err)
     }
   }
 
