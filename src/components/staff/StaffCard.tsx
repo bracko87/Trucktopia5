@@ -1,18 +1,22 @@
 /**
  * StaffCard.tsx
  *
- * Compact card showing a candidate's summary with expandable details and hiring action.
+ * Compact card showing a candidate's summary with optional expanded details.
+ * Provides a hire handler that calls the server-side RPC `hire_unemployed_staff`
+ * which atomically inserts into `hired_staff` and deletes the `unemployed_staff` row.
  *
- * This file defines a single default export StaffCard and related helpers.
+ * Notes:
+ * - Uses the safe server-side RPC approach: client only sends unemployed_id.
+ * - All DB delete/insert logic runs inside the RPC (SECURITY DEFINER) on the server.
+ * - Component notifies parent via onHire callback when hire succeeds.
  */
 
 import React, { useEffect, useState } from 'react'
-
+import { supabase } from '../../lib/supabase'
 import { Menu } from 'lucide-react'
 import { useAuth } from '../../context/AuthContext'
 import { toast } from 'sonner'
-import { supabase } from '../../lib/supabase'
-
+import { useNavigate } from 'react-router'
 
 /**
  * StaffMember
@@ -47,50 +51,33 @@ interface ResolvedSkill {
 }
 
 /**
- * StaffCardProps
+ * Props
  *
- * Props for StaffCard component.
+ * - candidate: StaffMember to render
+ * - onHire: optional callback invoked after a successful hire with (candidateId, hiredRow)
  */
-type StaffCardProps = {
+export default function StaffCard({
+  candidate,
+  onHire,
+}: {
   candidate: StaffMember
-  /**
-   * onHire:
-   * - Called when the user initiates a hire (optimistic intent).
-   * - Parent should usually remove the row immediately.
-   */
-  onHire?: (candidateId: string, hiredRow?: any | null) => void
-}
-
-/**
- * StaffCard
- *
- * Renders a single candidate card with expandable details and a Hire button.
- *
- * - The card owns its uiState ('idle' | 'hiring' | 'done' | 'error') and performs
- *   authoritative DB work in background after triggering optimistic UI via onHire.
- *
- * @param props StaffCardProps
- * @returns JSX.Element
- */
-export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.Element {
-  const { accessToken } = useAuth()
+  onHire?: (candidateId: string, hiredRow: any) => void
+}): JSX.Element {
+  const { user } = useAuth()
+  const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [flagLoaded, setFlagLoaded] = useState(false)
   const [showEmojiFallback, setShowEmojiFallback] = useState(false)
   const [resolvedSkills, setResolvedSkills] = useState<ResolvedSkill[] | null>(null)
+  const [hired, setHired] = useState(false)
+  const [hiring, setHiring] = useState(false)
   const [dbAge, setDbAge] = useState<number | null | undefined>(candidate.age ?? undefined)
 
   /**
-   * UI state for the hiring flow owned by the card.
-   * - 'idle' : default
-   * - 'hiring' : background work in progress
-   * - 'done' : completed successfully
-   * - 'error' : failed
-   */
-  const [uiState, setUiState] = useState<'idle' | 'hiring' | 'done' | 'error'>('idle')
-
-  /**
-   * Base salary computed from available fields.
+   * Base salary (numeric). Compute once to avoid repeated conversions.
+   * - prefer expected_salary_cents / 100
+   * - fallback to expected_salary numeric
+   * - final fallback = 0
    */
   const baseSalary =
     candidate.expected_salary_cents != null
@@ -99,13 +86,15 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
       ? Number(candidate.expected_salary)
       : 0
 
+  // Hiring rate (decimal) and derived amounts
   const hiringRate = computeHiringRate(candidate)
   const hiringFee = baseSalary * hiringRate
   const totalHiringCost = baseSalary + hiringFee
 
-  const code = inferCountryCode(candidate.country ?? undefined)
+  const countryInput = candidate.country ?? candidate.country
+  const code = inferCountryCode(countryInput)
   const emoji = countryCodeToEmoji(code)
-  const countryDisplay = getCountryDisplay(candidate.country ?? undefined)
+  const countryDisplay = getCountryDisplay(countryInput)
   const flagUrl = code ? `https://flagcdn.com/${code.toLowerCase()}.svg` : undefined
 
   useEffect(() => {
@@ -123,7 +112,8 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
   }, [flagUrl, candidate.name])
 
   /**
-   * Resolve skills to friendly display names using skills_master when needed.
+   * Resolve skills to name + description using skills_master.
+   * If skills look already human (not UUID) we keep them as-is with no description.
    */
   useEffect(() => {
     let mounted = true
@@ -161,9 +151,6 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
     }
   }, [candidate.skills])
 
-  /**
-   * Fetch age from DB if not provided.
-   */
   useEffect(() => {
     let mounted = true
     async function fetchAge() {
@@ -195,56 +182,60 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
   /**
    * handleHire
    *
-   * Performs the authoritative background work for hiring while making the UI transition immediately.
+   * Calls the server-side RPC `hire_unemployed_staff(unemployed_id uuid)` which:
+   *  - inserts a row into hired_staff (mapping fields server-side)
+   *  - deletes the unemployed_staff row
+   *  - returns the inserted hired_staff row
+   *
+   * Client only provides the unemployed_id. This keeps the operation atomic and
+   * avoids giving the client direct INSERT/DELETE privileges.
    */
   /**
    * handleHire
    *
-   * Simplified frontend flow: optimistic intent then server-side RPC to handle hiring atomically.
-   */
-  /**
-   * handleHire
-   *
-   * Trigger Edge Function to hire candidate. Frontend performs no DB mutations.
+   * Attempt to hire the candidate by calling the server RPC.
+   * This version logs authentication/session info and full RPC errors
+   * to help debugging why the RPC returns P0001/400.
    */
   async function handleHire() {
-    if (uiState !== 'idle') return
-    if (!accessToken) {
-      toast.error('Not authenticated')
-      return
-    }
-
-    setUiState('hiring')
+    if (hired || hiring) return
+    setHiring(true)
 
     try {
-      const res = await fetch(
-        'https://iiunrkztuhhbdgxzqqgq.supabase.co/functions/v1/hire-staff',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
-            unemployed_id: candidate.id,
-          }),
-        }
-      )
+      const { data, error } = await supabase.rpc('hire_unemployed_staff', {
+        unemployed_id: candidate.id,
+      })
 
-      const json = await res.json()
-
-      if (!res.ok) {
-        throw new Error(json.error || 'Hire failed')
+      if (error) {
+        console.error('hire_unemployed_staff RPC error:', error)
+        toast.error(error.message)
+        setHiring(false)
+        return
       }
 
-      // ✅ backend succeeded
-      onHire?.(candidate.id, json.hired)
-      setUiState('done')
+      if (!data) {
+        toast.error('Hire failed: no data returned')
+        setHiring(false)
+        return
+      }
+
+      console.log('hire_unemployed_staff RPC success', data)
+
+      // Only update UI after a real successful response with data
+      setHired(true)
       toast.success('Candidate hired')
+
+      // Optional: keep market UI clean if parent handles it
+      onHire?.(candidate.id, data)
+
+      setHiring(false)
+
+      // 🔥 Trigger refetch by navigating to Staff page
+      navigate('/staff')
     } catch (err: any) {
-      console.error(err)
-      setUiState('error')
-      toast.error(err.message || 'Hiring failed')
+      console.error('Unexpected error calling hire_unemployed_staff:', err)
+      toast.error(err?.message ?? 'Failed to hire candidate')
+      setHiring(false)
     }
   }
 
@@ -351,18 +342,33 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
                   </span>
                 </div>
                 <div className="text-xs text-slate-500">
-                  {baseSalary > 0 ? (
-                    <>
-                      <span>Base: {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(baseSalary)}</span>
-                      <span className="mx-2">•</span>
-                      <span>
-                        Fee {Math.round(hiringRate * 100)}%:{' '}
-                        {new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(hiringFee)}
-                      </span>
-                    </>
-                  ) : (
-                    <>—</>
-                  )}
+                  <div className="flex justify-end gap-4">
+                    <div className="text-right">
+                      <div className="text-xs text-slate-500">Salary</div>
+                      <div className="text-sm text-slate-700 font-medium">
+                        {baseSalary > 0
+                          ? new Intl.NumberFormat('en-US', {
+                              style: 'currency',
+                              currency: 'USD',
+                              maximumFractionDigits: 0,
+                            }).format(baseSalary)
+                          : '—'}
+                      </div>
+                    </div>
+
+                    <div className="text-right">
+                      <div className="text-xs text-slate-500">Hiring fee</div>
+                      <div className="text-sm text-emerald-700 font-medium">
+                        {baseSalary > 0
+                          ? new Intl.NumberFormat('en-US', {
+                              style: 'currency',
+                              currency: 'USD',
+                              maximumFractionDigits: 0,
+                            }).format(hiringFee)
+                          : '—'}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -413,14 +419,14 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
               <button
                 type="button"
                 onClick={handleHire}
-                disabled={uiState !== 'idle'}
-                className={`w-full px-4 py-2 rounded-md text-white font-medium bg-emerald-600 disabled:bg-slate-300`}
-                aria-pressed={uiState === 'done'}
-                aria-busy={uiState === 'hiring'}
-                aria-label={uiState === 'done' ? 'Hired' : uiState === 'hiring' ? 'Hiring candidate' : 'Hire candidate'}
+                disabled={hired || hiring}
+                className={`w-full px-4 py-2 rounded-md text-white font-medium ${hired ? 'bg-slate-300 text-slate-600 cursor-default' : hiring ? 'bg-emerald-500/90 hover:bg-emerald-600' : 'bg-emerald-600 hover:bg-emerald-700'}`}
+                aria-pressed={hired}
+                aria-busy={hiring}
+                aria-label={hired ? 'Hired' : hiring ? 'Hiring candidate' : 'Hire candidate'}
+                style={{ pointerEvents: hired ? 'none' : 'auto' }}
               >
-                {uiState === 'idle' && 'Hire'}
-                {uiState === 'hiring' && (
+                {hiring ? (
                   <span className="inline-flex items-center gap-2">
                     <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
@@ -428,9 +434,11 @@ export default function StaffCard({ candidate, onHire }: StaffCardProps): JSX.El
                     </svg>
                     Hiring...
                   </span>
+                ) : hired ? (
+                  'Hired'
+                ) : (
+                  'Hire'
                 )}
-                {uiState === 'done' && 'Hired'}
-                {uiState === 'error' && 'Retry'}
               </button>
             </div>
           </div>
@@ -587,6 +595,13 @@ async function fetchSkillNames(values: string[]): Promise<Record<string, { name:
  *
  * Produce a plain text string from a possibly structured description value.
  *
+ * Rules:
+ * - If the description looks like JSON array or object, attempt JSON.parse and extract strings/numbers.
+ * - Otherwise extract bracket contents like allowed_cargo_types:[...]
+ * - Replace underscores/hyphens with spaces and remove most punctuation.
+ * - Collapse multiple spaces into single space and trim.
+ * - Convert standalone numeric tokens to percentages (e.g. 8 -> 8%).
+ *
  * @param raw raw description string
  * @returns sanitized plain text or empty string
  */
@@ -649,7 +664,11 @@ function sanitizeDescription(raw?: string | null): string {
       .trim()
   }
 
-  // Convert standalone numeric tokens to percentages.
+  /**
+   * Convert standalone numeric tokens to percentages.
+   * - Matches integers and decimals not already followed by a percent sign.
+   * - Example: "8" -> "8%"; "8.5" -> "8.5%"; "8%" remains "8%".
+   */
   out = out.replace(/\b(\d+(?:\.\d+)?)(?!%)(?=\b)/g, (_m, p1) => `${p1}%`)
 
   return out
@@ -681,10 +700,13 @@ function humanizeAvailability(v?: string | null): string | null {
  * SkillBadge
  *
  * Displays skill name and a small sanitized description text (plain words only).
+ * Truncates description to 30 characters with ellipsis; full text is available on hover via title.
  */
 function SkillBadge({ name, description }: { name: string; description?: string | null }) {
   const plain = sanitizeDescription(description)
   const MAX_LEN = 30
+
+  // If the sanitized description is longer than MAX_LEN, truncate and append ellipsis.
   const display = plain && plain.length > MAX_LEN ? `${plain.slice(0, MAX_LEN).trim()}...` : plain
 
   return (
@@ -700,7 +722,18 @@ function SkillBadge({ name, description }: { name: string; description?: string 
 /**
  * computeHiringRate
  *
- * Compute hiring fee rate according to rules.
+ * Compute hiring fee rate for the game's rules.
+ *
+ * Mapping:
+ * - explicit candidate.hiring_fee_rate -> use as-is
+ * - 'now' / 'available' / 'available_now' -> 50%
+ * - '1_week' / '1-week' / '1week' -> 30%
+ * - '2_weeks' / '2-weeks' / '2weeks' -> 10%
+ * - '3_weeks' / '3-weeks' / '3weeks' -> 0%
+ * - default -> 20%
+ *
+ * @param candidate StaffMember
+ * @returns fee rate as decimal (e.g. 0.3 for 30%)
  */
 function computeHiringRate(candidate: StaffMember): number {
   if (candidate.hiring_fee_rate != null) return candidate.hiring_fee_rate

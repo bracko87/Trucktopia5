@@ -19,6 +19,7 @@ import JobCard, { JobRow } from '../components/market/JobCard'
 import AcceptModal from '../components/market/AcceptModal'
 import { useAuth } from '../context/AuthContext'
 import { Filter } from 'lucide-react'
+import { getCountryName } from '../lib/countryNames'
 
 /**
  * Market API constants
@@ -104,7 +105,7 @@ function pickStringJob(obj: any): string | null {
  */
 function pickLogoJob(obj: any): string | null {
   if (!obj) return null
-  return obj.company_image_url ?? obj.logo_url ?? obj.logo ?? obj.image_url ?? obj.icon_url ?? null
+  return obj.logo ?? obj.logo_url ?? obj.image_url ?? obj.icon_url ?? null
 }
 
 /**
@@ -118,8 +119,8 @@ async function fetchJobs(): Promise<JobRow[]> {
   const select =
     '*,origin_city:origin_city_id(city_name,country_code),' +
     'destination_city:destination_city_id(city_name,country_code),' +
-    "origin_company:origin_client_company_id(id,name,company_image_url)," +
-    "destination_company:destination_client_company_id(id,name,company_image_url)," +
+    "origin_company:origin_client_company_id(id,name,logo)," +
+    "destination_company:destination_client_company_id(id,name,logo)," +
     'cargo_type_obj:cargo_type_id(*),' +
     'cargo_item_obj:cargo_item_id(*)'
 
@@ -229,8 +230,8 @@ async function fetchJobsForHub(country?: string | null, city?: string | null): P
   const select =
     '*,origin_city:origin_city_id(city_name,country_code),' +
     'destination_city:destination_city_id(city_name,country_code),' +
-    "origin_company:origin_client_company_id(id,name,company_image_url)," +
-    "destination_company:destination_client_company_id(id,name,company_image_url)," +
+    "origin_company:origin_client_company_id(id,name,logo)," +
+    "destination_company:destination_client_company_id(id,name,logo)," +
     'cargo_type_obj:cargo_type_id(*),' +
     'cargo_item_obj:cargo_item_id(*)'
 
@@ -557,42 +558,7 @@ export default function MarketPage(): JSX.Element {
     return Array.from(s)
   }, [jobs])
 
-  const COUNTRY_NAMES: Record<string, string> = {
-    rs: 'Serbia',
-    us: 'United States',
-    gb: 'United Kingdom',
-    de: 'Germany',
-    fr: 'France',
-    es: 'Spain',
-    it: 'Italy',
-    nl: 'Netherlands',
-    se: 'Sweden',
-    no: 'Norway',
-    ca: 'Canada',
-    au: 'Australia',
-    nz: 'New Zealand',
-    pl: 'Poland',
-    br: 'Brazil',
-    mx: 'Mexico',
-    ph: 'Philippines',
-    id: 'Indonesia',
-    tr: 'Turkey',
-    vn: 'Vietnam',
-    th: 'Thailand',
-    my: 'Malaysia',
-    lk: 'Sri Lanka',
-    bs: 'Bahamas',
-    cu: 'Cuba',
-    do: 'Dominican Republic',
-    ht: 'Haiti',
-    jm: 'Jamaica',
-    cr: 'Costa Rica',
-    hn: 'Honduras',
-    ni: 'Nicaragua',
-    pa: 'Panama',
-    ar: 'Argentina',
-    cl: 'Chile',
-  }
+  // COUNTRY_NAMES removed — use getCountryName from src/lib/countryNames
 
   const countries = useMemo(() => {
     const map = new Map<string, { code: string; name: string; cities: Set<string> }>()
@@ -619,7 +585,7 @@ export default function MarketPage(): JSX.Element {
 
     const normalized = Array.from(map.values()).map((v) => ({
       code: v.code,
-      name: COUNTRY_NAMES[v.code] ?? v.code.toUpperCase(),
+      name: getCountryName(v.code),
       cities: Array.from(v.cities),
     }))
 
@@ -784,49 +750,109 @@ export default function MarketPage(): JSX.Element {
     setAcceptingJobId(job.id)
   }
 
+  /**
+   * confirmAccept
+   *
+   * Simple non-atomic accept flow:
+   * 1) insert job_assignments row
+   * 2) patch job_offers status -> assigned
+   * 3) remove job from local Market UI
+   *
+   * This avoids RPC/CORS issues and provides a quick working path. Note: not atomic.
+   *
+   * @param truckId - selected truck id from the AcceptModal
+   */
+  /**
+   * confirmAccept
+   *
+   * Simple non-atomic accept flow:
+   * 1) insert job_assignments row
+   * 2) patch job_offers status -> assigned
+   * 3) remove job from local Market UI
+   *
+   * This avoids RPC/CORS issues and provides a quick working path. Note: not atomic.
+   *
+   * @param truckId - selected truck id from the AcceptModal
+   */
   async function confirmAccept(truckId: string) {
     setActionError(null)
     setSuccessMessage(null)
+
     if (!user) {
-      setActionError('Please log in to accept jobs')
+      setActionError('Please log in')
       setAcceptingJobId(null)
-      return
+      // Throw so caller (modal) knows this failed and avoids closing the modal.
+      throw new Error('Please log in')
     }
+
     const jobId = acceptingJobId
     if (!jobId) {
-      setActionError('No job selected')
-      return
+      setAcceptingJobId(null)
+      throw new Error('Missing job id')
     }
-    try {
-      const url = `${MARKET_API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobId)}`
-      const body = {
-        assigned_user_truck_id: truckId || null,
-      }
 
-      const res = await fetch(url, {
-        method: 'PATCH',
+    try {
+      /* 1️⃣ Create assignment */
+      const assignRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
+        method: 'POST',
         headers: {
           apikey: MARKET_SUPABASE_ANON_KEY,
           Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
           'Content-Type': 'application/json',
           Prefer: 'return=representation',
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          job_offer_id: jobId,
+          carrier_company_id: (user as any).company_id ?? null,
+          user_id: (user as any).id ?? null,
+          user_truck_id: truckId ?? null,
+          status: 'assigned',
+          accepted_at: new Date().toISOString(),
+        }),
       })
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => '')
-        throw new Error(`Accept failed: ${res.status} ${txt}`)
+      if (!assignRes.ok) {
+        const txt = await assignRes.text().catch(() => 'Assignment creation failed')
+        throw new Error(txt)
       }
 
+      /* 2️⃣ Ensure job_offers.status is updated (important finalization step) */
+      const patchRes = await fetch(
+        `${MARKET_API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobId)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: MARKET_SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            status: 'assigned',
+            assigned_user_truck_id: truckId ?? null,
+          }),
+        }
+      )
+
+      if (!patchRes.ok) {
+        const txt = await patchRes.text().catch(() => 'Job update failed')
+        throw new Error(txt)
+      }
+
+      /* 3️⃣ Remove from Market UI */
       setJobs((prev) => prev.filter((j) => j.id !== jobId))
+
       setSuccessMessage('Job accepted')
+      // Resolve normally (no throw) so AcceptModal will close itself after await.
+      return
     } catch (err: any) {
       console.error('accept error', err)
-      setActionError(err?.message ?? 'Failed to accept job')
+      setActionError(err?.message ?? 'Accept failed')
+      // Rethrow so AcceptModal's handler knows the action failed and won't close.
+      throw err
     } finally {
+      // Ensure we clear the accepting id (parent/modal will also call onClose).
       setAcceptingJobId(null)
-      setTimeout(() => setSuccessMessage(null), 3500)
+      setTimeout(() => setSuccessMessage(null), 3000)
     }
   }
 
@@ -994,12 +1020,13 @@ return (
       <AcceptModal
         open={Boolean(acceptingJobId)}
         jobId={acceptingJobId}
+        job={jobs.find((j) => j.id === acceptingJobId) ?? null}
         onClose={() => {
           setActionError(null)
           setAcceptingJobId(null)
         }}
         onConfirm={(truckId: string) => confirmAccept(truckId)}
-      />
+      /> 
     </div>
   </Layout>
 )

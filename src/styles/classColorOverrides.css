@@ -1,0 +1,29 @@
+/* 
+  classColorOverrides.css
+
+  Provide small global text-color overrides for legacy class names so elements
+  using .truck, .small, .medium and .big get distinct readable colors without
+  changing layout or markup.
+*/
+
+/* Truck label — cool blue */
+.truck {
+  color: #0ea5e9; /* tailwind sky-500 */
+}
+
+/* Small — green */
+.small {
+  color: #10b981; /* tailwind emerald-500 */
+}
+
+/* Medium — amber */
+.medium {
+  color: #f59e0b; /* tailwind amber-500 */
+}
+
+/* Big — red */
+.big {
+  color: #ef4444; /* tailwind red-500 */
+}
+
+/* Ensure utility classes keep precedence if needed (uses specificity) */

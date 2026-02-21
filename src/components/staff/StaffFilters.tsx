@@ -3,15 +3,17 @@
  *
  * Collapsible filter panel used on the Staff Market page.
  *
- * - Keeps the existing three-column layout (Category, Country, Salary).
- * - Adds a Skills selector extracted from the `description` column (heuristic).
- * - Keeps Availability selector (static options for now).
+ * Changes:
+ * - Country dropdown values are the ISO code only (value={c.code}).
+ * - Country display uses "Name (CODE)".
+ * - Country items include a human readable name computed via Intl.DisplayNames.
  *
- * The component is purely presentational and reports changes via callbacks.
+ * Layout and behavior preserved.
  */
 
 import React from 'react'
 import { ChevronDown, Filter } from 'lucide-react'
+import { supabase } from '../../lib/supabase'
 
 /**
  * StaffFiltersProps
@@ -21,109 +23,32 @@ import { ChevronDown, Filter } from 'lucide-react'
 export interface StaffFiltersProps {
   roleFilter: string
   onRoleFilterChange: (v: string) => void
-  countryFilter: string
-  countries: string[]
-  onCountryFilterChange: (v: string) => void
-  availabilityFilter: string
-  onAvailabilityFilterChange: (v: string) => void
   skillsFilter: string
   onSkillsFilterChange: (v: string) => void
   salaryMode: 'any' | 'below' | 'above'
   onSalaryModeChange: (v: 'any' | 'below' | 'above') => void
   salaryValue: string
   onSalaryValueChange: (v: string) => void
-}
-
-/**
- * Mapping of some common ISO codes -> display names.
- */
-const countryNames: Record<string, string> = {
-  PT: 'Portugal',
-  VN: 'Vietnam',
-  AU: 'Australia',
-  NZ: 'New Zealand',
-  CA: 'Canada',
-  MX: 'Mexico',
-  US: 'United States',
-  USA: 'United States',
-  GB: 'United Kingdom',
-  UK: 'United Kingdom',
-  BS: 'Bahamas',
-  CU: 'Cuba',
-  DO: 'Dominican Republic',
-  HT: 'Haiti',
-  JM: 'Jamaica',
-  CR: 'Costa Rica',
-  HN: 'Honduras',
-  NI: 'Nicaragua',
-  PA: 'Panama',
-  AR: 'Argentina',
-  BR: 'Brazil',
-  CL: 'Chile',
-  PL: 'Poland',
-  ID: 'Indonesia',
-  MY: 'Malaysia',
-  PH: 'Philippines',
-  TH: 'Thailand',
-  LK: 'Sri Lanka',
-}
-
-/**
- * getCountryDisplay
- *
- * Return a user-friendly country label.
- *
- * @param country raw country value
- */
-function getCountryDisplay(country: string): string {
-  if (!country) return ''
-  const raw = country.trim()
-  if (raw.toLowerCase() === 'all') return 'All'
-  const code = raw.toUpperCase()
-  if ((code.length <= 3 || /^[A-Z]{2,3}$/.test(code)) && countryNames[code]) {
-    return countryNames[code]
-  }
-  return raw
-}
-
-/**
- * countryCodeToEmoji
- *
- * Convert 2-letter ISO code to flag emoji (best-effort).
- *
- * @param code country code
- */
-function countryCodeToEmoji(code?: string | null): string {
-  if (!code) return ''
-  const c = code.trim().toUpperCase()
-  if (!/^[A-Z]{2}$/.test(c)) return ''
-  const first = 0x1f1e6 + (c.charCodeAt(0) - 65)
-  const second = 0x1f1e6 + (c.charCodeAt(1) - 65)
-  return String.fromCodePoint(first, second)
-}
-
-/**
- * inferCountryCode
- *
- * Try to infer a 2-letter ISO code from a value (code or name).
- *
- * @param country input country
- */
-function inferCountryCode(country?: string | null): string | undefined {
-  if (!country) return undefined
-  const raw = country.trim()
-  const maybeCode = raw.toUpperCase()
-  if (/^[A-Z]{2,3}$/.test(maybeCode)) return maybeCode.length === 3 && maybeCode === 'USA' ? 'US' : maybeCode.slice(0, 2)
-  for (const [code, name] of Object.entries(countryNames)) {
-    if (name.toLowerCase() === raw.toLowerCase()) return code.slice(0, 2)
-  }
-  return undefined
+  countryFilter: string
+  onCountryFilterChange: (v: string) => void
+  /**
+   * onReload
+   *
+   * Optional callback that should perform a canonical reload of the staff list
+   * (must re-fetch the hired_staff/hired list). This is called when a global
+   * 'staff:reload' event is dispatched (e.g. after an assignment).
+   */
+  onReload?: () => void
 }
 
 /**
  * PanelHeader
  *
  * Small header used to toggle the collapsible panel.
+ *
+ * @param props.open whether panel is open
+ * @param props.onToggle toggle handler
+ * @param props.children header children
  */
 function PanelHeader({ open, onToggle, children }: { open: boolean; onToggle: () => void; children: React.ReactNode }) {
   return (
@@ -147,152 +72,277 @@ function PanelHeader({ open, onToggle, children }: { open: boolean; onToggle: ()
 }
 
 /**
+ * SkillItem
+ *
+ * Interface representing a skill row from skills_master.
+ */
+interface SkillItem {
+  id: string
+  name: string
+}
+
+/**
+ * CountryItem
+ *
+ * Represents a discovered country_code value.
+ */
+interface CountryItem {
+  code: string
+  key: string
+  /** Human readable country name (derived from code) */
+  name: string
+}
+
+/**
+ * getCountryName
+ *
+ * Map an ISO country code to a human readable name using Intl.DisplayNames when available.
+ * Falls back to the code when mapping is not possible.
+ *
+ * @param code country ISO code (string)
+ * @returns display name or code
+ */
+function getCountryName(code: string) {
+  try {
+    // Intl.DisplayNames expects region codes (ISO 3166-1 alpha-2/alpha-3)
+    // @ts-ignore - DisplayNames may not exist in some environments
+    if (typeof Intl !== 'undefined' && (Intl as any).DisplayNames) {
+      const dn = new (Intl as any).DisplayNames(['en'], { type: 'region' })
+      const name = dn.of(code)
+      if (name) return name
+    }
+  } catch {
+    // ignore and fall back
+  }
+  return code
+}
+
+/**
  * StaffFilters
  *
- * Renders the three-column filter UI and:
- * - Fetches job categories
- * - Extracts skill tokens from the description column (heuristic) and exposes them
- *   in the Skills select so the parent can filter by a chosen skill.
+ * Renders the filter UI with role, skills, country_code and salary filters.
+ * Country dropdown is server-backed and filters data server-side in the parent.
  *
  * @param props StaffFiltersProps
  */
 export default function StaffFilters({
   roleFilter,
   onRoleFilterChange,
-  countryFilter,
-  countries,
-  onCountryFilterChange,
-  availabilityFilter,
-  onAvailabilityFilterChange,
   skillsFilter,
   onSkillsFilterChange,
   salaryMode,
   onSalaryModeChange,
   salaryValue,
   onSalaryValueChange,
+  countryFilter,
+  onCountryFilterChange,
+  onReload,
 }: StaffFiltersProps): JSX.Element {
   const [open, setOpen] = React.useState<boolean>(false)
-  const [roles, setRoles] = React.useState<string[]>(['all'])
-  const [skills, setSkills] = React.useState<string[]>(['all'])
+
+  const canonicalRoles = ['drivers', 'mechanics', 'dispatchers', 'managers', 'directors'] as const
+  const [roles, setRoles] = React.useState<string[]>(['all', ...canonicalRoles])
+  const [skills, setSkills] = React.useState<SkillItem[]>([])
   const [loadingSkills, setLoadingSkills] = React.useState<boolean>(false)
+
+  const [countries, setCountries] = React.useState<CountryItem[]>([])
+  const [loadingCountries, setLoadingCountries] = React.useState<boolean>(false)
+  const [countriesError, setCountriesError] = React.useState<string | null>(null)
 
   /**
    * Fetch distinct job categories from unemployed_staff.job_category
+   * Merge results with canonicalRoles so canonical roles appear first.
    */
   React.useEffect(() => {
     let mounted = true
     async function fetchRoles() {
       try {
-        const res = await fetch('/rest/v1/unemployed_staff?select=job_category&order=job_category')
-        if (!res.ok) return
+        const res = await fetch('/rest/v1/unemployed_staff?select=job_category')
+        if (!res.ok) {
+          if (mounted) setRoles(['all', ...canonicalRoles])
+          return
+        }
         const data = await res.json()
-        const set = new Set<string>()
-        data.forEach((row: any) => {
+        const found = new Set<string>()
+        for (const row of data) {
           const v = (row?.job_category || '').trim()
-          if (v) set.add(v)
-        })
-        const arr = Array.from(set).sort((a, b) => a.localeCompare(b))
-        if (mounted) setRoles(['all', ...arr])
+          if (v) found.add(v)
+        }
+
+        const extras: string[] = []
+        for (const v of Array.from(found)) {
+          if (!canonicalRoles.includes(v as any)) extras.push(v)
+        }
+        extras.sort((a, b) => a.localeCompare(b))
+
+        const final = ['all', ...canonicalRoles, ...extras]
+        if (mounted) setRoles(final)
       } catch {
-        // keep default if fetch fails
+        if (mounted) setRoles(['all', ...canonicalRoles])
       }
     }
     fetchRoles()
     return () => {
       mounted = false
     }
+    // run once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   /**
-   * fetchSkillsFromDescriptions
+   * loadSkillsForCategory
    *
-   * Heuristically extracts tokens from the description column.
-   * - Looks for JSON-style arrays and key:[..] patterns (e.g. skills:[], allowed_cargo_types:[])
-   * - Falls back to simple "skills: a, b, c" patterns.
+   * Loads skills (id + name) from skills_master for the currently selected category.
+   * Skills UI is hidden until a specific category is chosen.
    */
   React.useEffect(() => {
     let mounted = true
-    let cancelled = false
-    async function fetchSkillsFromDescriptions() {
+    async function loadSkills() {
       setLoadingSkills(true)
       try {
-        const res = await fetch('/rest/v1/unemployed_staff?select=description')
-        if (!res.ok) return
-        const rows = await res.json()
-        const set = new Set<string>()
-        for (const r of rows) {
-          const desc: string = String(r?.description || '')
-          if (!desc) continue
-
-          // JSON-like arrays: ["a","b"]
-          const jsonArrayRegex = /(\[[^\]]*["'][^\]]*["'][^\]]*\])/g
-          const matches = desc.match(jsonArrayRegex) || []
-          for (const m of matches) {
-            try {
-              const parsed = JSON.parse(m)
-              if (Array.isArray(parsed)) {
-                parsed.forEach((p) => {
-                  if (typeof p === 'string' && p.trim()) set.add(p.trim())
-                })
-                continue
-              }
-            } catch {
-              // ignore JSON parse errors for this match and try simple split
-            }
-            const inner = m.replace(/^\[|\]$/g, '')
-            inner
-              .split(',')
-              .map((s) => s.replace(/^['"\s]+|['"\s]+$/g, '').trim())
-              .filter(Boolean)
-              .forEach((s) => set.add(s))
+        if (!roleFilter || roleFilter === 'all') {
+          if (mounted) {
+            setSkills([])
+            onSkillsFilterChange('all')
+            setLoadingSkills(false)
           }
-
-          // key: [a,b] patterns (skills, allowed_cargo_types, etc.)
-          const keyArrayRegex = /(?:skills|skill|allowed_cargo_types)\s*:\s*\[([^\]]+)\]/gi
-          let k: RegExpExecArray | null
-          while ((k = keyArrayRegex.exec(desc))) {
-            const inner = k[1] || ''
-            inner
-              .split(',')
-              .map((s) => s.replace(/^['"\s]+|['"\s]+$/g, '').trim())
-              .filter(Boolean)
-              .forEach((s) => set.add(s))
-          }
-
-          // "skills: a, b, c" fallback
-          const skillsLabelRegex = /skills?\s*[:\-]\s*([A-Za-z0-9,\s_\/\-]+)/i
-          const lm = desc.match(skillsLabelRegex)
-          if (lm && lm[1]) {
-            lm[1]
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean)
-              .forEach((s) => set.add(s))
-          }
+          return
         }
 
-        if (!cancelled && mounted) {
-          const arr = Array.from(set)
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .sort((a, b) => a.localeCompare(b))
-          setSkills(['all', ...arr])
+        const encoded = encodeURIComponent(roleFilter)
+        const url = `/rest/v1/skills_master?select=id,name&category=eq.${encoded}&order=name.asc`
+        const res = await fetch(url)
+        if (!res.ok) {
+          if (mounted) {
+            setSkills([])
+            onSkillsFilterChange('all')
+          }
+          return
+        }
+        const data = await res.json()
+        const normalized: SkillItem[] = Array.isArray(data)
+          ? data
+              .map((r: any) => {
+                return { id: String(r.id), name: String(r.name ?? '').trim() }
+              })
+              .filter((s) => s.name)
+          : []
+
+        if (mounted) {
+          setSkills(normalized)
+          onSkillsFilterChange('all')
         }
       } catch {
         // ignore fetch errors
       } finally {
-        if (mounted && !cancelled) setLoadingSkills(false)
+        if (mounted) setLoadingSkills(false)
       }
     }
 
-    fetchSkillsFromDescriptions()
+    loadSkills()
     return () => {
-      cancelled = true
+      mounted = false
+    }
+    // only when roleFilter changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roleFilter])
+
+  /**
+   * fetchCountries
+   *
+   * Pages the unemployed_staff table to gather distinct country_code rows.
+   * - Uses supabase-js paging (.range) only
+   * - Dedupes by country_code
+   * - Does NOT query or depend on a country name column
+   *
+   * Runs once on mount.
+   */
+  React.useEffect(() => {
+    let mounted = true
+
+    async function fetchCountries() {
+      setLoadingCountries(true)
+      setCountriesError(null)
+
+      try {
+        const chunk = 1000
+        let from = 0
+        const seen = new Set<string>()
+
+        while (mounted) {
+          const to = from + chunk - 1
+
+          const { data, error } = await supabase
+            .from('unemployed_staff')
+            .select('country_code')
+            .not('country_code', 'is', null)
+            .range(from, to)
+
+          if (error) {
+            // surface the error in console for debugging but stop paging
+            // eslint-disable-next-line no-console
+            console.error('Country fetch error:', error)
+            break
+          }
+
+          if (!data || data.length === 0) break
+
+          for (const r of data) {
+            const code = (r?.country_code ?? '').toString().trim()
+            if (code) seen.add(code)
+          }
+
+          if (data.length < chunk) break
+          from += chunk
+        }
+
+        const arr = Array.from(seen)
+          .sort()
+          .map((code) => ({ key: code, code, name: getCountryName(code) }))
+
+        if (mounted) {
+          setCountries(arr)
+          if (arr.length === 0) {
+            setCountriesError('No country codes found in unemployed_staff.')
+          }
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error(e)
+        if (mounted) {
+          setCountries([])
+          setCountriesError('Failed to load countries.')
+        }
+      } finally {
+        if (mounted) setLoadingCountries(false)
+      }
+    }
+
+    fetchCountries()
+    return () => {
       mounted = false
     }
   }, [])
 
-  // Salary numeric derived for the slider display
+  /**
+   * Listen for global staff reload events.
+   *
+   * When other components dispatch `window.dispatchEvent(new CustomEvent('staff:reload'))`
+   * this listener will call onReload if provided. This ensures there is one canonical
+   * reload path for the staff list (parent should implement onReload to re-fetch).
+   */
+  React.useEffect(() => {
+    function handleReload() {
+      onReload?.()
+    }
+
+    if (typeof window === 'undefined') return
+    window.addEventListener('staff:reload', handleReload)
+    return () => {
+      window.removeEventListener('staff:reload', handleReload)
+    }
+  }, [onReload])
+
   const numericSalary = React.useMemo(() => {
     const n = Number(salaryValue)
     if (Number.isNaN(n)) return 0
@@ -302,26 +352,13 @@ export default function StaffFilters({
   /**
    * setMode
    *
-   * Switch salary mode.
+   * Helper to change salary mode.
    */
   function setMode(m: 'any' | 'below' | 'above') {
     onSalaryModeChange(m)
   }
 
-  // Static availability options (kept for layout parity)
-  const availabilityOptions = [
-    { value: 'all', label: 'All' },
-    { value: 'now', label: 'Available now' },
-    { value: '1_week', label: '1 week' },
-    { value: '2_weeks', label: '2 weeks' },
-    { value: '1_month', label: '1 month' },
-    { value: '2_months', label: '2 months' },
-  ]
-
-  const selectedCountryEmoji = React.useMemo(() => {
-    const code = inferCountryCode(countryFilter)
-    return countryCodeToEmoji(code)
-  }, [countryFilter])
+  const skillsDisabled = !roleFilter || roleFilter === 'all'
 
   return (
     <div className="w-full">
@@ -340,7 +377,10 @@ export default function StaffFilters({
             </div>
 
             <div className="flex items-center md:justify-start">
-              <label className="text-xs text-slate-600">Country</label>
+              {/* Show country label with a loaded count; keep styling unchanged */}
+              <label className="text-xs text-slate-600">
+                Country{loadingCountries ? ' (loading...)' : countries.length > 0 ? ` (${countries.length})` : ''}
+              </label>
             </div>
 
             <div className="flex items-center md:justify-start">
@@ -349,7 +389,7 @@ export default function StaffFilters({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 items-start w-full">
-            {/* Category + Skills (left column) */}
+            {/* Category + (skills hidden when no role selected) */}
             <div className="flex flex-col gap-2">
               <div className="flex items-center">
                 <select
@@ -358,73 +398,59 @@ export default function StaffFilters({
                   className="border px-4 py-2 rounded w-full md:w-full"
                 >
                   {roles.map((r) => (
-                    <option key={r} value={r === 'all' ? 'all' : r}>
+                    <option key={r} value={r}>
                       {r === 'all' ? 'All' : r[0].toUpperCase() + r.slice(1)}
                     </option>
                   ))}
                 </select>
               </div>
 
-              <div className="flex items-center gap-3">
-                <select
-                  value={skillsFilter}
-                  onChange={(e) => onSkillsFilterChange(e.target.value)}
-                  className="border px-3 py-2 rounded w-full text-sm"
-                >
-                  {loadingSkills ? <option>Loading skills…</option> : null}
-                  {skills.map((s) => (
-                    <option key={s} value={s}>
-                      {s === 'all' ? 'All skills' : s}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {/* Skills select is removed/hidden when no category is chosen */}
+              {!skillsDisabled && (
+                <div className="flex items-center gap-3">
+                  <select
+                    value={skillsFilter}
+                    onChange={(e) => onSkillsFilterChange(e.target.value)}
+                    className={`border px-3 py-2 rounded w-full text-sm ${loadingSkills ? 'opacity-80' : ''}`}
+                    disabled={loadingSkills}
+                  >
+                    {loadingSkills ? (
+                      <option>Loading skills…</option>
+                    ) : (
+                      <>
+                        <option value="all">All skills</option>
+                        {skills.map((s) => (
+                          <option key={s.id} value={s.name}>
+                            {s.name}
+                          </option>
+                        ))}
+                      </>
+                    )}
+                  </select>
+                </div>
+              )}
             </div>
 
-            {/* Country + Availability (middle column) */}
+            {/* Middle column: country selector (server-backed, country_code only) */}
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-3">
                 <select
                   value={countryFilter}
                   onChange={(e) => onCountryFilterChange(e.target.value)}
-                  className="border px-4 py-2 rounded w-full md:w-full"
+                  className={`border px-4 py-2 rounded w-full md:w-full ${loadingCountries ? 'opacity-80' : ''}`}
+                  disabled={loadingCountries}
                 >
                   <option value="all">All</option>
-                  {countries.map((c) => {
-                    const code = inferCountryCode(c)
-                    const emoji = countryCodeToEmoji(code)
-                    const display = getCountryDisplay(c)
-                    return (
-                      <option key={c} value={c}>
-                        {emoji ? `${emoji} ${display}` : display}
-                      </option>
-                    )
-                  })}
-                </select>
-
-                <div className="hidden md:flex items-center text-xs text-slate-500 whitespace-nowrap">
-                  {countryFilter && countryFilter !== 'all' ? (
-                    <>
-                      <span className="mr-1">{selectedCountryEmoji}</span>
-                      <span>· {getCountryDisplay(countryFilter)}</span>
-                    </>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <select
-                  value={availabilityFilter}
-                  onChange={(e) => onAvailabilityFilterChange(e.target.value)}
-                  className="border px-3 py-2 rounded w-full text-sm"
-                >
-                  {availabilityOptions.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
+                  {countries.map((c) => (
+                    <option key={c.code} value={c.code}>
+                      {c.name} ({c.code})
                     </option>
                   ))}
                 </select>
               </div>
+
+              {/* Minimal inline error message to surface failures without changing layout */}
+              {countriesError && <div className="text-xs text-rose-600">{countriesError}</div>}
             </div>
 
             {/* Salary (right column) */}
@@ -486,7 +512,7 @@ export default function StaffFilters({
 
               <div className="flex items-center justify-between text-xs text-slate-500 px-4">
                 <span>0</span>
-                <span>{numericSalary > 0 ? `$${numericSalary}` : ''}</span>
+                <span>{numericSalary > 0 ? `${numericSalary}` : ''}</span>
                 <span>10,000+</span>
               </div>
             </div>

@@ -1,16 +1,26 @@
+
 /**
  * JobCard.tsx
  *
- * Presentational Job card used on the Market list.
+ * Presentational Job card used on the Market list and My Jobs page.
  *
- * Renders a compact summary row and a collapsible details panel.
- * Adds small weather badges (origin & destination) using WeatherBadge which
- * fetches from public.city_weather_today without changing the existing layout.
+ * Behavior changes:
+ * - Reads job.pickup_ready (if provided by the API) to determine whether the job
+ *   may be assigned yet. When pickup_ready === false the card is shown as
+ *   muted/gray and the primary assign/accept button is disabled. Countdown is
+ *   still displayed.
+ *
+ * - Backwards compatible: if pickup_ready is not present, client-side time
+ *   comparison is used as a fallback (now() >= pickup_time).
+ *
+ * Note: This file focuses only on UI behavior; actual data queries must expose
+ * pickup_ready (see migrations/075_pickup_ready.sql).
  */
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useState } from 'react'
 import CountdownTimer from '../common/CountdownTimer'
-import { Truck, Clock, Tag, ChevronDown, ChevronUp, Star } from 'lucide-react'
+import Currency from '../common/Currency'
+import { Truck, Clock, Tag, ChevronDown, ChevronUp } from 'lucide-react'
 import PricePill from './PricePill'
 import CompanyProfileModal from './CompanyProfileModal'
 import WeatherBadge from './WeatherBadge'
@@ -18,7 +28,8 @@ import WeatherBadge from './WeatherBadge'
 /**
  * JobRow
  *
- * Minimal job shape used by the Market page.
+ * Minimal job shape used by the Market page. pickup_ready is optional and when
+ * present is authoritative.
  */
 export interface JobRow {
   id: string
@@ -41,7 +52,6 @@ export interface JobRow {
   pallets?: number | null
   temperature_control?: boolean | null
   hazardous?: boolean | null
-  /** Indicates whether the job requires crossing customs / border formalities */
   requires_customs?: boolean | null
   special_requirements?: any | null
   currency?: string | null
@@ -53,8 +63,13 @@ export interface JobRow {
   destination_client_company_logo?: string | null
   posted_by_user_name?: string | null
   status?: string | null
-  /** Job offer type coming from job_offers.job_offer_type_code (preferred display) */
   job_offer_type_code?: string | null
+  assignment_status?: string | null
+  driving_session_phase?: string | null
+  computed_status?: string | null
+  is_deadline_expired?: boolean | null
+  /** pickup_ready - authoritative flag from server: now() >= pickup_time */
+  pickup_ready?: boolean | null
 }
 
 /**
@@ -66,6 +81,11 @@ export interface JobCardProps {
   job: JobRow
   onView?: (job: JobRow) => void
   onAccept: (job: JobRow) => void
+  onCancel?: (job: JobRow) => void
+  actionsVariant?: 'default' | 'my-jobs'
+  variant?: 'default' | 'waiting' | 'active'
+  /** mode influences disabled behavior: 'market' keeps future pickups selectable */ 
+  mode?: 'market' | 'staging' | 'my-jobs' | 'default'
 }
 
 /**
@@ -101,84 +121,69 @@ function formatPayload(kg?: number | null) {
 /**
  * SquareFlag
  *
- * Presentational square flag chip. Falls back to emoji if images fail.
+ * Presentational flag chip. Renders a normal rectangular flag instead of a
+ * tightly cropped square so flags keep their natural aspect ratio and
+ * look correct visually.
  */
-/**
-   * SquareFlag
+function SquareFlag({ code, alt = '', size = 20 }: { code?: string | null; alt?: string; size?: number }) {
+  const initialSrc = (() => {
+    if (!code) return null
+    const cc = String(code).trim().toLowerCase()
+    if (cc.length !== 2) return null
+    return `https://flagcdn.com/w40/${cc}.png`
+  })()
+
+  const [src, setSrc] = useState<string | null>(initialSrc)
+  const [triedAlternate, setTriedAlternate] = useState(false)
+
+  /**
+   * countryCodeToEmoji
    *
-   * Presentational flag chip. Renders a normal rectangular flag instead of a
-   * tightly cropped square so flags keep their natural aspect ratio and
-   * look correct visually.
-   *
-   * - Uses the `size` prop as the height in pixels.
-   * - Computes a width with a 4:3 aspect ratio (approx 1.6x height) to avoid
-   *   squashed images.
-   * - Falls back to an emoji when remote images fail.
-   *
-   * @param code - two-letter country code
-   * @param alt - accessible title / alt text
-   * @param size - desired height in pixels (defaults to 20)
+   * Fallback emoji rendering for country codes.
    */
-  function SquareFlag({ code, alt = '', size = 20 }: { code?: string | null; alt?: string; size?: number }) {
-    const initialSrc = (() => {
-      if (!code) return null
-      const cc = String(code).trim().toLowerCase()
-      if (cc.length !== 2) return null
-      return `https://flagcdn.com/w40/${cc}.png`
-    })()
-
-    const [src, setSrc] = useState<string | null>(initialSrc)
-    const [triedAlternate, setTriedAlternate] = useState(false)
-
-    /**
-     * countryCodeToEmoji
-     *
-     * Fallback emoji rendering for country codes.
-     */
-    function countryCodeToEmoji(code?: string | null) {
-      if (!code) return '🌍'
-      const cc = code.trim().toUpperCase()
-      if (cc.length !== 2) return '🌍'
-      return cc.split('').map((c) => String.fromCodePoint(127397 + c.charCodeAt(0))).join('')
-    }
-
-    /**
-     * onImageError
-     *
-     * Try an alternate CDN on first failure, then fall back to emoji.
-     */
-    function onImageError() {
-      if (!triedAlternate && src) {
-        const cc = String(code || '').trim().toLowerCase()
-        if (cc.length === 2) {
-          setSrc(`https://flagpedia.net/data/flags/icon/72x54/${cc}.png`)
-          setTriedAlternate(true)
-          return
-        }
-      }
-      setSrc(null)
-    }
-
-    // Use height=size and a wider width so flags keep their rectangular aspect.
-    const width = Math.max(16, Math.round((size || 20) * 1.6))
-    const chipStyle: React.CSSProperties = { width, height: size }
-
-    return (
-      <div
-        aria-hidden
-        className="overflow-hidden bg-white border border-slate-100 shadow-sm flex items-center justify-center"
-        style={chipStyle}
-        title={alt || code || 'Country'}
-      >
-        {src ? (
-          // eslint-disable-next-line jsx-a11y/alt-text
-          <img src={src} className="w-full h-full object-cover block" onError={onImageError} />
-        ) : (
-          <span style={{ fontSize: Math.max(10, Math.floor((size || 20) * 0.6)), lineHeight: 1 }}>{countryCodeToEmoji(code)}</span>
-        )}
-      </div>
-    )
+  function countryCodeToEmoji(code?: string | null) {
+    if (!code) return '🌍'
+    const cc = code.trim().toUpperCase()
+    if (cc.length !== 2) return '🌍'
+    return cc.split('').map((c) => String.fromCodePoint(127397 + c.charCodeAt(0))).join('')
   }
+
+  /**
+   * onImageError
+   *
+   * Try an alternate CDN on first failure, then fall back to emoji.
+   */
+  function onImageError() {
+    if (!triedAlternate && src) {
+      const cc = String(code || '').trim().toLowerCase()
+      if (cc.length === 2) {
+        setSrc(`https://flagpedia.net/data/flags/icon/72x54/${cc}.png`)
+        setTriedAlternate(true)
+        return
+      }
+    }
+    setSrc(null)
+  }
+
+  const width = Math.max(16, Math.round((size || 20) * 1.6))
+  const chipStyle: React.CSSProperties = { width, height: size }
+
+  return (
+    <div
+      aria-hidden
+      className="overflow-hidden bg-white border border-slate-100 shadow-sm flex items-center justify-center"
+      style={chipStyle}
+      title={alt || code || 'Country'}
+    >
+      {src ? (
+        // eslint-disable-next-line jsx-a11y/alt-text
+        <img src={src} className="w-full h-full object-cover block" onError={onImageError} />
+      ) : (
+        <span style={{ fontSize: Math.max(10, Math.floor((size || 20) * 0.6)), lineHeight: 1 }}>{countryCodeToEmoji(code)}</span>
+      )}
+    </div>
+  )
+}
 
 /**
  * CompanyAvatar
@@ -250,9 +255,79 @@ function openCityModal(cityId?: string | null, cityName?: string | null) {
 }
 
 /**
+ * PHASE_LABELS_SHORT
+ *
+ * Map technical DB phase values to short, user-friendly badge labels.
+ * Keep DB values untouched; map only in UI.
+ */
+const PHASE_LABELS_SHORT: Record<string, string> = {
+  TO_PICKUP: 'Picking up',
+  PICKING_LOAD: 'Picking up',
+  LOADING: 'Loading',
+  TO_DELIVERY: 'Delivering',
+  TO_DELIVER: 'Delivering',
+  UNLOADING: 'Unloading',
+  COMPLETED: 'Completed',
+  DELIVERED: 'Completed',
+  ASSIGNED: 'Assigned',
+  'TO PICKUP': 'Picking up',
+  'TO DELIVERY': 'Delivering',
+}
+
+/**
+ * StatusBadge
+ *
+ * Small presentational badge showing assignment status with color coding.
+ *
+ * @param props.status - raw status/phase string
+ */
+function StatusBadge({ status }: { status?: string | null }) {
+  const raw = String(status ?? '').trim()
+  const transformedKey = raw
+    ? raw
+        .toUpperCase()
+        .replace(/\s+/g, '_')
+        .replace(/-+/g, '_')
+        .replace(/__+/g, '_')
+    : 'ASSIGNED'
+
+  const label = PHASE_LABELS_SHORT[transformedKey] ?? (() => {
+    const human = transformedKey.replace(/_/g, ' ').toLowerCase()
+    return human
+      .split(' ')
+      .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
+      .join(' ')
+  })()
+
+  const styles: Record<string, string> = {
+    ASSIGNED: 'bg-blue-100 text-blue-700',
+    TO_PICKUP: 'bg-blue-100 text-blue-700',
+    PICKING_LOAD: 'bg-blue-100 text-blue-700',
+    LOADING: 'bg-amber-100 text-amber-700',
+    TO_DELIVERY: 'bg-indigo-100 text-indigo-700',
+    TO_DELIVER: 'bg-indigo-100 text-indigo-700',
+    UNLOADING: 'bg-amber-100 text-amber-700',
+    COMPLETED: 'bg-emerald-100 text-emerald-700',
+    DELIVERED: 'bg-emerald-100 text-emerald-700',
+    CANCELLED: 'bg-gray-200 text-gray-700',
+    FAILED: 'bg-rose-100 text-rose-700',
+  }
+
+  const cls = styles[transformedKey] ?? styles.ASSIGNED
+
+  return (
+    <span className={`px-2 py-1 rounded text-xs font-semibold ${cls}`} title={raw || 'status'}>
+      {label}
+    </span>
+  )
+}
+
+/**
  * TopRouteRow
  *
  * Compact summary row with origin -> destination, primary reward and chevron.
+ *
+ * Accepts pickupReady which is authoritative when provided by the server.
  */
 function TopRouteRow({
   origin,
@@ -271,6 +346,11 @@ function TopRouteRow({
   onToggleExpand,
   distanceKm,
   currency,
+  assignmentStatus,
+  variant = 'default',
+  actionsVariant = 'default',
+  pickupReady,
+  disabled,
 }: {
   origin?: string | null
   originCode?: string | null
@@ -288,34 +368,57 @@ function TopRouteRow({
   onToggleExpand: () => void
   distanceKm?: number | null
   currency?: string | null
+  assignmentStatus?: string | null
+  variant?: 'default' | 'waiting' | 'active'
+  actionsVariant?: 'default' | 'my-jobs'
+  pickupReady?: boolean | null
+  disabled?: boolean
 }) {
-  // Determine if a compact active countdown should be shown (pickup exists and is in the future).
-  const pickupActive = (() => {
+  // If pickupReady not provided by API, fall back to local time comparison.
+  const pickupReadyComputed = (() => {
+    if (typeof pickupReady === 'boolean') return pickupReady
     if (!pickup) return false
     const t = new Date(pickup).getTime()
     if (Number.isNaN(t)) return false
-    return t > Date.now()
+    return Date.now() >= t
   })()
 
-  /**
-   * onKeyDownHandler
-   *
-   * Handle Enter/Space to toggle expansion for keyboard users.
-   */
+  const pickupReadyFinal = pickupReadyComputed
+
+  const isDeadlineExpired = (() => {
+    if (!deadline) return false
+    const d = new Date(String(deadline))
+    if (Number.isNaN(d.getTime())) return false
+    return d < new Date()
+  })()
+
   function onKeyDownHandler(e: React.KeyboardEvent) {
+    if (disabled) return
     if (e.key === 'Enter' || e.key === ' ' || e.key === 'Space' || e.key === 'Spacebar') {
       e.preventDefault()
       onToggleExpand()
     }
   }
 
+  const topRowBase =
+    variant === 'waiting'
+      ? 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-sky-50 to-white/80 border border-sky-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-sky-200'
+      : variant === 'active'
+      ? 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-emerald-50 to-white/80 border border-emerald-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-200'
+      : 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-amber-50 to-white/80 border border-amber-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-200'
+
+  const topRowClass = `${topRowBase} ${disabled ? 'opacity-70 filter grayscale cursor-not-allowed' : ''}`
+
   return (
     <div
       role="button"
-      tabIndex={0}
-      onClick={() => onToggleExpand()}
+      tabIndex={disabled ? -1 : 0}
+      onClick={() => {
+        if (disabled) return
+        onToggleExpand()
+      }}
       onKeyDown={onKeyDownHandler}
-      className="w-full rounded-lg px-4 py-3 bg-gradient-to-br from-amber-50 to-white/80 border border-amber-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-200"
+      className={topRowClass}
       aria-pressed={expanded}
       aria-label={`Toggle job details for ${origin ?? 'Unknown'} to ${destination ?? 'Unknown'}`}
     >
@@ -340,13 +443,23 @@ function TopRouteRow({
           </div>
 
           <div className="ml-auto text-right flex items-center gap-3">
-            <PricePill amount={primaryReward} currency={currency ?? undefined} />
+            {/* Status badge shown before price */}
+            <StatusBadge status={assignmentStatus} />
+
+            {/* Use Currency formatter on My Jobs to show symbol; keep PricePill otherwise. */}
+            {actionsVariant === 'my-jobs' ? (
+              <div aria-hidden>
+                <Currency value={primaryReward ?? 0} currency={currency ?? 'USD'} className="text-slate-900 text-lg font-semibold" />
+              </div>
+            ) : (
+              <PricePill amount={primaryReward} currency={currency ?? undefined} />
+            )}
 
             <button
               type="button"
               onClick={(e) => {
-                // prevent the top-level onClick from doubling when someone clicks the chevron
                 e.stopPropagation()
+                if (disabled) return
                 onToggleExpand()
               }}
               aria-expanded={expanded}
@@ -361,7 +474,15 @@ function TopRouteRow({
         <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
             <Truck className="w-3 h-3 text-slate-500" />
-            <span className="font-medium">{transportMode ?? '—'}</span>
+            <span className="font-semibold">
+              {normalizedTransportMode(transportMode) === 'load' ? (
+                <span className="text-blue-600">Load</span>
+              ) : normalizedTransportMode(transportMode) === 'trailer' ? (
+                <span className="text-purple-600">Trailer</span>
+              ) : (
+                <span className="text-slate-700">{transportMode ?? '—'}</span>
+              )}
+            </span>
           </div>
 
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
@@ -381,12 +502,12 @@ function TopRouteRow({
 
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
             <Clock className="w-3 h-3 text-slate-500" />
-            <span>Pickup: {smallDate(pickup)}</span>
+            <span className={`${pickupReadyFinal ? 'font-bold text-emerald-700' : 'font-bold text-rose-600'}`}>Pickup: {smallDate(pickup)}</span>
           </div>
 
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
             <Clock className="w-3 h-3 text-slate-500" />
-            <span>Deadline: {smallDate(deadline)}</span>
+            <span className={isDeadlineExpired ? 'text-rose-600 font-semibold' : ''}>Deadline: {smallDate(deadline)}</span>
           </div>
         </div>
       </div>
@@ -420,10 +541,16 @@ function MetaBox({
   hazardous?: boolean | null
   special_requirements?: any | null
 }) {
+  const isExpired = (() => {
+    if (!deadline) return false
+    const d = new Date(String(deadline))
+    if (Number.isNaN(d.getTime())) return false
+    return d < new Date()
+  })()
+
   return (
     <div className="rounded-lg p-4 bg-white border border-slate-100 shadow-sm h-full flex flex-col justify-between">
       <div className="grid grid-cols-1 gap-3">
-        {/* Top row: Pickup and Deadline */}
         <div className="grid grid-cols-2 gap-3 items-start">
           <div className="flex items-start gap-3 pr-3 border-r border-slate-100">
             <div className="text-slate-400 mt-0.5">
@@ -441,19 +568,17 @@ function MetaBox({
             </div>
             <div>
               <div className="text-xs text-slate-500">Deadline</div>
-              <div className="text-sm text-slate-800">{smallDate(deadline)}</div>
+              <div className={isExpired ? 'text-rose-600 font-semibold text-sm' : 'text-sm text-slate-800'}>{smallDate(deadline)}</div>
             </div>
           </div>
         </div>
 
-        {/* Dedicated countdown box inside expanded details */}
         <div>
           <div className="rounded-md bg-white border border-slate-100 p-3 flex items-center justify-center">
             <CountdownTimer pickupTime={pickup ?? null} className="text-sm font-medium text-slate-700" />
           </div>
         </div>
 
-        {/* Payload / Stats row */}
         <div className="border-t border-slate-100 pt-3 grid grid-cols-2 gap-2">
           <div className="rounded-md bg-slate-50 p-2 text-sm">
             <div className="text-xs text-slate-500">Weight</div>
@@ -493,17 +618,9 @@ function MetaBox({
  *
  * Two-column rewards / insights box used in JobCard expanded view.
  *
- * - Left: Distance, Type and Weather badges (Origin / Destination)
- * - Right: Advantages + Disadvantages (handicaps)
- *
- * Added detection for customs (requires_customs) which is treated as a disadvantage.
- *
- * @param trailer - reward for trailer cargo
- * @param load - reward for load cargo
- * @param modeKey - normalized transport mode key
- * @param onView - optional view callback
- * @param onAccept - accept callback
- * @param job - job row data
+ * onAccept is a simple void callback that triggers parent accept flow.
+ * The actions area can be controlled with actionsVariant to allow page-specific
+ * buttons (for example My Jobs shows only Cancel Load).
  */
 function RewardsBox({
   trailer,
@@ -511,14 +628,20 @@ function RewardsBox({
   modeKey,
   onView,
   onAccept,
+  onCancel,
+  actionsVariant = 'default',
   job,
+  disabled,
 }: {
   trailer: number
   load: number
   modeKey: 'load' | 'trailer' | 'unknown'
   onView?: (job: JobRow) => void
-  onAccept: (job: JobRow) => void
+  onAccept: () => void
+  onCancel?: () => void
+  actionsVariant?: 'default' | 'my-jobs'
   job: JobRow
+  disabled?: boolean
 }) {
   let primary = 0
   let primaryLabel = 'Total'
@@ -534,12 +657,6 @@ function RewardsBox({
     primaryLabel = load >= trailer ? 'Load' : 'Trailer'
   }
 
-  /**
-   * inferHandicaps
-   *
-   * Best-effort extraction of negative aspects from job data.
-   * Includes customs (border crossing) when requires_customs is set.
-   */
   function inferHandicaps(): string[] {
     const out: string[] = []
     try {
@@ -550,17 +667,11 @@ function RewardsBox({
       if (s.includes('toll') || s.includes('tolls')) out.push('Tolls')
       if (job.temperature_control) out.push('Temperature control')
       if (job.hazardous) out.push('Hazardous')
-      // New: customs / border crossing increases time & paperwork -> disadvantage
       if (job.requires_customs) out.push('Customs (border crossing)')
     } catch {}
     return out
   }
 
-  /**
-   * inferOfferType
-   *
-   * Simplified inference of offer type from country codes.
-   */
   function inferOfferType(): string {
     try {
       const oCountry = job.origin_country_code?.toLowerCase()
@@ -571,11 +682,6 @@ function RewardsBox({
     return 'Unknown'
   }
 
-  /**
-   * inferAdvantages
-   *
-   * Best-effort positive aspects detection.
-   */
   function inferAdvantages(): string[] {
     const out: string[] = []
     try {
@@ -596,9 +702,7 @@ function RewardsBox({
 
   return (
     <div className="rounded-lg p-4 bg-white border border-slate-100 shadow-sm h-full flex flex-col">
-      {/* TWO COLUMN LAYOUT */}
       <div className="grid grid-cols-2 gap-4 mb-4">
-        {/* LEFT SIDE */}
         <div className="space-y-3">
           <div>
             <div className="text-xs text-slate-500">Distance</div>
@@ -626,7 +730,6 @@ function RewardsBox({
           </div>
         </div>
 
-        {/* RIGHT SIDE */}
         <div className="space-y-3">
           {advantages.length > 0 && (
             <div>
@@ -656,28 +759,55 @@ function RewardsBox({
         </div>
       </div>
 
-      {/* TOTAL + BUTTONS */}
       <div className="w-full mt-auto border-t border-slate-100 pt-3">
         <div className="w-full mt-2 flex items-baseline justify-between">
           <div className="text-sm text-slate-500">Total</div>
-          <PricePill amount={primary} currency={job.currency ?? undefined} compact />
+
+          {/* Use Currency formatter on My Jobs to show symbol; keep PricePill otherwise. */}
+          {actionsVariant === 'my-jobs' ? (
+            <Currency value={primary} currency={job.currency ?? 'USD'} className="text-slate-900 text-lg font-semibold" />
+          ) : (
+            <PricePill amount={primary} currency={job.currency ?? undefined} compact />
+          )}
         </div>
 
         <div className="w-full mt-4 flex gap-2">
           <div className="flex-1" aria-hidden />
-          <button
-            type="button"
-            className="px-3 py-2 rounded-md border bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
-          >
-            Follow
-          </button>
-          <button
-            type="button"
-            onClick={() => onAccept(job)}
-            className="px-4 py-2 rounded-md bg-sky-600 text-white text-sm hover:bg-sky-700 transition shadow"
-          >
-            Accept
-          </button>
+          {actionsVariant === 'my-jobs' ? (
+            <div className="ml-auto flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => onCancel?.()}
+                disabled={disabled}
+                className={`px-4 py-2 rounded-md text-white text-sm transition shadow ${disabled ? 'bg-rose-300 cursor-not-allowed opacity-60' : 'bg-rose-600 hover:bg-rose-700'}`}
+              >
+                Cancel Load
+              </button>
+              {!disabled ? null : <span className="text-xs text-slate-500">Assign disabled</span>}
+            </div>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="px-3 py-2 rounded-md border bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                onClick={() => onView?.(job)}
+              >
+                Follow
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (disabled) return
+                  onAccept()
+                }}
+                disabled={disabled}
+                className={`px-4 py-2 rounded-md text-sm transition shadow ${disabled ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-70' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >
+                Accept
+              </button>
+              {disabled ? <span className="ml-2 text-xs text-slate-500">Assign disabled</span> : null}
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -688,8 +818,13 @@ function RewardsBox({
  * JobCard
  *
  * Exported component that composes the small summary and the expanded details.
+ *
+ * Behavior note:
+ * - The component uses job.pickup_ready (if present) to decide whether the job
+ *   is currently assignable. When not assignable the card is visually muted
+ *   and assignment buttons are disabled.
  */
-export default function JobCard({ job, onView, onAccept }: JobCardProps) {
+export default function JobCard({ job, onView, onAccept, onCancel, variant = 'default', actionsVariant = 'default', mode = undefined }: JobCardProps) {
   const [expanded, setExpanded] = useState(false)
 
   const rewardTrailer = job.reward_trailer_cargo ?? 0
@@ -722,20 +857,48 @@ export default function JobCard({ job, onView, onAccept }: JobCardProps) {
     setCompanyModalOpen(true)
   }
 
-  /**
-   * closeCompanyModal
-   *
-   * Close the modal and clear selected company.
-   */
   function closeCompanyModal() {
     setCompanyModalOpen(false)
   }
+
+  /**
+   * Determine the authoritative status/phase string for the badge.
+   *
+   * Preference order:
+   * 1) driving_session_phase (authoritative when present)
+   * 2) job.status (database assignment/job status)
+   * 3) job.assignment_status (legacy)
+   * 4) job.computed_status (normalized string provided by pages)
+   */
+  const authoritativePhase = (job.driving_session_phase ?? job.status ?? job.assignment_status ?? job.computed_status ?? 'ASSIGNED') as string
+
+  /**
+   * Determine pickup readiness and disabled state.
+   *
+   * Jobs are only disabled (grayed out / unassignable) when pickup time is in the future
+   * AND the card is rendered in a context that requires readiness (staging or my-jobs).
+   * The Market keeps jobs selectable even if pickup is in the future.
+   */
+  const pickupReady = typeof job.pickup_ready === 'boolean' ? job.pickup_ready : (() => {
+    if (!job.pickup_time) return false
+    const t = new Date(String(job.pickup_time)).getTime()
+    if (Number.isNaN(t)) return false
+    return Date.now() >= t
+  })()
+
+  // Determine render mode: explicit prop overrides, otherwise infer from actionsVariant.
+  const effectiveMode: 'market' | 'staging' | 'my-jobs' | 'default' =
+    (mode as any) ?? (actionsVariant === 'my-jobs' ? 'my-jobs' : 'market')
+
+  const disabled = pickupReady === false && (effectiveMode === 'staging' || effectiveMode === 'my-jobs')
 
   return (
     <article
       aria-labelledby={`job-${job.id}-title`}
       data-jobcard-version="v3-cargo-payload-company-v2"
-      className="group rounded-xl border border-slate-100 shadow-sm hover:shadow-lg transition-shadow duration-150 p-3 bg-white"
+      className={`group rounded-xl border border-slate-100 shadow-sm hover:shadow-lg transition-shadow duration-150 p-3 bg-white ${disabled ? 'opacity-75 filter grayscale' : ''}`}
+      aria-disabled={disabled}
+      role="article"
     >
       <div className="mb-3">
         <TopRouteRow
@@ -755,12 +918,16 @@ export default function JobCard({ job, onView, onAccept }: JobCardProps) {
           onToggleExpand={() => setExpanded((s) => !s)}
           distanceKm={job.distance_km}
           currency={job.currency ?? undefined}
+          assignmentStatus={authoritativePhase}
+          variant={variant}
+          actionsVariant={actionsVariant}
+          pickupReady={job.pickup_ready ?? undefined}
+          disabled={disabled}
         />
       </div>
 
       <div className={`overflow-hidden transition-[max-height,opacity] duration-300 ${expanded ? 'max-h-96 opacity-100' : 'max-h-0 opacity-0'}`} aria-hidden={!expanded}>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-          {/* Left column */}
           <div className="rounded-lg p-4 bg-white border border-slate-100 shadow-sm h-full flex flex-col justify-between">
             <div className="min-w-0">
               <div className="text-xs text-slate-500">Cargo Type</div>
@@ -826,7 +993,17 @@ export default function JobCard({ job, onView, onAccept }: JobCardProps) {
             />
           </div>
 
-          <RewardsBox trailer={rewardTrailer} load={rewardLoad} modeKey={modeKey} onView={onView} onAccept={onAccept} job={job} />
+          <RewardsBox
+            trailer={rewardTrailer}
+            load={rewardLoad}
+            modeKey={modeKey}
+            onView={onView}
+            onAccept={() => onAccept(job)}
+            onCancel={() => onCancel?.(job)}
+            actionsVariant={actionsVariant}
+            job={job}
+            disabled={disabled}
+          />
         </div>
       </div>
 

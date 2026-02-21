@@ -2,88 +2,107 @@
  * StaffTabs.tsx
  *
  * Tabs component dividing staff by role and rendering lists for each.
+ *
+ * IMPORTANT:
+ * - This component MUST NOT reshape staff rows.
+ * - It must pass the full StaffMember object directly to HiredStaffCard.
  */
 
 import React from 'react'
-import StaffRow from './StaffRow'
+import HiredStaffCard from './HiredStaffCard'
 import type { StaffMember } from '../../lib/staffApi'
+import StaffCategoryEffects from './StaffCategoryEffects'
+import type { StaffCategory } from '../../lib/staffCategoryEffects'
 
-/**
- * Props for StaffTabs.
- */
 export interface StaffTabsProps {
   staff: StaffMember[]
+  onSalaryUpdated: () => void
 }
 
-/**
- * StaffTabs
- *
- * Renders five tabs (Drivers, Mechanics, Dispatchers, Managers, Directors)
- * and shows lists of staff for the active role.
- *
- * @param props StaffTabsProps
- * @returns JSX.Element
- */
-export default function StaffTabs({ staff }: StaffTabsProps) {
-  const roles = ['drivers', 'mechanics', 'dispatchers', 'managers', 'directors'] as const
-  const [active, setActive] = React.useState<typeof roles[number]>('drivers')
+const CATEGORIES = ['drivers', 'mechanics', 'dispatchers', 'managers', 'directors'] as const
+type Category = typeof CATEGORIES[number]
 
-  const roleMap = {
-    drivers: 'driver',
-    mechanics: 'mechanic',
-    dispatchers: 'dispatcher',
-    managers: 'manager',
-    directors: 'director',
-  } as const
+export default function StaffTabs({ staff, onSalaryUpdated }: StaffTabsProps) {
+  const [active, setActive] = React.useState<Category>('drivers')
 
-  const filtered = staff.filter(s => {
-    const r = (s.role || '').toLowerCase()
-    return r === roleMap[active]
-  })
+  /**
+   * matchesCategory
+   *
+   * Canonical category matching.
+   * - hired staff → job_category
+   * - founder logic handled separately
+   */
+  function matchesCategory(row: StaffMember, category: Category): boolean {
+    // --------------------------------------------------
+    // Founder handling (CEO / DRIVER)
+    // --------------------------------------------------
+    if (row.roles && Array.isArray(row.roles)) {
+      if (category === 'directors') {
+        return row.roles.some((r) => r.key === 'CEO')
+      }
+
+      if (category === 'drivers') {
+        return row.roles.some((r) => r.key === 'DRIVER')
+      }
+    }
+
+    // --------------------------------------------------
+    // Hired staff (THIS IS THE IMPORTANT FIX)
+    // --------------------------------------------------
+    if (!row.job_category) return false
+
+    return row.job_category === category
+  }
+
+  const filtered = staff.filter((s) => matchesCategory(s, active))
 
   return (
     <div className="mt-4">
+      {/* Tabs */}
       <div className="flex gap-2 overflow-auto">
-        {roles.map(r => (
-          <button
-            key={r}
-            onClick={() => setActive(r)}
-            className={`px-3 py-1 rounded-md text-sm font-medium ${
-              active === r ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-            }`}
-          >
-            {capitalize(r)} ({staff.filter(s => (s.role || '').toLowerCase() === roleMap[r]).length})
-          </button>
-        ))}
+        {CATEGORIES.map((cat) => {
+          const count = staff.filter((s) => matchesCategory(s, cat)).length
+
+          return (
+            <button
+              key={cat}
+              onClick={() => setActive(cat)}
+              className={`px-3 py-1 rounded-md text-sm font-medium ${
+                active === cat
+                  ? 'bg-slate-900 text-white'
+                  : 'bg-slate-100 text-slate-700'
+              }`}
+            >
+              {capitalize(cat)} ({count})
+            </button>
+          )
+        })}
       </div>
 
+      {/* Staff list */}
       <div className="mt-4 grid gap-3">
         {filtered.length === 0 ? (
-          <div className="p-6 bg-white rounded shadow-sm text-sm text-slate-500">No staff in this role yet.</div>
+          <div className="p-6 bg-white rounded shadow-sm text-sm text-slate-500">
+            No staff in this role yet.
+          </div>
         ) : (
-          filtered.map(s => (
-            <StaffRow
-              key={s.id}
-              id={s.id}
-              name={s.name}
-              role={s.role}
-              email={s.email}
-              phone={s.phone}
-              hired_at={s.hired_at}
+          filtered.map((member) => (
+            <HiredStaffCard
+              key={member.id}
+              member={member}
+              onSalaryUpdated={onSalaryUpdated}
+              currentCategory={active}
             />
           ))
         )}
       </div>
+
+      {/* Category effects (skills / positions / bonuses) */}
+      <StaffCategoryEffects category={active as StaffCategory} />
     </div>
   )
 }
 
-/**
- * capitalize
- *
- * Capitalizes the provided string.
- */
-function capitalize(s?: string) {
-  if (!s) return ''
+function capitalize(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1)
 }

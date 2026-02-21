@@ -1,10 +1,10 @@
 /**
  * StaffMarket.tsx
  *
- * Staff market page – lists available candidates and exposes filters.
+ * Staff Market page - lists available candidates and provides filters/pagination.
  *
- * - Integrates StaffFilters (category, country, availability, skills, salary).
- * - Applies skills filtering by doing an ilike on the description column.
+ * This file contains minimal layout safety tweaks (min-w-0 guards) to avoid
+ * horizontal overflow when the page is rendered full-width inside the app layout.
  */
 
 import React from 'react'
@@ -19,7 +19,7 @@ import { toast } from 'sonner'
 /**
  * StaffMember
  *
- * Representation of a staff row used in the UI.
+ * Represents a normalized staff candidate row used by the UI.
  */
 export interface StaffMember {
   id: string
@@ -34,22 +34,30 @@ export interface StaffMember {
   generated_at?: string | null
   availability?: string | null
   country_code?: string | null
-  country_display?: string | null
-  country_flag?: string | null
 }
 
-type RoleFilter = 'all' | 'driver' | 'mechanic' | 'dispatcher' | 'manager' | 'director'
+type RoleFilter =
+  | 'all'
+  | 'driver'
+  | 'mechanic'
+  | 'dispatcher'
+  | 'manager'
+  | 'director'
 
 /**
  * normalizeRow
  *
- * Normalizes a raw DB row to StaffMember shape.
+ * Convert a raw DB row into a StaffMember for consistent rendering.
  *
- * @param row raw row from unemployed_staff
+ * @param row raw database row
+ * @returns StaffMember
  */
 function normalizeRow(row: any): StaffMember {
   const id = row.id ?? String(Math.random())
-  const name = row.first_name || row.last_name ? `${row.first_name ?? ''} ${row.last_name ?? ''}`.trim() : null
+  const name =
+    row.first_name || row.last_name
+      ? `${row.first_name ?? ''} ${row.last_name ?? ''}`.trim()
+      : null
 
   return {
     id,
@@ -58,10 +66,14 @@ function normalizeRow(row: any): StaffMember {
     country: row.country_code ?? null,
     country_code: row.country_code ?? null,
     expected_salary: row.salary != null ? Number(row.salary) : null,
-    expected_salary_cents: row.salary != null ? Math.round(Number(row.salary) * 100) : null,
-    experience_years: row.experience != null ? Number(row.experience) : null,
+    expected_salary_cents:
+      row.salary != null ? Math.round(Number(row.salary) * 100) : null,
+    experience_years:
+      row.experience != null ? Number(row.experience) : null,
     bio: null,
-    skills: [row.skill1_id, row.skill2_id, row.skill3_id].filter(Boolean).map(String),
+    skills: [row.skill1_id, row.skill2_id, row.skill3_id]
+      .filter(Boolean)
+      .map(String),
     generated_at: row.generated_at ?? null,
     availability: row.availability ?? null,
   }
@@ -70,7 +82,11 @@ function normalizeRow(row: any): StaffMember {
 /**
  * StaffMarket
  *
- * Page component that fetches unemployed_staff and renders the list with filters.
+ * Page component that displays the staff marketplace.
+ *
+ * Minimal layout safety tweaks:
+ * - outer wrappers have min-w-0
+ * - section and grids include min-w-0 to prevent child overflow from breaking layout
  */
 export default function StaffMarket(): JSX.Element {
   const [rows, setRows] = React.useState<StaffMember[]>([])
@@ -80,18 +96,27 @@ export default function StaffMarket(): JSX.Element {
   const [page, setPage] = React.useState(1)
   const [pageCount, setPageCount] = React.useState(1)
 
-  const [roleFilter, setRoleFilter] = React.useState<RoleFilter>('all')
-  const [countryFilter, setCountryFilter] = React.useState('all')
-  const [availabilityFilter, setAvailabilityFilter] = React.useState<string>('all')
-  const [skillsFilter, setSkillsFilter] = React.useState<string>('all')
-  const [salaryMode, setSalaryMode] = React.useState<'any' | 'below' | 'above'>('any')
+  const [roleFilter, setRoleFilter] =
+    React.useState<RoleFilter>('all')
+  const [skillsFilter, setSkillsFilter] =
+    React.useState<string>('all')
+  const [salaryMode, setSalaryMode] =
+    React.useState<'any' | 'below' | 'above'>('any')
   const [salaryValue, setSalaryValue] = React.useState('')
+  const [countryFilter, setCountryFilter] =
+    React.useState<string>('all')
 
   const pageSize = 20
 
   React.useEffect(() => {
     setPage(1)
-  }, [roleFilter, countryFilter, availabilityFilter, skillsFilter, salaryMode, salaryValue])
+  }, [
+    roleFilter,
+    skillsFilter,
+    salaryMode,
+    salaryValue,
+    countryFilter,
+  ])
 
   React.useEffect(() => {
     let mounted = true
@@ -103,30 +128,42 @@ export default function StaffMarket(): JSX.Element {
         const from = (page - 1) * pageSize
         const to = from + pageSize - 1
 
-        /**
-         * Build base query for unemployed_staff:
-         * - Do NOT apply ordering (some columns may not exist / be hidden by RLS).
-         * - Do NOT ilike on `description` (column doesn't exist).
-         * - Skills filtering must be implemented later via skill1_id/skill2_id/skill3_id.
-         */
-        let query = supabase.from('unemployed_staff').select('*', { count: 'exact' }).range(from, to)
+        let query: any = supabase
+          .from('unemployed_staff')
+          .select('*', { count: 'exact' })
+          .order('generated_at', { ascending: false })
+          .range(from, to)
 
-        if (roleFilter !== 'all') query = query.eq('job_category', roleFilter)
-        if (countryFilter !== 'all') query = query.eq('country_code', countryFilter)
-        if (availabilityFilter !== 'all') query = query.eq('availability', availabilityFilter)
+        if (roleFilter !== 'all')
+          query = query.eq('job_category', roleFilter)
 
-        // NOTE: Removed ilike('description', ...) because `description` column does not exist.
-        // Future improvement: filter by skill1_id/skill2_id/skill3_id when schema confirmed.
+        if (skillsFilter !== 'all' && skillsFilter.trim()) {
+          const skill = skillsFilter.replace(/\\"/g, '')
+          const pattern = `%${skill}%`
+
+          query = query
+            .ilike('skill1_id', pattern)
+            .or(`skill2_id.ilike.${pattern}`)
+            .or(`skill3_id.ilike.${pattern}`)
+        }
 
         if (salaryMode !== 'any' && salaryValue) {
           const v = Number(salaryValue)
           if (!Number.isNaN(v)) {
-            if (salaryMode === 'below') query = query.lte('salary', v)
-            if (salaryMode === 'above') query = query.gte('salary', v)
+            if (salaryMode === 'below')
+              query = query.lte('salary', v)
+            if (salaryMode === 'above')
+              query = query.gte('salary', v)
           }
         }
 
-        const { data, count, error: sbError } = await query
+        if (countryFilter && countryFilter !== 'all') {
+          query = query.eq('country_code', countryFilter)
+        }
+
+        const { data, count, error: sbError } =
+          await query
+
         if (!mounted) return
 
         if (sbError) {
@@ -138,7 +175,9 @@ export default function StaffMarket(): JSX.Element {
 
         const items = Array.isArray(data) ? data : []
         setRows(items.map(normalizeRow))
-        setPageCount(Math.max(1, Math.ceil((count ?? 0) / pageSize)))
+        setPageCount(
+          Math.max(1, Math.ceil((count ?? 0) / pageSize))
+        )
       } catch (e: any) {
         if (!mounted) return
         setError(e?.message || 'Failed to load staff')
@@ -153,10 +192,25 @@ export default function StaffMarket(): JSX.Element {
     return () => {
       mounted = false
     }
-  }, [page, roleFilter, countryFilter, availabilityFilter, skillsFilter, salaryMode, salaryValue])
+  }, [
+    page,
+    roleFilter,
+    skillsFilter,
+    salaryMode,
+    salaryValue,
+    countryFilter,
+  ])
 
   const stats: StaffCounts = React.useMemo(() => {
-    const c: StaffCounts = { total: rows.length, drivers: 0, mechanics: 0, dispatchers: 0, managers: 0, directors: 0 }
+    const c: StaffCounts = {
+      total: rows.length,
+      drivers: 0,
+      mechanics: 0,
+      dispatchers: 0,
+      managers: 0,
+      directors: 0,
+    }
+
     rows.forEach((r) => {
       const role = (r.role || '').toLowerCase()
       if (role.includes('driver')) c.drivers++
@@ -165,68 +219,103 @@ export default function StaffMarket(): JSX.Element {
       else if (role.includes('manager')) c.managers++
       else if (role.includes('director')) c.directors++
     })
-    return c
-  }, [rows])
 
-  const countries = React.useMemo(() => {
-    const s = new Set<string>()
-    rows.forEach((r) => r.country && s.add(r.country))
-    return Array.from(s).sort()
+    return c
   }, [rows])
 
   return (
     <Layout fullWidth>
-      <div className="space-y-6">
-        <header>
-          <h1 className="text-2xl font-bold">Staff Market</h1>
-          <p className="text-sm text-slate-500">
-            Browse available candidates and hire drivers, mechanics, dispatchers, managers and directors.
-          </p>
+      <div className="space-y-6 min-w-0">
+        <header className="min-w-0">
+          <h1 className="text-2xl font-bold">
+            Staff Market
+          </h1>
+
+          <div className="flex items-start justify-between min-w-0">
+            <p className="text-sm text-slate-500">
+              Browse available candidates and hire drivers,
+              mechanics, dispatchers, managers and directors.
+            </p>
+
+            <a
+              href="#/staff"
+              className="text-sm text-sky-600 hover:underline"
+            >
+              Back to Staff
+            </a>
+          </div>
 
           <div className="mt-4 mb-6">
-            <StaffStats counts={stats} />
+            <StaffStats
+              counts={stats}
+              source="unemployed"
+            />
           </div>
 
           <StaffFilters
             roleFilter={roleFilter}
-            onRoleFilterChange={(v) => setRoleFilter(v as RoleFilter)}
-            countryFilter={countryFilter}
-            countries={countries}
-            onCountryFilterChange={setCountryFilter}
-            availabilityFilter={availabilityFilter}
-            onAvailabilityFilterChange={setAvailabilityFilter}
+            onRoleFilterChange={(v) =>
+              setRoleFilter(v as RoleFilter)
+            }
             skillsFilter={skillsFilter}
             onSkillsFilterChange={setSkillsFilter}
             salaryMode={salaryMode}
             onSalaryModeChange={setSalaryMode}
             salaryValue={salaryValue}
             onSalaryValueChange={setSalaryValue}
+            countryFilter={countryFilter}
+            onCountryFilterChange={setCountryFilter}
           />
         </header>
 
-        <section className="bg-white p-6 rounded-lg shadow-sm w-full">
-          {loading && <div className="text-sm text-slate-500">Loading candidates…</div>}
-          {error && <div className="text-sm text-rose-600">{error}</div>}
-          {!loading && !error && rows.length === 0 && <div className="text-sm text-slate-500">No candidates available.</div>}
+        <section className="bg-white p-6 rounded-lg shadow-sm w-full min-w-0 overflow-x-hidden">
+          {loading && (
+            <div className="text-sm text-slate-500">
+              Loading candidates…
+            </div>
+          )}
+
+          {error && (
+            <div className="text-sm text-rose-600">
+              {error}
+            </div>
+          )}
+
+          {!loading &&
+            !error &&
+            rows.length === 0 && (
+              <div className="text-sm text-slate-500">
+                No candidates available.
+              </div>
+            )}
 
           {rows.length > 0 && (
             <>
-              <div className="grid gap-3">
+              <div className="grid gap-3 min-w-0">
                 {rows.map((c) => (
                   <StaffCard
                     key={c.id}
                     candidate={c}
                     onHire={(candidateId) => {
-                      // UI-first: treat click as intent. Parent removes the candidate immediately.
-                      setRows((prev) => prev.filter((r) => r.id !== candidateId))
-                      toast.success('Hiring started…')
+                      setRows((prev) =>
+                        prev.filter(
+                          (r) => r.id !== candidateId
+                        )
+                      )
+                      toast.success(
+                        'Candidate moved to hired staff'
+                      )
                     }}
                   />
                 ))}
               </div>
 
               <div className="mt-4">
-                <StaffPagination currentPage={page} pageCount={pageCount} onPageChange={setPage} />
+                <StaffPagination
+                  currentPage={page}
+                  pageCount={pageCount}
+                  onPageChange={setPage}
+                />
               </div>
             </>
           )}

@@ -7,7 +7,7 @@
  * the exact columns required by TruckCard (mileage_km, fuel_level_l, class, max_payload, tonnage, country).
  */
 
-import { supabaseFetch, getTable } from '../lib/supabase'
+import { supabaseFetch, getTable, supabase } from '../lib/supabase'
 
 /**
  * TruckModelInfo
@@ -167,18 +167,17 @@ export async function updateTruck(truckId: string, patch: Record<string, any>) {
  * fetchTrucksForAuthUser
  *
  * Fetch user_trucks rows for the supplied auth user id (resolve public.users row first),
- * include nested truck_models columns (make, model, country, class, max_payload, tonnage)
- * and return a compact TruckCardRow[] suitable for feeding TruckCard components.
+ * include nested truck_models columns and join the cities table to obtain city name.
  *
  * Behavior:
- *  - Resolve public.users row for auth_user_id to obtain public.users.id and company_id
- *  - Fetch user_trucks where owner_user_id == public.users.id
- *  - Additionally fetch rows where owner_company_id == public.users.company_id (if present)
- *  - Avoid duplicates and map nested truck_models -> model
+ *  - Resolve public.users row for auth_user_id to obtain public.users.company_id
+ *  - Fetch user_trucks where owner_company_id == company_id
+ *  - Only return trucks that are status='available' and is_active=true
  *
  * IMPORTANT:
- *  - For active trucks shown on the Trucks page we prefer the year coming from user_trucks.model_year
- *    (a denormalized/override value) when available. Only fall back to truck_models.year when absent.
+ *  - Replaces usage of a non-existent column location_city_name with a proper join:
+ *    cities:location_city_id(name)
+ *  - Maps joined cities.name into location_city_name for UI compatibility.
  *
  * @param authUserId - Supabase GoTrue auth user id (auth.uid())
  * @returns TruckCardRow[] (empty array on error)
@@ -191,41 +190,23 @@ export async function fetchTrucksForAuthUser(authUserId: string): Promise<TruckC
       `/rest/v1/users?select=id,company_id&auth_user_id=eq.${encodeURIComponent(authUserId)}&limit=1`
     )
     const publicUser = Array.isArray(userRes?.data) ? userRes.data[0] : null
-    const ownerUserId = publicUser?.id ?? null
     const ownerCompanyId = publicUser?.company_id ?? null
 
+    // If no company id, return empty - we want company trucks for staging view
+    if (!ownerCompanyId) return []
+
     const selectFragment =
-      'select=id,master_truck_id,owner_user_id,owner_company_id,name,registration,purchase_date,created_at,mileage_km,model_year,fuel_level_l,condition_score,status,location_city_id,location_city_name,truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)'
+      'select=id,master_truck_id,owner_user_id,owner_company_id,name,registration,purchase_date,created_at,mileage_km,model_year,fuel_level_l,condition_score,status,location_city_id,cities:location_city_id(name),truck_models:truck_models!user_trucks_master_truck_id_fkey(id,make,model,country,class,year,max_load_kg,tonnage,load_type,fuel_tank_capacity_l,fuel_type,image_url)'
 
-    const results: any[] = []
-
-    async function fetchForFilter(filterKey: 'owner_user_id' | 'owner_company_id', idValue: string) {
-      const q = `${selectFragment}&${filterKey}=eq.${encodeURIComponent(idValue)}&order=created_at.desc`
-      const path = `/rest/v1/user_trucks?${q}`
-      try {
-        const r = await supabaseFetch(path)
-        if (r && Array.isArray(r.data)) return r.data as any[]
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.debug('fetchTrucksForAuthUser.fetchForFilter error', filterKey, err)
-      }
-      return []
-    }
-
-    if (ownerUserId) {
-      const byUser = await fetchForFilter('owner_user_id', ownerUserId)
-      results.push(...byUser)
-    }
-
-    // NOTE:
-    // We intentionally do NOT fetch company-only trucks (owner_company_id = company_id, owner_user_id is null)
-    // here, because the RLS policies do not allow the current user to update those rows.
-    // The UI would show non-editable "ghost" trucks. Instead, we rely on creating a starter
-    // user_trucks row that is explicitly owned by this user (owner_user_id), see
-    // createCompanyWithBootstrap in db.ts.
+    const q = `${selectFragment}&owner_company_id=eq.${encodeURIComponent(ownerCompanyId)}&status=eq.available&order=created_at.desc`
+    const path = `/rest/v1/user_trucks?${q}`
+    const res = await supabaseFetch(path)
+    const results = Array.isArray(res?.data) ? res.data : []
+    // TEMP FIX: some REST exposures do not include `is_active` column. Filter client-side to preserve behavior.
+    const filteredResults = results.filter((r: any) => r.is_active !== false)
 
     // Map into TruckCardRow shape. Prefer user_trucks.model_year when present for active trucks.
-    const mapped: TruckCardRow[] = results.map((r: any) => {
+    const mapped: TruckCardRow[] = filteredResults.map((r: any) => {
       const model = r.truck_models ?? null
       const resolvedYear =
         r.model_year !== undefined && r.model_year !== null
@@ -243,7 +224,8 @@ export async function fetchTrucksForAuthUser(authUserId: string): Promise<TruckC
         condition_score: typeof r.condition_score === 'number' ? r.condition_score : r.condition_score ? Number(r.condition_score) : null,
         status: r.status ?? null,
         location_city_id: r.location_city_id ?? null,
-        location_city_name: r.location_city_name ?? null,
+        // UI compatibility: map joined city object -> location_city_name
+        location_city_name: r?.cities?.city_name ?? null,
         model: model
           ? {
               id: model.id,

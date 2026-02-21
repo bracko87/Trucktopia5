@@ -70,7 +70,15 @@ function toIso(v: any): string | null {
  */
 function pickTimestamp(row: GameTimeRow | null): string | null {
   if (!row) return null
-  const candidates = ['game_time', 'current_time', 'now', 'time', 'created_at', 'timestamp']
+  const candidates = [
+    'game_timestamp', // ← ensure DB column name is recognized
+    'game_time',
+    'current_time',
+    'now',
+    'time',
+    'created_at',
+    'timestamp'
+  ]
   for (const k of candidates) {
     const iso = toIso(row[k])
     if (iso) return iso

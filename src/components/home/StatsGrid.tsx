@@ -40,7 +40,8 @@ interface StatsGridProps {
  */
 function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
   return (
-    <div className="bg-white rounded-lg p-4 shadow flex items-center gap-4">
+    // Ensure the stat card sits above any page background images by using relative positioning and a high z-index.
+    <div className="relative z-40 bg-white rounded-lg p-4 shadow flex items-center gap-4">
       <div className="w-12 h-12 rounded-md bg-yellow-400 text-black flex items-center justify-center">
         {icon}
       </div>

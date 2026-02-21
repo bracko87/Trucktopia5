@@ -1,87 +1,129 @@
 /**
  * Login.tsx
  *
- * Simple login page that authenticates via Supabase and redirects to dashboard.
+ * Sign-in page for Tracktopia.
+ *
+ * FIX:
+ * - Actually authenticate with Supabase using signInWithPassword
+ * - Show error if credentials are wrong
+ * - Navigate to /dashboard only after successful login
  */
 
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router'
-import { useAuth } from '../context/AuthContext'
+import BackgroundImageLayer from '../components/BackgroundImageLayer'
+import { supabase } from '../lib/supabase'
 
-/**
- * LoginPage
- *
- * Presents login form and handles sign in.
- */
-export default function LoginPage() {
+export default function LoginPage(): JSX.Element {
   const nav = useNavigate()
-  const { signIn } = useAuth()
-  const [form, setForm] = useState({ email: '', password: '' })
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
 
-  /**
-   * handleSubmit
-   *
-   * Authenticate user and navigate to dashboard on success.
-   */
-  async function handleSubmit(e: React.FormEvent) {
+  const [email, setEmail] = useState('bracko87@live.com')
+  const [password, setPassword] = useState('Esta2020')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string>('')
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
     setError('')
     setLoading(true)
-    const res = await signIn(form.email, form.password)
-    setLoading(false)
-    if (res && res.status === 200) {
-      nav('/dashboard')
-    } else {
-      setError('Invalid credentials.')
+
+    try {
+      const { data, error: signInErr } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      })
+
+      if (signInErr) {
+        setError(signInErr.message || 'Login failed.')
+        return
+      }
+
+      if (!data.session) {
+        setError('No session returned. Please try again.')
+        return
+      }
+
+      nav('/dashboard', { replace: true })
+    } catch (err) {
+      console.error('login error:', err)
+      setError('Login failed. Please try again.')
+    } finally {
+      setLoading(false)
     }
   }
 
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-yellow-400">
-      <div className="w-full max-w-md bg-white rounded shadow p-6">
-        <h2 className="text-2xl font-bold mb-4">Sign in to Tracktopia</h2>
-        {error && <div className="mb-3 text-red-600">{error}</div>}
-        <form onSubmit={handleSubmit} className="space-y-3">
-          <div>
-            <label className="block text-sm font-medium">Email</label>
-            <input
-              type="email"
-              value={form.email}
-              onChange={(e) => setForm({ ...form, email: e.target.value })}
-              className="w-full border px-3 py-2 rounded"
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium">Password</label>
-            <input
-              type="password"
-              value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
-              className="w-full border px-3 py-2 rounded"
-              required
-            />
-          </div>
+  const bgSrc = 'https://i.ibb.co/bMkDQr71/Chat-GPT-Image-Feb-17-2026-01-26-22-PM.png'
 
-          <div className="flex justify-between items-center">
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-4 py-2 bg-black text-yellow-400 rounded font-semibold"
-            >
-              {loading ? 'Signing in...' : 'Sign in'}
-            </button>
-            <button
-              type="button"
-              onClick={() => nav('/')}
-              className="text-sm text-black/70 underline"
-            >
-              Back
-            </button>
-          </div>
-        </form>
+  return (
+    <div className="relative min-h-screen">
+      <div className="absolute inset-0 bg-white-400" />
+
+      <BackgroundImageLayer
+        src={bgSrc}
+        opacity={0.1}
+        alt="Decorative background"
+        className="z-10"
+      />
+
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 pointer-events-none z-20"
+        style={{
+          background:
+            'linear-gradient(to bottom, rgba(255,255,255,0) 20%, rgba(255,255,255,1) 95%)',
+        }}
+      />
+
+      <div className="relative z-30 min-h-screen flex items-center justify-center">
+        <div className="w-full max-w-md bg-white rounded shadow p-6">
+          <h2 className="text-2xl font-bold mb-4">Sign in to Tracktopia</h2>
+
+          {error && <div className="mb-3 text-red-600 text-sm">{error}</div>}
+
+          <form className="space-y-3" onSubmit={handleSubmit}>
+            <div>
+              <label className="block text-sm font-medium mb-1">Email</label>
+              <input
+                name="email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                className="w-full border px-3 py-2 rounded"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Password</label>
+              <input
+                name="password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                className="w-full border px-3 py-2 rounded"
+              />
+            </div>
+
+            <div className="flex justify-between items-center">
+              <button
+                type="submit"
+                disabled={loading}
+                className="px-4 py-2 bg-black text-yellow-400 rounded font-semibold disabled:opacity-60"
+              >
+                {loading ? 'Signing in…' : 'Sign in'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => nav('/')}
+                className="text-sm text-black/70 underline"
+              >
+                Back to Home Page
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   )

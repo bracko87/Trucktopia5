@@ -1,28 +1,8 @@
-/**
- * InsuranceManager.tsx
- *
- * Small reusable UI component that connects an existing button to the insurance
- * backend. Allows using a custom button appearance or the default button that
- * matches the markup you've shown. Opens InsuranceModal and delegates purchase.
- */
-
-/**
- * File-level: Connect existing button UI to compute/purchase insurance API.
- */
-
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Shield } from 'lucide-react'
 import InsuranceModal from './InsuranceModal'
-import { purchaseInsurance } from '../../lib/insurance'
+import { purchaseInsurance, listInsurancesForTruck } from '../../lib/insurance'
 
-/**
- * Props for InsuranceManager
- *
- * - userTruckId: user_trucks.id for the truck to insure
- * - className: optional className to apply to the trigger button (defaults to white button style)
- * - children: optional content to render inside the button; when omitted default text + icon is used
- * - style: optional inline style for the button
- */
 export interface InsuranceManagerProps {
   userTruckId: string
   className?: string
@@ -30,19 +10,6 @@ export interface InsuranceManagerProps {
   style?: React.CSSProperties
 }
 
-/**
- * InsuranceManager
- *
- * Renders a button that opens the InsuranceModal for the provided truck.
- * The rendered button defaults to:
- * <button type="button" class="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2" style="pointer-events: auto;">Insurance</button>
- *
- * If you already have a button in markup, replace it with:
- * <InsuranceManager userTruckId={id} className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2" />
- *
- * @param props - InsuranceManagerProps
- * @returns JSX.Element
- */
 export default function InsuranceManager({
   userTruckId,
   className,
@@ -51,26 +18,59 @@ export default function InsuranceManager({
 }: InsuranceManagerProps): JSX.Element {
   const [open, setOpen] = useState(false)
   const [pending, setPending] = useState(false)
+  const [disabled, setDisabled] = useState(false)
 
-  /**
-   * handlePurchase
-   *
-   * Called from modal when user confirms purchase. Uses the shared purchaseInsurance helper.
-   *
-   * @param planCode - plan code (basic | plus | premium)
-   * @param months - duration months
-   */
+  useEffect(() => {
+    async function checkInsurance() {
+      try {
+        const rows = await listInsurancesForTruck(userTruckId)
+
+        console.log('Insurance rows:', rows)
+
+        if (!rows?.length) {
+          setDisabled(false)
+          return
+        }
+
+        const active = rows.find((r: any) => r.is_active)
+
+        console.log('Active insurance:', active)
+
+        if (!active?.end_date) {
+          setDisabled(false)
+          return
+        }
+
+        const end = new Date(active.end_date)
+        const now = new Date()
+
+        const daysLeft =
+          (end.getTime() - now.getTime()) /
+          (1000 * 60 * 60 * 24)
+
+        console.log('Days left:', daysLeft)
+
+        const shouldDisable = daysLeft > 60
+        console.log('Button disabled:', shouldDisable)
+
+        setDisabled(shouldDisable)
+      } catch (e) {
+        console.error('Insurance check failed', e)
+        setDisabled(false)
+      }
+    }
+
+    checkInsurance()
+  }, [userTruckId])
+
   async function handlePurchase(planCode: string, months: number) {
     setPending(true)
     try {
       await purchaseInsurance(userTruckId, planCode, months)
-      // eslint-disable-next-line no-alert
       alert('Insurance purchased successfully.')
       setOpen(false)
     } catch (err: any) {
-      // eslint-disable-next-line no-console
       console.error('purchaseInsurance failed', err)
-      // eslint-disable-next-line no-alert
       alert('Purchase failed.')
     } finally {
       setPending(false)
@@ -79,16 +79,29 @@ export default function InsuranceManager({
 
   const defaultClass =
     'px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded flex items-center gap-2'
-  const btnClass = className || defaultClass
+
+  const btnClass =
+    (className || defaultClass) +
+    (disabled
+      ? ' opacity-40 cursor-not-allowed hover:bg-white'
+      : '')
 
   return (
     <>
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          if (!disabled) setOpen(true)
+        }}
+        disabled={disabled}
         className={btnClass}
-        style={{ pointerEvents: 'auto', ...(style || {}) }}
+        style={{ ...(style || {}) }}
         aria-label="Open insurance modal"
+        title={
+          disabled
+            ? 'New insurance available 60 days before expiry'
+            : 'Open insurance modal'
+        }
       >
         {children ? (
           children
@@ -100,7 +113,12 @@ export default function InsuranceManager({
         )}
       </button>
 
-      <InsuranceModal truckId={userTruckId} open={open} onClose={() => setOpen(false)} onPurchase={handlePurchase} />
+      <InsuranceModal
+        truckId={userTruckId}
+        open={open}
+        onClose={() => setOpen(false)}
+        onPurchase={handlePurchase}
+      />
     </>
   )
 }

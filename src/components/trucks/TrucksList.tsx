@@ -15,20 +15,10 @@ import TruckCard from './TruckCard'
 import MarketTruckCard from './MarketTruckCard'
 import { getTruckModelsBatch } from '../../lib/db/modules/truckModels'
 
-/**
- * TrucksListProps
- *
- * Props for the TrucksList component.
- */
 interface TrucksListProps {
   trucks: any[]
 }
 
-/**
- * ModelLookup
- *
- * Map of model id -> make/model and extended model values.
- */
 interface ModelLookup {
   [id: string]:
     | {
@@ -49,46 +39,63 @@ interface ModelLookup {
     | undefined
 }
 
-/**
- * TrucksList
- *
- * Render the list of trucks as a single-column vertical list. Prefer server-provided
- * embedded truck_models (returned by select=*,truck_models(*)) and only fetch missing
- * models in batch when necessary.
- *
- * @param props - TrucksListProps
- */
 export default function TrucksList({ trucks }: TrucksListProps) {
   const [modelLookup, setModelLookup] = useState<ModelLookup>({})
 
   useEffect(() => {
     let mounted = true
 
-    // Try to build lookup from embedded truck_models when available.
     const embeddedLookup: ModelLookup = {}
     const missingModelIds = new Set<string>()
-
     const allModelIds = new Set<string>()
 
     trucks.forEach((t) => {
       const rawModelId = (t.master_truck_id as unknown as string) ?? ''
       allModelIds.add(rawModelId)
-      // Supabase returns related rows as an array, e.g. truck_models: [{...}] when joined.
-      const embedded = Array.isArray(t.truck_models) && t.truck_models.length > 0 ? t.truck_models[0] : null
+
+      const embedded =
+        Array.isArray(t.truck_models) && t.truck_models.length > 0
+          ? t.truck_models[0]
+          : null
+
       if (embedded && rawModelId) {
-        // Map extended fields from embedded data so UI has access to class/year/payload/etc.
         embeddedLookup[rawModelId] = {
           make: embedded.make ?? null,
           model: embedded.model ?? null,
           country: embedded.country ?? null,
           class: embedded.class ?? null,
-          max_payload: typeof embedded.max_payload === 'number' ? embedded.max_payload : embedded.max_payload ? Number(embedded.max_payload) : null,
-          tonnage: typeof embedded.tonnage === 'number' ? embedded.tonnage : embedded.tonnage ? Number(embedded.tonnage) : null,
-          year: typeof embedded.year === 'number' ? embedded.year : embedded.year ? Number(embedded.year) : null,
+          max_payload:
+            typeof embedded.max_payload === 'number'
+              ? embedded.max_payload
+              : embedded.max_payload
+              ? Number(embedded.max_payload)
+              : null,
+          tonnage:
+            typeof embedded.tonnage === 'number'
+              ? embedded.tonnage
+              : embedded.tonnage
+              ? Number(embedded.tonnage)
+              : null,
+          year:
+            typeof embedded.year === 'number'
+              ? embedded.year
+              : embedded.year
+              ? Number(embedded.year)
+              : null,
           cargo_type_id: embedded.cargo_type_id ?? null,
           cargo_type_name: embedded.cargo_type_name ?? null,
-          max_load_kg: typeof embedded.max_load_kg === 'number' ? embedded.max_load_kg : embedded.max_load_kg ? Number(embedded.max_load_kg) : null,
-          fuel_tank_capacity_l: typeof embedded.fuel_tank_capacity_l === 'number' ? embedded.fuel_tank_capacity_l : embedded.fuel_tank_capacity_l ? Number(embedded.fuel_tank_capacity_l) : null,
+          max_load_kg:
+            typeof embedded.max_load_kg === 'number'
+              ? embedded.max_load_kg
+              : embedded.max_load_kg
+              ? Number(embedded.max_load_kg)
+              : null,
+          fuel_tank_capacity_l:
+            typeof embedded.fuel_tank_capacity_l === 'number'
+              ? embedded.fuel_tank_capacity_l
+              : embedded.fuel_tank_capacity_l
+              ? Number(embedded.fuel_tank_capacity_l)
+              : null,
           fuel_type: embedded.fuel_type ?? null,
           image_url: embedded.image_url ?? null,
         }
@@ -97,17 +104,16 @@ export default function TrucksList({ trucks }: TrucksListProps) {
       }
     })
 
-    // If we have embedded data for all visible model ids, fetch the enriched payload
-    // to ensure cargo_type_name is present (we still call the batch helper once).
     const idsToFetch =
-      missingModelIds.size === 0 ? Array.from(allModelIds).filter(Boolean) : Array.from(missingModelIds)
+      missingModelIds.size === 0
+        ? Array.from(allModelIds).filter(Boolean)
+        : Array.from(missingModelIds)
 
     if (idsToFetch.length === 0) {
       if (mounted) setModelLookup(embeddedLookup)
       return
     }
 
-    // Start with embedded partial data and fetch models in batch for enrichment.
     setModelLookup(embeddedLookup)
 
     getTruckModelsBatch(idsToFetch)
@@ -116,7 +122,6 @@ export default function TrucksList({ trucks }: TrucksListProps) {
         setModelLookup((prev) => ({ ...prev, ...map }))
       })
       .catch((err) => {
-        // eslint-disable-next-line no-console
         console.debug('TrucksList: getTruckModelsBatch error', err)
       })
 
@@ -126,25 +131,38 @@ export default function TrucksList({ trucks }: TrucksListProps) {
   }, [trucks])
 
   if (!trucks || trucks.length === 0) {
-    return <div className="text-sm text-slate-500">No trucks found for your account.</div>
+    return (
+      <div className="text-sm text-slate-500">
+        No trucks found for your account.
+      </div>
+    )
   }
 
   return (
-    // Adjust -mx-6 if the parent section uses different horizontal padding.
-    <div className="-mx-6 px-6 flex flex-col gap-4 w-full">
+    // FIX: removed -mx-6 px-6 so cards can use full width
+    <div className="flex flex-col gap-4 w-full">
       {trucks.map((t) => {
-        const rawModelId = (t.master_truck_id as unknown as string) ?? ''
-        const modelInfo = rawModelId ? modelLookup[rawModelId] : undefined
+        const rawModelId =
+          (t.master_truck_id as unknown as string) ?? ''
+        const modelInfo = rawModelId
+          ? modelLookup[rawModelId]
+          : undefined
 
-        // Detect market items which are mapped with id prefix "model-..."
         const isMarket = String(t.id ?? '').startsWith('model-')
 
         return (
           <div key={t.id ?? JSON.stringify(t)} className="w-full">
             {isMarket ? (
-              <MarketTruckCard marketItem={t} modelId={rawModelId} />
+              <MarketTruckCard
+                marketItem={t}
+                modelId={rawModelId}
+              />
             ) : (
-              <TruckCard truck={t} modelInfo={modelInfo} isMarket={isMarket} />
+              <TruckCard
+                truck={t}
+                modelInfo={modelInfo}
+                isMarket={isMarket}
+              />
             )}
           </div>
         )

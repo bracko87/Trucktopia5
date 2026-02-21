@@ -1,30 +1,31 @@
 /**
  * Finances.tsx
  *
- * Page displaying company finances: balance, transactions, income/expense graphs.
+ * Page wrapper for the Finances area. Mounts the tabbed finances UI.
  */
 
 import React from 'react'
 import Layout from '../components/Layout'
+import FinancesTabs from '../components/finances/FinancesTabs'
 
 /**
  * FinancesPage
  *
- * Placeholder for financial dashboard. Graphs and transaction tables will be
- * implemented later and wired to the financial APIs.
+ * Main page component for company finances.
+ * Matches layout spacing used across the app (e.g. Trailers page).
  */
-export default function FinancesPage() {
+export default function FinancesPage(): JSX.Element {
   return (
     <Layout fullWidth>
       <div className="space-y-4">
         <header>
           <h1 className="text-2xl font-bold">Finances</h1>
-          <p className="text-sm text-black/70">Balance, transactions and reports</p>
+          <p className="text-sm text-black/70">
+            Balance, transactions and financial reports
+          </p>
         </header>
 
-        <section className="bg-white p-6 rounded shadow">
-          <div className="text-sm text-black/70">Financial overview will be displayed here.</div>
-        </section>
+        <FinancesTabs />
       </div>
     </Layout>
   )

@@ -11,6 +11,7 @@
  */
 
 import React, { useEffect, useState } from 'react'
+import { useCompany } from '../../context/CompanyContext'
 import { Gauge, Menu, Truck, Columns } from 'lucide-react'
 import StatChip from './StatChip'
 import { getTable } from '../../lib/supabase'
@@ -21,6 +22,7 @@ import SellTruckModal from './SellTruckModal'
 import InsuranceModal from './InsuranceModal'
 import MaintenanceModal from './MaintenanceModal'
 import TruckCompareModal from './TruckCompareModal'
+import LeaseConfirmModal from '../leases/LeaseConfirmModal' // added lease modal import
 
 /**
  * ModelInfo
@@ -160,8 +162,6 @@ function PricePill({ label, value, color }: { label: string; value?: number | st
  * Lease Rate and List Price are shown in the header with different colors.
  * A cargo type icon (when available) is shown next to the model title, falling
  * back to a truck icon when no icon_url is available.
- *
- * NOTE: Icon placement has been adjusted to appear after the truck name as requested.
  */
 export default function TruckModelCard({ truck, modelInfo, defaultRegistration, isMarket = false }: TruckModelCardProps) {
   const id = truck?.id ?? ''
@@ -182,6 +182,10 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
   const [showInsurance, setShowInsurance] = useState<boolean>(false)
   const [maintenanceModalOpen, setMaintenanceModalOpen] = useState(false)
   const [showCompare, setShowCompare] = useState<boolean>(false)
+
+  // New: lease modal visibility state
+  const [showLeaseModal, setShowLeaseModal] = useState<boolean>(false)
+  const { company } = useCompany()
 
   /**
    * Resolve model information.
@@ -279,6 +283,28 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
     // Condition comes from the list item (truck) when available
     row.condition_score = conditionScore
 
+    // Map numeric gcw/cgw to labels A/B/C (truck_models stores numeric codes).
+    // Mapping per request: 1 -> A, 2 -> B, 3 -> C
+    if (row.gcw !== undefined && row.gcw !== null) {
+      const num = Number(row.gcw)
+      const map: Record<number, string> = { 1: 'A', 2: 'B', 3: 'C' }
+      if (!Number.isNaN(num) && map[num]) {
+        row.gcw = map[num]
+      } else {
+        // fall back to any cgw-like field if present
+        const alt = (resolvedModel as any)?.cgw ?? null
+        if (alt != null && !Number.isNaN(Number(alt)) && map[Number(alt)]) {
+          row.gcw = map[Number(alt)]
+        }
+      }
+    } else if ((resolvedModel as any)?.cgw !== undefined && (resolvedModel as any)?.cgw !== null) {
+      const num = Number((resolvedModel as any).cgw)
+      const map: Record<number, string> = { 1: 'A', 2: 'B', 3: 'C' }
+      if (!Number.isNaN(num) && map[num]) {
+        row.gcw = map[num]
+      }
+    }
+
     // Lease rate and price fallbacks
     row.lease_rate = row.lease_rate ?? (truck?.lease_rate ?? null)
     row.list_price = row.list_price ?? row.price ?? (truck?.list_price ?? truck?.price ?? null)
@@ -358,7 +384,12 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
   const showLifecycleActions = !componentsDisabled
 
   return (
-    <div className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200`} role="article" aria-label={`Truck model card ${primaryTitle}`}>
+    <div
+      className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200`}
+      data-asset-model-id={rawModelId ?? resolvedModel?.id ?? truck?.id ?? undefined}
+      role="article"
+      aria-label={`Truck model card ${primaryTitle}`}
+    >
       <div className="flex items-center gap-4 p-3 w-full">
         <div className="h-12 w-1 rounded-full bg-gradient-to-b from-sky-400 to-emerald-400" />
 
@@ -369,9 +400,7 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
               <span className="truncate">{primaryTitle}</span>
               {/* Secondary cargo type badge displayed inline when available */}
               {cargoNameSecondary ? (
-                <span className="inline-block text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded">
-                  {cargoNameSecondary}
-                </span>
+                <span className="inline-block text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded">{cargoNameSecondary}</span>
               ) : null}
             </div>
           </div>
@@ -476,13 +505,10 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
               Specifications
             </button>
 
+            {/* Updated Lease button: opens the LeaseConfirmModal */}
             <button
               type="button"
-              onClick={() => {
-                // Placeholder: implement lease flow/modal
-                // eslint-disable-next-line no-console
-                console.debug('Lease Truck clicked', id)
-              }}
+              onClick={() => setShowLeaseModal(true)}
               className="px-3 py-1 text-sm bg-emerald-600 hover:bg-emerald-700 border border-emerald-600 rounded text-white"
               aria-label="Lease Truck"
             >
@@ -532,6 +558,18 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
       <InsuranceModal truckId={id} condition={(truck?.condition_score as number) ?? 0} open={showInsurance} onClose={() => setShowInsurance(false)} />
       <SellTruckModal truckId={id} condition={(truck?.condition_score as number) ?? 0} open={showSell} onClose={() => setShowSell(false)} />
       <MaintenanceModal truckId={id} open={maintenanceModalOpen} onClose={() => setMaintenanceModalOpen(false)} onDone={() => {}} />
+
+      {/* Lease modal mounted here so Lease Truck opens it */}
+      <LeaseConfirmModal
+        open={showLeaseModal}
+        onClose={() => setShowLeaseModal(false)}
+        assetModelId={resolvedModel?.id ?? rawModelId}
+        companyId={company?.id ?? null}
+        onSuccess={() => {
+          setShowLeaseModal(false)
+          // optional: emit event or trigger refresh if needed
+        }}
+      />
 
       {/* Compare modal (opened by Compare Trucks button) */}
       <TruckCompareModal id={`truck-compare-${id}`} open={showCompare} onClose={() => setShowCompare(false)} currentModel={resolvedModel} currentTruck={truck} />

@@ -5,13 +5,10 @@
  * expandable details panel. Allows editing name, registration and hub assignment
  * for owned trucks. When isMarket=true the card is read-only.
  *
- * Enhanced with maintenance UI:
- * - Shows Last maintenance (date-only) and Next maintenance (remaining km)
- * - Adds "Maintenance" button that opens MaintenanceModal
- * - Visual warning & suspension states based on remaining km:
- *    - Normal: remaining > 0
- *    - Warning: 0 >= remaining > -3000
- *    - Suspended: remaining <= -3000 -> card overlay + only maintenance actionable
+ * Enhanced with maintenance UI and safe location handling:
+ * - Tracks currentCity separately from hubCity so real truck location (location_city_id)
+ *   is displayed when available.
+ * - Hub remains a fallback and is not allowed to overwrite the real location.
  */
 
 import React, { useEffect, useState } from 'react'
@@ -27,6 +24,7 @@ import InsuranceModal from './InsuranceModal'
 import RegistrationInput from '../common/RegistrationInput'
 import TruckInsurance from './TruckInsurance'
 import MaintenanceModal from './MaintenanceModal'
+import TruckImageField from './TruckImageField'
 import { computeMaintenanceCost } from '../../services/maintenanceService'
 
 /**
@@ -161,6 +159,10 @@ export default function TruckCard({
   const [cargoIconUrl, setCargoIconUrl] = useState<string | null>(null)
   const [cargoIconUrlSecondary, setCargoIconUrlSecondary] = useState<string | null>(null)
 
+  // CGW fetched from truck_models when not present in props/truck
+  const [fetchedCgwNum, setFetchedCgwNum] = useState<number | null>(null)
+  const [fetchedCgwLabel, setFetchedCgwLabel] = useState<string | null>(null)
+
   // Editable name
   const [name, setName] = useState<string>((truck as any)?.name ?? defaultName ?? '')
   const [savingName, setSavingName] = useState<boolean>(false)
@@ -184,8 +186,14 @@ export default function TruckCard({
   const [savingHub, setSavingHub] = useState<boolean>(false)
   const [selectedHubId, setSelectedHubId] = useState<string>('')
 
+  // Track "real" current truck location separately from hub
+  const [currentCity, setCurrentCity] = useState<string | null>((truck as any)?.location_city_name ?? null)
+
   // Acquisition type (new)
   const [acquisitionType, setAcquisitionType] = useState<string | null>(((truck as any)?.acquisition_type as string) ?? null)
+
+  // Insurance button disabling (true until 60 days before current active insurance ends)
+  const [insuranceDisabled, setInsuranceDisabled] = useState<boolean>(false)
 
   // UI state
   const [expanded, setExpanded] = useState<boolean>(false)
@@ -196,7 +204,82 @@ export default function TruckCard({
   const [showSell, setShowSell] = useState<boolean>(false)
   const [showInsurance, setShowInsurance] = useState<boolean>(false)
 
+  /**
+   * checkInsurance
+   *
+   * Loads active insurance end_date for this truck and disables the Insurance
+   * button when more than 60 days remain.
+   */
+  useEffect(() => {
+    async function checkInsurance() {
+      try {
+        const res = await getTable(
+          'truck_insurances',
+          `?user_truck_id=eq.${encodeURIComponent(id)}&is_active=eq.true&select=end_date`
+        )
+
+        const rows = Array.isArray(res?.data) ? res.data : []
+
+        if (!rows.length || !rows[0].end_date) {
+          setInsuranceDisabled(false)
+          return
+        }
+
+        const end = new Date(rows[0].end_date)
+        const now = new Date()
+
+        const daysLeft =
+          (end.getTime() - now.getTime()) /
+          (1000 * 60 * 60 * 24)
+
+        setInsuranceDisabled(daysLeft > 60)
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('Insurance check failed', e)
+        setInsuranceDisabled(false)
+      }
+    }
+
+    if (id) checkInsurance()
+  }, [id])
+
   const rawModelId = (truck as any)?.master_truck_id ?? null
+
+  /**
+   * Fetch CGW/GCW numeric code from truck_models when not present in the
+   * passed modelInfo or truck row. The truck_models table stores numeric codes
+   * (1/2/3) which we map to labels A/B/C below.
+   */
+  React.useEffect(() => {
+    let mounted = true
+    async function loadCgwFromModel() {
+      if (!rawModelId) return
+      try {
+        const q = `?select=gcw&id=eq.${encodeURIComponent(String(rawModelId))}&limit=1`
+        const res: any = await getTable('truck_models', q)
+        const rows = Array.isArray(res?.data) ? res.data : []
+        if (!mounted) return
+        if (rows.length > 0) {
+          const r = rows[0] as any
+          const maybeNum = r.gcw ?? null
+          const n = maybeNum !== null && maybeNum !== undefined ? Number(maybeNum) : null
+          setFetchedCgwNum(n)
+          // keep fetchedCgwLabel unused - clear to avoid stale values
+          setFetchedCgwLabel(null)
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.debug('TruckCard: failed to fetch gcw from truck_models', err)
+        setFetchedCgwNum(null)
+        setFetchedCgwLabel(null)
+      }
+    }
+    void loadCgwFromModel()
+    return () => {
+      mounted = false
+    }
+    // only depends on rawModelId
+  }, [rawModelId])
 
   // Model display
   const derivedModelName =
@@ -310,6 +393,13 @@ export default function TruckCard({
     }
   }, [truck?.master_truck_id, modelInfo?.cargo_type_id, modelInfo?.cargo_type_id_secondary, modelInfo?.cargo_type_name, truck?.cargo_type_name])
 
+  // Initial seed for currentCity from prop (do not override if already set)
+  useEffect(() => {
+    const seed = (truck as any)?.location_city_name ?? null
+    if (!currentCity && seed) setCurrentCity(seed)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [truck?.location_city_name])
+
   // Refresh editable fields from API for owned trucks
   useEffect(() => {
     if (isMarket) return
@@ -329,11 +419,23 @@ export default function TruckCard({
           const row = res.data[0] as any
           if (typeof row.name === 'string') setName(row.name)
           if (typeof row.registration === 'string') setRegistration(row.registration)
+
+          // Hub remains hub
           if (typeof row.hub === 'string') setHubCity(row.hub)
 
-          // If the join returned a city row, prefer it as the displayed location (safe fallback to hub)
-          if (row.cities && Array.isArray(row.cities) && row.cities.length > 0 && row.cities[0]?.city_name) {
-            setHubCity(row.cities[0].city_name)
+          // If the join returned a city row, treat it as the real current location (do NOT write over hub)
+          if (
+            row.cities &&
+            Array.isArray(row.cities) &&
+            row.cities.length > 0 &&
+            row.cities[0]?.city_name
+          ) {
+            setCurrentCity(row.cities[0].city_name)
+          }
+
+          // If the join didn't include cities but payload has location_city_id or location_city_name
+          if (!row.cities && typeof row.location_city_id === 'string' && row.location_city_id) {
+            // leave as-is; backend should return cities join when available
           }
 
           if (typeof row.last_maintenance_at === 'string') {
@@ -533,8 +635,12 @@ export default function TruckCard({
     }
   }
 
-  // Location display fallback
-  const location = (truck as any)?.location_city_name ?? hubCity ?? '—'
+  // Location display: prefer currentCity (live location), then truck prop, then hub fallback
+  const location =
+    currentCity ??
+    (truck as any)?.location_city_name ??
+    hubCity ??
+    '—'
 
   function handleToggleExpand() {
     if (actionsOpen) setActionsOpen(false)
@@ -583,6 +689,12 @@ export default function TruckCard({
 
       <div className="flex items-center gap-4 p-3 w-full">
         <div className="h-12 w-1 rounded-full bg-gradient-to-b from-sky-400 to-emerald-400" />
+        {/* Truck image slot (small preview + edit) */}
+        <TruckImageField
+          truckId={id}
+          initialUrl={modelInfo?.image_url ?? (truck as any)?.image_url ?? (truck as any)?.photo_url ?? null}
+          className="w-12 h-12 rounded-sm border border-slate-100 bg-white object-cover"
+        />
 
         <div className="flex items-center gap-3 min-w-0 flex-1">
           <div className="min-w-0 w-full">
@@ -649,27 +761,64 @@ export default function TruckCard({
           </div>
         </div>
 
-        {/* Cargo type icons */}
+        {/* Cargo type icons OR GCW badge */}
         <div className="flex items-center gap-3 ml-4 flex-shrink-0">
-          <div className="flex items-center gap-3">
-            {cargoIconUrl ? (
-              <img
-                src={cargoIconUrl}
-                alt="Cargo type"
-                className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
-                style={{ flexShrink: 0 }}
-              />
-            ) : null}
+          {(() => {
+            const truckClass =
+              modelInfo?.class ??
+              truck?.model_class ??
+              truck?.truck_class ??
+              truck?.class ??
+              null
 
-            {cargoIconUrlSecondary ? (
-              <img
-                src={cargoIconUrlSecondary}
-                alt="Secondary cargo type"
-                className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
-                style={{ flexShrink: 0 }}
-              />
-            ) : null}
-          </div>
+            const isBig =
+              truckClass &&
+              String(truckClass).toLowerCase() === 'big'
+
+            if (isBig) {
+              const mapping: Record<number, string> = {
+                1: 'A',
+                2: 'B',
+                3: 'C',
+              }
+
+              const label =
+                fetchedCgwNum != null
+                  ? mapping[Number(fetchedCgwNum)] ?? null
+                  : null
+
+              if (!label) return null
+
+              return (
+                <div className="w-10 h-10 flex items-center justify-center rounded-md border border-slate-200 bg-white font-semibold text-slate-700">
+                  {label}
+                </div>
+              )
+            }
+
+            // Small & Medium → cargo icons
+            return (
+              <div className="flex items-center gap-3">
+                {cargoIconUrl ? (
+                  <img
+                    src={cargoIconUrl}
+                    alt="Cargo type"
+                    className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
+                    style={{ flexShrink: 0 }}
+                  />
+                ) : null}
+
+                {cargoIconUrlSecondary ? (
+                  <img
+                    src={cargoIconUrlSecondary}
+                    alt="Secondary cargo type"
+                    className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
+                    style={{ flexShrink: 0 }}
+                  />
+                ) : null}
+              </div>
+            )
+          })()}
         </div>
 
         <div className="flex items-center gap-4 ml-6 flex-shrink-0">
@@ -717,8 +866,43 @@ export default function TruckCard({
             </div>
 
             <div>
-              <div className="text-xs text-slate-500">Country</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.country ?? truck?.model_country ?? truck?.manufactured_country ?? truck?.origin_country ?? truck?.country ?? '—'}</div>
+              <div className="text-xs text-slate-500">GCW</div>
+              <div className="text-sm font-medium text-slate-800">
+                {(() => {
+                  /**
+                   * New GCW rendering:
+                   * - Only display GCW mapped label (A/B/C) for trucks of class "big"
+                   * - Prefer fetchedCgwNum (numeric 1/2/3) from the backend, then model/truck gcw
+                   * - If not applicable or missing, display '—'
+                   */
+                  const truckClass =
+                    (modelInfo?.class as string | undefined) ??
+                    (truck?.model_class as string | undefined) ??
+                    (truck?.truck_class as string | undefined) ??
+                    (truck?.class as string | undefined) ??
+                    null
+
+                  if (!truckClass || String(truckClass).toLowerCase() !== 'big') {
+                    return '—'
+                  }
+
+                  const raw =
+                    fetchedCgwNum ??
+                    (modelInfo as any)?.gcw ??
+                    (truck as any)?.gcw ??
+                    null
+
+                  const num = raw !== null && raw !== undefined && !Number.isNaN(Number(raw)) ? Number(raw) : null
+
+                  const mapping: Record<number, string> = {
+                    1: 'A',
+                    2: 'B',
+                    3: 'C',
+                  }
+
+                  return num != null ? mapping[num] ?? '—' : '—'
+                })()}
+              </div>
             </div>
 
             <div>
@@ -880,7 +1064,16 @@ export default function TruckCard({
               Logs
             </button>
 
-            <button type="button" onClick={() => setShowInsurance(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+            <button
+              type="button"
+              onClick={() => {
+                if (!insuranceDisabled && !isSuspended)
+                  setShowInsurance(true)
+              }}
+              disabled={isSuspended || insuranceDisabled}
+              className={`px-3 py-1 text-sm border border-slate-200 rounded flex items-center gap-2 ${isSuspended || insuranceDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'}`}
+              title={insuranceDisabled ? 'New insurance available 60 days before expiry' : 'Insurance'}
+            >
               Insurance
             </button>
 

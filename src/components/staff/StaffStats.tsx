@@ -1,19 +1,8 @@
-/**
- * StaffStats.tsx
- *
- * Small header stats component: total staff and per-role counts.
- *
- * Renders compact role chips using a strict black-and-white palette.
- */
-
 import React from 'react'
+import { supabase } from '@/lib/supabase'
+import { useAuth } from '@/context/AuthContext'
 
-/**
- * StaffCounts
- *
- * Counts per role structure.
- */
-export interface StaffCounts {
+interface StaffCounts {
   total: number
   drivers: number
   mechanics: number
@@ -22,29 +11,103 @@ export interface StaffCounts {
   directors: number
 }
 
-/**
- * StaffStatsProps
- *
- * Props for StaffStats component.
- */
 export interface StaffStatsProps {
-  counts: StaffCounts
+  mode: 'company' | 'market'
 }
 
-/**
- * StaffStats
- *
- * Displays the total staff and per-role chips using only black and white colors.
- *
- * @param props StaffStatsProps
- * @returns JSX.Element
- */
-export default function StaffStats({ counts }: StaffStatsProps) {
+export default function StaffStats({ mode }: StaffStatsProps) {
+  const { user } = useAuth()
+  const companyId = (user as any)?.company_id ?? null
+
+  const [counts, setCounts] = React.useState<StaffCounts>({
+    total: 0,
+    drivers: 0,
+    mechanics: 0,
+    dispatchers: 0,
+    managers: 0,
+    directors: 0,
+  })
+
+  const table =
+    mode === 'company' ? 'hired_staff' : 'unemployed_staff'
+
+  React.useEffect(() => {
+    let mounted = true
+
+    /* 🔒 HARD GUARD
+       If this is the Staff page and companyId is missing,
+       DO NOT QUERY ANYTHING.
+    */
+    if (mode === 'company' && !companyId) {
+      setCounts({
+        total: 0,
+        drivers: 0,
+        mechanics: 0,
+        dispatchers: 0,
+        managers: 0,
+        directors: 0,
+      })
+      return
+    }
+
+    async function fetchCount(category?: string) {
+      if (mode === 'company' && !companyId) return 0
+
+      let q = supabase
+        .from(table)
+        .select('id', { count: 'exact' })
+
+      if (category) q = q.eq('job_category', category)
+      if (mode === 'company') q = q.eq('company_id', companyId)
+
+      const res = await q
+      return res.error ? 0 : res.count ?? 0
+    }
+
+    async function load() {
+      const [
+        total,
+        drivers,
+        mechanics,
+        dispatchers,
+        managers,
+        directors,
+      ] = await Promise.all([
+        fetchCount(),
+        fetchCount('drivers'),
+        fetchCount('mechanics'),
+        fetchCount('dispatchers'),
+        fetchCount('managers'),
+        fetchCount('directors'),
+      ])
+
+      if (!mounted) return
+
+      setCounts({
+        total,
+        drivers,
+        mechanics,
+        dispatchers,
+        managers,
+        directors,
+      })
+    }
+
+    load()
+    return () => {
+      mounted = false
+    }
+  }, [mode, companyId])
+
   return (
     <div className="bg-white p-4 rounded-lg shadow-sm flex flex-col md:flex-row md:items-center md:justify-between gap-3">
       <div>
-        <div className="text-sm text-slate-500">Total staff</div>
-        <div className="mt-1 text-2xl font-bold text-slate-900">{counts.total}</div>
+        <div className="text-sm text-slate-500">
+          {mode === 'company' ? 'Total staff' : 'Available staff'}
+        </div>
+        <div className="mt-1 text-2xl font-bold text-slate-900">
+          {counts.total}
+        </div>
       </div>
 
       <div className="flex flex-wrap gap-2 items-center">
@@ -58,18 +121,10 @@ export default function StaffStats({ counts }: StaffStatsProps) {
   )
 }
 
-/**
- * RoleChip
- *
- * Small pill used to show a role and count. Uses only black & white colors.
- *
- * @param props {label, count}
- */
 function RoleChip({ label, count }: { label: string; count: number }) {
   return (
-    <div className="px-3 py-1 rounded-full text-sm font-medium flex items-center gap-2 bg-white text-black border border-black/10">
-      <span className="font-semibold">{count}</span>
-      <span className="opacity-80">{label}</span>
+    <div className="px-3 py-1 rounded-full text-sm font-medium bg-white text-black border border-black/10">
+      <span className="font-semibold">{count}</span> {label}
     </div>
   )
 }

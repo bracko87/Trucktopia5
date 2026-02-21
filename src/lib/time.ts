@@ -10,6 +10,7 @@
  */
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import { getGameTimeDate } from './gameTime'
 
 /**
  * formatGameTime
@@ -69,6 +70,13 @@ export interface GameTimeProviderProps {
  * React provider that ticks once per second and exposes { now, timeZone }.
  * Uses React.createElement instead of JSX so this file stays valid as .ts.
  *
+ * Behavior:
+ * - Attempt to fetch canonical DB time via getGameTimeDate().
+ * - If DB time is received, use it as baseTime and advance the clock by elapsed real ms.
+ * - Otherwise fall back to system time and continue ticking.
+ *
+ * This ensures UI components (Footer, etc.) show DB-backed time when available.
+ *
  * @param props - Provider props
  * @returns React element
  */
@@ -77,8 +85,51 @@ export function GameTimeProvider(props: GameTimeProviderProps): React.ReactEleme
   const [now, setNow] = useState<Date>(new Date())
 
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000)
-    return () => clearInterval(id)
+    // Base time that the UI clock will advance from (may be DB time or local time).
+    let baseTime: Date = new Date()
+    // Real timestamp when baseTime was captured.
+    let baseReal = Date.now()
+    let mounted = true
+
+    /**
+     * init
+     *
+     * Try to initialize baseTime from DB game_time. On success, replace baseTime
+     * and baseReal and update the local state so UI immediately reflects DB time.
+     */
+    async function init() {
+      try {
+        const dbTime = await getGameTimeDate()
+        if (!mounted) return
+        if (dbTime) {
+          baseTime = dbTime
+          baseReal = Date.now()
+          setNow(dbTime)
+          // eslint-disable-next-line no-console
+          console.log('GameTimeProvider initialized from DB:', dbTime)
+        } else {
+          // eslint-disable-next-line no-console
+          console.info('GameTimeProvider: no DB time available, using local time')
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('GameTimeProvider: error fetching DB time', err)
+      }
+    }
+
+    init()
+
+    const id = setInterval(() => {
+      const elapsed = Date.now() - baseReal
+      setNow(new Date(baseTime.getTime() + elapsed))
+    }, 1000)
+
+    return () => {
+      mounted = false
+      clearInterval(id)
+    }
+    // Intentionally run once on mount; timeZone not included to avoid restart loops.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const value = useMemo<GameTimeContextValue>(() => ({ now, timeZone }), [now, timeZone])

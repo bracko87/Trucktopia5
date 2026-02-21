@@ -8,8 +8,9 @@
  *
  * Important:
  * - The component keeps the same UI and props contract so page design/layout is unchanged.
- * - Uses authenticated requests (via existing supabase helpers). If the user is not logged in
- *   operations will silently fail and a brief status message is shown.
+ * - It only writes to the database when the user explicitly clicks "Save selection".
+ * - On mount it fetches the existing saved_hubs row for the authenticated owner (company preferred,
+ *   otherwise user). If no owner is available the component falls back to localStorage for persistence.
  */
 
 import React from 'react'
@@ -41,37 +42,38 @@ interface SavedHubControlProps {
  *
  * Behavior:
  * - Reads existing saved hub for the current user/company on mount and surfaces it.
- * - Save: creates or updates saved_hubs row using upsertSavedHub.
- * - Clear: deletes the saved_hubs row if present.
+ * - Save: creates or updates saved_hubs row using upsertSavedHub. (Only when Save clicked.)
+ * - Clear: deletes the saved_hubs row if present (server-side) or clears local fallback.
  *
  * @param props - SavedHubControlProps
  */
 export default function SavedHubControl({ selectedCountry, selectedCity, onApply }: SavedHubControlProps) {
   const { user } = useAuth()
-  const STORAGE_KEY = 'market_saved_hub' // kept for compatibility fallback if needed
+  const STORAGE_KEY = 'market_saved_hub' // kept for local fallback compatibility
   const [saved, setSaved] = React.useState<SavedHubRow | null>(null)
   const [status, setStatus] = React.useState<string | null>(null)
-  const [loading, setLoading] = React.useState(false)
+  const [loading, setLoading] = React.useState<boolean>(false)
 
   /**
-   * resolveOwner
+   * ownerInfo
    *
    * Decide whether to use company_id (preferred) or user_id when interacting with saved_hubs.
    *
-   * @returns object for fetch/upsert calls
+   * @returns { userId?: string, companyId?: string } or null when not available
    */
-  function resolveOwner() {
+  function ownerInfo(): { userId?: string; companyId?: string } | null {
     const companyId = (user as any)?.company_id ?? null
     const userId = (user as any)?.id ?? null
-    if (companyId) return { companyId, userId: undefined }
-    if (userId) return { userId, companyId: undefined }
-    return { userId: undefined, companyId: undefined }
+    if (companyId) return { companyId }
+    if (userId) return { userId }
+    return null
   }
 
   /**
    * loadSavedFromServer
    *
-   * Try to load saved_hub for current user/company and apply it.
+   * Load saved_hub for current owner (company or user). Apply it to parent via onApply only
+   * when a saved row exists. This function does not perform any writes.
    */
   React.useEffect(() => {
     let mounted = true
@@ -79,11 +81,30 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
       setLoading(true)
       setStatus(null)
       try {
-        const owner = resolveOwner()
-        if (!owner.userId && !owner.companyId) {
-          setSaved(null)
+        const owner = ownerInfo()
+        if (!owner) {
+          // If unauthenticated, attempt local fallback (do not write to server).
+          try {
+            const raw = localStorage.getItem(STORAGE_KEY)
+            if (raw) {
+              const parsed = JSON.parse(raw)
+              const country = parsed?.country ? String(parsed.country).trim().toLowerCase() : null
+              const city = parsed?.city ? String(parsed.city).trim() : null
+              if (!mounted) return
+              setSaved(country || city ? ({ id: 'local', country, city } as any) : null)
+              if (country || city) onApply(country, city)
+            } else {
+              if (!mounted) return
+              setSaved(null)
+            }
+          } catch {
+            if (!mounted) return
+            setSaved(null)
+          }
           return
         }
+
+        // Fetch from server for the resolved owner (company preferred).
         try {
           const fetched = await fetchSavedHub(owner as any)
           if (!mounted) return
@@ -92,38 +113,44 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
             onApply(fetched.country ?? null, fetched.city ?? null)
           }
         } catch (err) {
-          // If fetch fails (e.g. not authenticated) fall back to localStorage if available
+          // If server fetch fails for any reason, keep UI functional and try local fallback.
           try {
             const raw = localStorage.getItem(STORAGE_KEY)
             if (raw) {
               const parsed = JSON.parse(raw)
               const country = parsed?.country ? String(parsed.country).trim().toLowerCase() : null
               const city = parsed?.city ? String(parsed.city).trim() : null
-              setSaved(country || city ? { id: 'local', country, city } as any : null)
+              setSaved(country || city ? ({ id: 'local', country, city } as any) : null)
               if (country || city) onApply(country, city)
+            } else {
+              setSaved(null)
             }
           } catch {
-            // ignore
+            setSaved(null)
           }
         }
       } finally {
         if (mounted) setLoading(false)
       }
     }
+
     load()
     return () => {
       mounted = false
     }
+    // Intentionally only reload when authentication/owner changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user])
+  }, [user?.company_id, user?.id])
 
   /**
    * saveCurrent
    *
    * Save the currently selected country+city to the server and apply it.
-   * Validates that at least one of country/city is provided.
+   * Writes happen only when user clicks Save selection.
    */
   async function saveCurrent() {
+    setLoading(true)
+    setStatus(null)
     try {
       const country = selectedCountry && String(selectedCountry).trim().length > 0 ? String(selectedCountry).trim().toLowerCase() : null
       const city = selectedCity && String(selectedCity).trim().length > 0 ? String(selectedCity).trim() : null
@@ -135,9 +162,9 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
         return
       }
 
-      const owner = resolveOwner()
+      const owner = ownerInfo()
       // If no authenticated owner, fallback to localStorage and inform user
-      if (!owner.userId && !owner.companyId) {
+      if (!owner) {
         try {
           const payload = { country, city }
           localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
@@ -145,6 +172,12 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
           onApply(country, city)
           setStatus('Saved locally (log in to save to server)')
           setTimeout(() => setStatus(null), 2000)
+          // emit event for other listeners
+          try {
+            window.dispatchEvent(new CustomEvent('market_saved_hub', { detail: { country, city } }))
+          } catch {
+            // ignore
+          }
           return
         } catch {
           setStatus('Save failed')
@@ -153,27 +186,28 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
         }
       }
 
-      // If we already have a saved row id -> update, otherwise create
+      // Persist to server. If we have an existing server row -> patch, otherwise create.
       if (saved && saved.id && saved.id !== 'local') {
+        // Patch existing row
         await upsertSavedHub({ id: saved.id, country, city })
-        const updated = await fetchSavedHub(owner as any)
-        setSaved(updated)
       } else {
+        // Create new row for owner
         const payload: any = {
           user_id: owner.userId ?? null,
           company_id: owner.companyId ?? null,
           country,
           city,
         }
-        const created = await upsertSavedHub(payload)
-        setSaved(created)
+        await upsertSavedHub(payload)
       }
 
-      // Notify parent so filters apply immediately
-      onApply(country, city)
-      // Also dispatch a global event for any other listeners
+      // Refresh saved row from server and notify parent
+      const refreshed = await fetchSavedHub(owner as any)
+      setSaved(refreshed)
+      onApply(refreshed?.country ?? null, refreshed?.city ?? null)
+
       try {
-        window.dispatchEvent(new CustomEvent('market_saved_hub', { detail: { country, city } }))
+        window.dispatchEvent(new CustomEvent('market_saved_hub', { detail: { country: refreshed?.country ?? null, city: refreshed?.city ?? null } }))
       } catch {
         // ignore
       }
@@ -183,6 +217,8 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
     } catch (err) {
       setStatus('Save failed')
       setTimeout(() => setStatus(null), 2000)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -192,9 +228,12 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
    * Remove the saved hub on the server (or local fallback) and notify parent to clear applied values.
    */
   async function clearSaved() {
+    setLoading(true)
+    setStatus(null)
     try {
+      const owner = ownerInfo()
       // If saved row exists on server -> delete it
-      if (saved && saved.id && saved.id !== 'local') {
+      if (saved && saved.id && saved.id !== 'local' && owner) {
         await deleteSavedHub(saved.id)
         setSaved(null)
       } else {
@@ -219,6 +258,8 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
     } catch {
       setStatus('Clear failed')
       setTimeout(() => setStatus(null), 2000)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -242,8 +283,9 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
         <button
           type="button"
           onClick={saveCurrent}
-          className="px-3 py-1 bg-sky-600 text-white rounded text-sm"
+          className={`px-3 py-1 rounded text-sm ${loading ? 'bg-slate-300 text-slate-600 cursor-not-allowed' : 'bg-sky-600 text-white'}`}
           aria-label="Save hub selection"
+          disabled={loading}
         >
           Save selection
         </button>
@@ -251,8 +293,9 @@ export default function SavedHubControl({ selectedCountry, selectedCity, onApply
         <button
           type="button"
           onClick={clearSaved}
-          className="px-3 py-1 bg-slate-100 rounded text-sm"
+          className={`px-3 py-1 rounded text-sm ${loading ? 'bg-slate-300 text-slate-600 cursor-not-allowed' : 'bg-slate-100 text-slate-800'}`}
           aria-label="Clear saved hub"
+          disabled={loading}
         >
           Clear
         </button>

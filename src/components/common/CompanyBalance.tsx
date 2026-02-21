@@ -1,122 +1,146 @@
 /**
  * CompanyBalance.tsx
  *
- * Small presentational + data component that fetches the current user's company
- * and displays the company's balance.
+ * Small header balance widget that reads the authoritative company balance
+ * from the public.companies table.
  *
- * Uses the existing supabaseFetch helper so RLS on the backend ensures the fetch
- * returns only the company(ies) visible to the logged-in user.
+ * Behavior:
+ * - When a user is available (from AuthContext) the component queries
+ *   public.companies by owner_auth_user_id and reads balance / balance_cents.
+ * - Also listens for a 'finances:summary' CustomEvent and will prefer that
+ *   event to update the UI if present (keeps compatibility with existing pages).
+ * - Exposes small formatting options via props.
  */
 
 import React, { useEffect, useState } from 'react'
-import { supabaseFetch } from '../../lib/supabase'
+import { supabase } from '../../lib/supabase'
+import { useAuth } from '../../context/AuthContext'
 
 /**
- * CompanyBalanceProps
- *
- * Props for the CompanyBalance component.
+ * Props for CompanyBalance component.
  */
 interface CompanyBalanceProps {
   className?: string
-  /**
-   * If true, show a subtle loading placeholder instead of the word "Loading..."
-   */
-  compact?: boolean
-  /**
-   * When true, format without cents and use a dot as thousand separator with
-   * the dollar sign after the number (e.g. "10.000$").
-   */
   noCents?: boolean
 }
 
 /**
- * formatCentsToDollar
+ * formatCurrency
  *
- * Convert integer cents to a human friendly USD string.
+ * Format a numeric balance to a string with optional removal of cents.
  *
- * @param cents - amount in cents (may be null)
- * @param noCents - whether to format without cents and place $ at the end
+ * @param value - numeric value to format
+ * @param noCents - if true, show no fractional digits
+ * @returns formatted currency string (e.g. $1,234.56)
  */
-function formatCentsToDollar(cents: number | null | undefined, noCents = false) {
-  if (cents === null || typeof cents === 'undefined') return '—'
-  const dollars = Number(cents) / 100
-
-  if (noCents) {
-    const rounded = Math.round(dollars)
-    try {
-      // Use de-DE to get dot thousands separator, then append $ as requested.
-      return new Intl.NumberFormat('de-DE', { maximumFractionDigits: 0 }).format(rounded) + '$'
-    } catch {
-      return `${rounded}$`
-    }
-  }
-
+function formatCurrency(value: number, noCents?: boolean): string {
   try {
-    return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency: 'USD',
-      maximumFractionDigits: 2
-    }).format(dollars)
+    const opts: Intl.NumberFormatOptions = {
+      minimumFractionDigits: noCents ? 0 : 2,
+      maximumFractionDigits: noCents ? 0 : 2,
+    }
+    const abs = Math.abs(value)
+    const formatted = new Intl.NumberFormat(undefined, opts).format(abs)
+    return `${value < 0 ? '-' : ''}$${formatted}`
   } catch {
-    // Fallback
-    return `$${dollars.toFixed(2)}`
+    return `${value < 0 ? '-' : ''}$${noCents ? Math.round(value) : value.toFixed(2)}`
   }
 }
 
 /**
  * CompanyBalance
  *
- * Fetches the current user's company (via /rest/v1/companies) and displays
- * companies[0].balance_cents as a formatted USD amount.
+ * Renders current company balance for the logged-in user's company.
  *
- * NOTE:
- * - We intentionally do not add owner filters to the REST path; Row-Level Security
- *   on the backend should limit returned companies to those visible to the session.
+ * - Primary data source: SELECT balance, balance_cents FROM companies WHERE owner_auth_user_id = user.id
+ * - Fallback: listens for 'finances:summary' event dispatched elsewhere in the app.
  *
- * @param props - CompanyBalanceProps
+ * @param props CompanyBalanceProps
+ * @returns JSX.Element
  */
 export default function CompanyBalance({
-  className = '',
-  compact = false,
-  noCents = false
-}: CompanyBalanceProps) {
-  const [loading, setLoading] = useState<boolean>(true)
-  const [balanceCents, setBalanceCents] = useState<number | null>(null)
+  className = 'text-sm font-medium text-white',
+  noCents,
+}: CompanyBalanceProps): JSX.Element {
+  const { user } = useAuth()
+  const [balance, setBalance] = useState<number | null>(null)
+
+  /**
+   * fetchCompanyBalance
+   *
+   * Performs a safe read of the companies table to obtain the canonical balance.
+   * Uses owner_auth_user_id to avoid relying on users.id denormalization.
+   */
+  async function fetchCompanyBalance(uid: string) {
+    try {
+      const res = await supabase
+        .from('companies')
+        .select('balance, balance_cents')
+        .eq('owner_auth_user_id', uid)
+        .maybeSingle()
+
+      if (res.error) {
+        // If the read fails, do not override an existing balance; just log.
+        // eslint-disable-next-line no-console
+        console.error('CompanyBalance: failed to fetch company', res.error)
+        return
+      }
+
+      const company = res.data as { balance?: number | null; balance_cents?: number | null } | null
+      if (!company) {
+        // no company found for this user
+        return
+      }
+
+      let val: number | null = null
+      if (typeof company.balance === 'number') {
+        val = company.balance
+      } else if (typeof company.balance_cents === 'number') {
+        val = company.balance_cents / 100
+      }
+
+      if (typeof val === 'number') {
+        setBalance(val)
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('CompanyBalance: unexpected error fetching company balance', err)
+    }
+  }
 
   useEffect(() => {
     let mounted = true
-    async function load() {
-      setLoading(true)
+
+    /**
+     * handleFinancesSummary
+     *
+     * If a Finances page dispatches a summary event prefer that value
+     * so small UI elements update in sync with the overview page.
+     */
+    function handleFinancesSummary(ev: Event) {
       try {
-        // RLS applies - select balance_cents for the company(ies) visible to the current session.
-        const res: any = await supabaseFetch('/rest/v1/companies?select=balance_cents&limit=1', {
-          method: 'GET'
-        })
-        if (!mounted) return
-        if (res && Array.isArray(res.data) && res.data.length > 0) {
-          const row = res.data[0]
-          const cents = row?.balance_cents ?? null
-          setBalanceCents(cents !== null && typeof cents !== 'undefined' ? Number(cents) : null)
-        } else {
-          setBalanceCents(null)
+        const ce = ev as CustomEvent<{ balance?: number }>
+        const next = ce?.detail?.balance
+        if (typeof next === 'number' && mounted) {
+          setBalance(next)
         }
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('CompanyBalance: failed to fetch company balance', err)
-        setBalanceCents(null)
-      } finally {
-        if (mounted) setLoading(false)
+      } catch {
+        // ignore malformed events
       }
     }
-    void load()
+
+    window.addEventListener('finances:summary', handleFinancesSummary)
+
+    if (user && user.id) {
+      void fetchCompanyBalance(user.id)
+    }
+
     return () => {
       mounted = false
+      window.removeEventListener('finances:summary', handleFinancesSummary)
     }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id])
 
-  if (loading) {
-    return <div className={`${className}`}>{compact ? '…' : 'Loading…'}</div>
-  }
-
-  return <div className={`${className}`}>{formatCentsToDollar(balanceCents, noCents)}</div>
+  return <div className={className}>{balance === null ? '—' : formatCurrency(balance, noCents)}</div>
 }

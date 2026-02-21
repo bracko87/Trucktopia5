@@ -1,100 +1,226 @@
 /**
  * staffApi.ts
  *
- * Minimal staff API helper.
+ * Fetch + normalize hired staff rows.
  *
- * Provides functions to fetch hired staff (public.hired_staff) and
- * unemployed candidates (public.unemployed_staff) for the UI.
+ * This file exports the StaffMember type and fetchHiredStaff function.
  */
 
 import { supabase } from './supabase'
 
 /**
+ * StaffRole
+ *
+ * Used for founder / role-based logic.
+ */
+export interface StaffRole {
+  key: 'CEO' | 'DRIVER'
+  locked: boolean
+}
+
+/**
  * StaffMember
  *
- * Represents a minimal staff row for the UI.
- * Extra fields are optional to stay compatible with the current DB.
+ * Minimal shape for a staff row used by the UI.
  */
 export interface StaffMember {
-  /** Primary key */
   id: string
-  /** Full name of the person */
-  name: string | null
-  /** Role / position (driver, mechanic, dispatcher, manager, director, etc.) */
-  role: string | null
-  /** Contact email, if available */
-  email?: string | null
-  /** Contact phone, if available */
-  phone?: string | null
-  /** When the person was hired (for hired_staff only) */
+
+  // 👇 used ONLY for founder
+  staffProfileId?: string
+  roles?: StaffRole[]
+
+  // identity
+  name: string
+  first_name?: string | null
+  last_name?: string | null
+  country_code?: string | null
+
+  // role / job (existing system)
+  role?: string | null
+  job_category?: string | null
+
+  // stats
+  age?: number | null
+  experience?: number | null
+  experience_years?: number | null
+
+  // salary / mood
+  salary?: number | null
+  fatigue?: number | null
+  happiness?: number | null
+
+  // timestamps
   hired_at?: string | null
 
-  /** Two-letter country code or full country name for filtering */
-  country?: string | null
-  /** Alternative country code field (if used by the table) */
-  country_code?: string | null
-  /** City or region name, if available */
-  city?: string | null
+  // activity
+  activity_id?: string | null
+  activity_until?: string | null
 
-  /** Expected / desired salary (numeric, e.g. per month) */
-  expected_salary?: number | null
-  /** Currency code for salary (e.g. EUR, USD) */
-  currency?: string | null
+  // skills
+  skills?: Array<{
+    title: string
+    subtitle?: string
+  }>
 
-  /** Years of experience, if tracked */
-  experience_years?: number | null
-  /** Main skill or specialization label */
-  primary_skill?: string | null
-  /** Free-form notes or description */
-  notes?: string | null
+  // position fields
+  position_id?: string | null
+  position?: {
+    id: string
+    code?: string
+    name?: string
+  } | null
+}
+
+/**
+ * FetchHiredStaffResult
+ */
+export interface FetchHiredStaffResult {
+  raw: any[]
+  rows: StaffMember[]
+  error?: Error
 }
 
 /**
  * fetchHiredStaff
  *
- * Fetches hired_staff rows for a specific company.
- *
- * @param companyId - UUID of the company to fetch hired staff for
- * @returns Promise<StaffMember[]>
+ * Fetch hired_staff rows for a company and normalize them.
+ * PLUS: append founder staff profile.
  */
-export async function fetchHiredStaff(companyId: string): Promise<StaffMember[]> {
-  try {
-    const { data, error } = await supabase
-      .from('hired_staff')
-      .select('*')
-      .eq('company_id', companyId)
-      .order('hired_at', { ascending: false })
-      .limit(200)
+export async function fetchHiredStaff(
+  companyId: string
+): Promise<FetchHiredStaffResult> {
+  // --------------------------------------------------
+  // 1️⃣ Fetch hired staff (UNCHANGED)
+  // --------------------------------------------------
+  // Include current_location_id so UI can resolve city name
+  const { data, error } = await supabase
+    .from('hired_staff')
+    .select(`
+      id,
+      first_name,
+      last_name,
+      country_code,
+      age,
+      job_category,
+      experience,
+      salary,
+      fatigue,
+      happiness,
+      hired_at,
+      activity_id,
+      activity_until,
+      position_id,
+      current_location_id,
+      position:staff_positions_master (
+        id,
+        code,
+        name
+      ),
+      skill1:skills_master!hired_staff_skill1_id_fkey ( name, description ),
+      skill2:skills_master!hired_staff_skill2_id_fkey ( name, description ),
+      skill3:skills_master!hired_staff_skill3_id_fkey ( name, description )
+    `)
+    .eq('company_id', companyId)
+    .order('hired_at', { ascending: false })
 
-    if (error) {
-      console.error('fetchHiredStaff error', error)
-      return []
-    }
-
-    return (data ?? []) as StaffMember[]
-  } catch (err) {
-    console.error('fetchHiredStaff unexpected error', err)
-    return []
+  if (error) {
+    return { raw: [], rows: [], error }
   }
-}
 
-/**
- * fetchUnemployedStaff
- *
- * Fetches all rows from public.unemployed_staff.
- *
- * @returns Promise<StaffMember[]>
- */
-export async function fetchUnemployedStaff(): Promise<StaffMember[]> {
-  try {
-    const { data, error } = await supabase.from('unemployed_staff').select('*')
-    if (error) {
-      console.error('fetchUnemployedStaff error', error)
-      return []
+  const raw = Array.isArray(data) ? data : []
+
+  const hiredRows: StaffMember[] = raw.map((r) => {
+    const pos = (r as any).position
+
+    return {
+      id: r.id,
+
+      name: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim(),
+      first_name: r.first_name,
+      last_name: r.last_name,
+      country_code: r.country_code,
+
+      role: r.job_category,
+      job_category: r.job_category,
+
+      age: typeof r.age === 'number' ? r.age : null,
+      experience: r.experience != null ? Number(r.experience) : null,
+
+      salary: r.salary != null ? Number(r.salary) : null,
+      fatigue: r.fatigue != null ? Number(r.fatigue) : null,
+      happiness: r.happiness != null ? Number(r.happiness) : null,
+
+      hired_at: r.hired_at,
+      activity_id: r.activity_id,
+      activity_until: r.activity_until,
+
+      /* Ensure we pass current_location_id through to the UI so cards can resolve city name */
+      current_location_id: r.current_location_id ?? null,
+
+      skills: [r.skill1, r.skill2, r.skill3]
+        .filter(Boolean)
+        .map((s: any) => ({
+          title: s.name,
+          subtitle: s.description,
+        })),
+
+      position_id: r.position_id ?? null,
+      position: pos
+        ? {
+            id: String(pos.id),
+            code: pos.code ? String(pos.code) : undefined,
+            name: pos.name ? String(pos.name) : undefined,
+          }
+        : null,
     }
-    return (data || []) as StaffMember[]
-  } catch (err) {
-    console.error('fetchUnemployedStaff unexpected error', err)
-    return []
+  })
+
+  // --------------------------------------------------
+  // 2️⃣ Fetch founder staff profile (FIXED)
+  // --------------------------------------------------
+  const { data: founderData } = await supabase.rpc(
+    'fetch_founder_staff_profile',
+    { p_company_id: companyId }
+  )
+
+  const founderRows: StaffMember[] = (founderData ?? []).map((f: any) => {
+    let roles: StaffRole[] = []
+
+    if (Array.isArray(f.roles)) {
+      roles = f.roles
+    } else if (typeof f.roles === 'string') {
+      try {
+        roles = JSON.parse(f.roles)
+      } catch {
+        roles = []
+      }
+    }
+
+    return {
+      id: `founder-${f.staff_profile_id}`,
+      staffProfileId: f.staff_profile_id,
+
+      name: `${f.first_name} ${f.last_name}`,
+      first_name: f.first_name,
+      last_name: f.last_name,
+
+      roles,
+
+      age: null,
+      experience: null,
+      salary: null,
+      fatigue: null,
+      happiness: null,
+      skills: [],
+    }
+  })
+
+  // --------------------------------------------------
+  // 3️⃣ Merge founder + hired staff
+  // --------------------------------------------------
+  return {
+    raw: [...raw, ...(founderData ?? [])],
+    rows: [...founderRows, ...hiredRows],
   }
 }

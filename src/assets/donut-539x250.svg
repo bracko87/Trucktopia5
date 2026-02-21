@@ -1,0 +1,50 @@
+<!--
+/**
+ * Modified donut SVG
+ *
+ * Purpose: same graphic scaled to a height of 500px.
+ */
+-->
+<svg cx="50%" cy="50%" class="recharts-surface" width="539" height="500" viewBox="0 0 539 198" style="width: 100%; height: 100%; pointer-events: auto;">
+  <title></title>
+  <desc></desc>
+  <defs>
+    <clipPath id="recharts6-clip">
+      <rect x="5" y="5" height="188" width="529"></rect>
+    </clipPath>
+  </defs>
+  <defs>
+    <radialGradient id="donut-inner-grad" cx="50%" cy="40%">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.0)"></stop>
+      <stop offset="60%" stop-color="rgba(0,0,0,0.03)"></stop>
+      <stop offset="100%" stop-color="rgba(0,0,0,0.06)"></stop>
+    </radialGradient>
+    <filter id="donut-drop" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity="0.06"></feDropShadow>
+    </filter>
+  </defs>
+  <g class="recharts-layer recharts-pie" tabindex="0">
+    <g class="recharts-layer">
+      <g class="recharts-layer recharts-pie-sector" tabindex="-1">
+        <path cx="269.5" cy="99" name="Income" stroke="#ffffff" fill="#10B981" filter="url(#donut-drop)" stroke-width="2" tabindex="-1" class="recharts-sector" d="M 269.5,8.760000000000005
+    A 90.24,90.24,0,
+    1,1,
+    194.67027476561827,48.564200994264674
+  L 227.40827955566027,70.62986305927387
+            A 50.76,50.76,0,
+            1,0,
+            269.5,48.24 Z" role="img" style="transition: opacity 320ms, transform 600ms; pointer-events: auto;"></path>
+      </g>
+      <g class="recharts-layer recharts-pie-sector" tabindex="-1">
+        <path cx="269.5" cy="99" name="Expenses" stroke="#ffffff" fill="#EF4444" filter="url(#donut-drop)" stroke-width="2" tabindex="-1" class="recharts-sector" d="M 196.4760430134882,45.98340537122292
+    A 90.24,90.24,0,
+    0,1,
+    266.35066941756634,8.814971769796799
+  L 267.7285015473811,48.2709216205107
+            A 50.76,50.76,0,
+            0,0,
+            228.4240241950871,69.17816552131289 Z" role="img" style="transition: opacity 320ms, transform 600ms; pointer-events: auto;"></path>
+      </g>
+    </g>
+  </g>
+</svg>

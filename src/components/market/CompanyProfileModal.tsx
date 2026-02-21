@@ -396,7 +396,32 @@ export default function CompanyProfileModal({
             'cargo_type:cargo_type_id(id,name),' +
             'cargo_item:cargo_item_id(id,name),' +
             'origin_city:origin_city_id(id,city_name),' +
-            'destination_city:destination_city_id(id,city_name)'
+            'destination_city:destination_city_id(id,city_name),' +
+            // Request minimal origin/destination client company info (safe fields)
+            "origin_company:origin_client_company_id(id,name,logo)," +
+            "destination_company:destination_client_company_id(id,name,logo)"
+
+          /**
+           * pickLogoJob
+           *
+           * Safely pick a probable logo field from a company row returned by PostgREST.
+           * Checks common column names used across the codebase and falls back to null.
+           *
+           * @param obj - company-like object
+           * @returns string|null - best-effort image url
+           */
+          /**
+           * pickLogoJob
+           *
+           * Return the primary logo field for a client company object.
+           *
+           * @param obj - company-like object returned by PostgREST
+           * @returns string|null - best-effort logo URL or null
+           */
+          function pickLogoJob(obj: any): string | null {
+            if (!obj) return null
+            return obj.logo ?? null
+          }
 
           // Query jobs where origin OR destination matches the company.
           // Include both 'generated' and 'open' statuses.
@@ -415,6 +440,10 @@ export default function CompanyProfileModal({
               const mapped = (jobsRes.data ?? []).map((r: any) => {
                 const originCity = r.origin_city ?? null
                 const destCity = r.destination_city ?? null
+
+                const originCompany = r.origin_company ?? null
+                const destinationCompany = r.destination_company ?? null
+
                 return {
                   id: r.id,
                   origin_city_name: chooseCityName(originCity),
@@ -431,6 +460,12 @@ export default function CompanyProfileModal({
                   special_requirements: r.special_requirements ?? null,
                   cargo_type_name: (r.cargo_type && (r.cargo_type.name ?? r.cargo_type.id)) ?? null,
                   cargo_item_name: (r.cargo_item && (r.cargo_item.name ?? r.cargo_item.id)) ?? null,
+
+                  // Map origin/destination client company name and logo (safe fallbacks)
+                  origin_client_company_name: originCompany?.name ?? null,
+                  origin_client_company_logo: pickLogoJob(originCompany),
+                  destination_client_company_name: destinationCompany?.name ?? null,
+                  destination_client_company_logo: pickLogoJob(destinationCompany),
                 } as CompanyJobRow
               })
               setJobs(mapped)

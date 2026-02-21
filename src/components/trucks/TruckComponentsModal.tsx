@@ -8,11 +8,13 @@
  * - Query REST endpoints for user_truck_components (including label) and fallback to Supabase client.
  * - Resolve human-readable master component names from truck_components_master and display them.
  * - Prefer the per-row "label" column from user_truck_components for display if present.
+ * - When master names are missing, attempt a secondary lookup using likely candidate ids
+ *   (master_component_id and as a last resort the component row id) to avoid showing raw UUIDs.
  * - Render using the shared ModalShell (blurred backdrop, portal, animations, ESC/backdrop/close).
  */
 
 import React, { useEffect, useState } from 'react'
-import { X, RefreshCw, Search, Filter } from 'lucide-react'
+import { X, Search, Filter } from 'lucide-react'
 import ModalShell from '../common/ModalShell'
 import { supabaseFetch, supabase } from '../../lib/supabase'
 import { useTruckOverallCondition } from '../../hooks/useTruckOverallCondition'
@@ -139,7 +141,7 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
   const [error, setError] = useState<string | null>(null)
 
   // Live overall condition hook (computed from components)
-  const { value: overallValue, display: overallDisplay, loading: overallLoading, refresh: refreshOverall } =
+  const { value: overallValue, display: overallDisplay, loading: overallLoading } =
     useTruckOverallCondition(truckId)
 
   const [search, setSearch] = useState('')
@@ -158,13 +160,53 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
     setError(null)
     try {
       const rows = await fetchComponentsForTruck(tId)
+
       // Resolve unique master_component_id values
       const ids = Array.from(new Set(rows.map((r) => r.master_component_id).filter(Boolean))) as string[]
       const nameMap = await fetchMasterComponentNames(ids)
-      const mapped = rows.map((r) => ({
+
+      // First merge step - use master_component_id -> name where possible
+      let mapped = rows.map((r) => ({
         ...r,
-        master_component_name: r.master_component_id ? nameMap[r.master_component_id] ?? null : null,
+        master_component_name: r.master_component_id ? nameMap[r.master_component_id] ?? null : r.master_component_name ?? null,
       }))
+
+      /**
+       * Secondary fallback lookup:
+       * Some rows may still lack a master_component_name (and also lack a user-provided label).
+       * As a best-effort we attempt another lookup for candidate ids:
+       * - master_component_id values for those rows (again)
+       * - as a last resort the component row id (some schemas historically stored master ids differently)
+       *
+       * This helps avoid showing raw UUIDs in the UI.
+       */
+      const missingRows = mapped.filter((r) => !(r.label || r.master_component_name))
+      if (missingRows.length > 0) {
+        const fallbackCandidates = Array.from(
+          new Set(
+            missingRows
+              .map((r) => r.master_component_id || r.id)
+              .filter(Boolean),
+          ),
+        ) as string[]
+
+        if (fallbackCandidates.length > 0) {
+          // Attempt to fetch names for these candidate ids and merge results
+          const fallbackMap = await fetchMasterComponentNames(fallbackCandidates)
+          mapped = mapped.map((r) => {
+            if (r.label) return r
+            if (r.master_component_name) return r
+            // try master_component_id first, then try row id mapping
+            const byMaster = r.master_component_id ? fallbackMap[r.master_component_id] : undefined
+            const byId = fallbackMap[r.id]
+            return {
+              ...r,
+              master_component_name: byMaster ?? byId ?? null,
+            }
+          })
+        }
+      }
+
       setComponents(mapped)
     } catch (err: any) {
       setError(err?.message ?? 'Failed to load components')
@@ -193,12 +235,6 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
       mounted = false
     }
   }, [open, truckId])
-
-  // Close on ESC is handled by ModalShell, keep this effect only if additional handling needed
-  useEffect(() => {
-    // noop here - ModalShell already listens for Escape
-    return
-  }, [])
 
   if (!open) return null
 
@@ -363,8 +399,8 @@ export default function TruckComponentsModal({ truckId, open, onClose }: TruckCo
         ) : (
           <div className="space-y-3">
             {filtered.map((c) => {
-              // Prefer per-row label, then master name, then master id, then row id
-              const displayName = c.label ?? c.master_component_name ?? c.master_component_id ?? c.id
+              // Prefer per-row label, then master name. Fallback to a friendly label to avoid showing raw IDs
+              const displayName = c.label ?? c.master_component_name ?? 'Unnamed component'
               return (
                 <div key={c.id} className="p-3 border rounded-md bg-slate-50 shadow-sm">
                   <div className="flex items-center justify-between">
