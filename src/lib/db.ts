@@ -177,6 +177,19 @@ export async function fetchCities() {
 }
 
 /**
+ * fetchLatestGameTime
+ *
+ * Reads the latest game clock row from public.game_time.
+ * Returns a single object (or null when no rows exist) so callers can
+ * directly access fields like current_time or game_timestamp.
+ */
+export async function fetchLatestGameTime() {
+  const res = await getTable('game_time', '?select=*&order=updated_at.desc.nullslast,created_at.desc&limit=1')
+  const rows = Array.isArray(res?.data) ? res.data : []
+  return rows[0] ?? null
+}
+
+/**
  * ensureUserProfile
  *
  * Idempotently ensures that a public.users row exists and is linked to the provided
