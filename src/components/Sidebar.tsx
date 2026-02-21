@@ -22,10 +22,17 @@ import {
   ChevronLeft,
   ChevronRight,
   LogOut,
+  Building2,
+  Handshake,
 } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import { supabase } from '../lib/supabase'
 
+/**
+ * SidebarItemProps
+ *
+ * Props for a single navigation item in the sidebar.
+ */
 interface SidebarItemProps {
   label: string
   subtitle?: string
@@ -34,6 +41,11 @@ interface SidebarItemProps {
   collapsed: boolean
 }
 
+/**
+ * SidebarItem
+ *
+ * Renders a single navigation button in the sidebar.
+ */
 function SidebarItem({ label, subtitle, to, icon, collapsed }: SidebarItemProps) {
   const nav = useNavigate()
 
@@ -58,6 +70,11 @@ function SidebarItem({ label, subtitle, to, icon, collapsed }: SidebarItemProps)
   )
 }
 
+/**
+ * Sidebar
+ *
+ * Main collapsible navigation sidebar, including sign-out control.
+ */
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
   const [signingOut, setSigningOut] = useState(false)
@@ -73,15 +90,72 @@ export default function Sidebar() {
   }, [])
 
   const items: Array<{ label: string; subtitle?: string; to: string; icon: React.ReactNode }> = [
-    { label: 'My Company', subtitle: 'Overview & settings', to: '/dashboard', icon: <Home size={18} className="text-white" /> },
-    { label: 'Trucks', subtitle: 'Your fleet', to: '/trucks', icon: <Truck size={18} className="text-white" /> },
-    { label: 'Trailers', subtitle: 'Trailer inventory', to: '/trailers', icon: <Package size={18} className="text-white" /> },
-    { label: 'Staff', subtitle: 'Drivers & admin', to: '/staff', icon: <Users size={18} className="text-white" /> },
-    { label: 'Market', subtitle: 'Find jobs', to: '/market', icon: <ShoppingCart size={18} className="text-white" /> },
-    { label: 'My Jobs', subtitle: 'Accepted jobs', to: '/my-jobs', icon: <FileText size={18} className="text-white" /> },
-    { label: 'Staging Area', subtitle: 'Assemble assets', to: '/staging', icon: <Warehouse size={18} className="text-white" /> },
-    { label: 'Finances', subtitle: 'Balance & transactions', to: '/finances', icon: <DollarSign size={18} className="text-white" /> },
-    { label: 'Map', subtitle: 'Fleet positions', to: '/map', icon: <MapPin size={18} className="text-white" /> },
+    {
+      label: 'My Company',
+      subtitle: 'Overview & settings',
+      to: '/dashboard',
+      icon: <Home size={18} className="text-white" />,
+    },
+    {
+      label: 'Trucks',
+      subtitle: 'Your fleet',
+      to: '/trucks',
+      icon: <Truck size={18} className="text-white" />,
+    },
+    {
+      label: 'Trailers',
+      subtitle: 'Trailer inventory',
+      to: '/trailers',
+      icon: <Package size={18} className="text-white" />,
+    },
+    {
+      label: 'Staff',
+      subtitle: 'Drivers & admin',
+      to: '/staff',
+      icon: <Users size={18} className="text-white" />,
+    },
+    {
+      label: 'Market',
+      subtitle: 'Find jobs',
+      to: '/market',
+      icon: <ShoppingCart size={18} className="text-white" />,
+    },
+    {
+      label: 'My Jobs',
+      subtitle: 'Accepted jobs',
+      to: '/my-jobs',
+      icon: <FileText size={18} className="text-white" />,
+    },
+    {
+      label: 'Staging Area',
+      subtitle: 'Assemble assets',
+      to: '/staging',
+      icon: <Warehouse size={18} className="text-white" />,
+    },
+    {
+      label: 'Facilities',
+      subtitle: 'Depots & hubs',
+      to: '/facilities',
+      icon: <Building2 size={18} className="text-white" />,
+    },
+    {
+      label: 'Contract Jobs',
+      subtitle: 'Long-term deals',
+      to: '/contract-jobs',
+      icon: <Handshake size={18} className="text-white" />,
+    },
+    {
+      label: 'Finances',
+      subtitle: 'Balance & transactions',
+      to: '/finances',
+      icon: <DollarSign size={18} className="text-white" />,
+    },
+    {
+      label: 'Map',
+      subtitle: 'Fleet positions',
+      to: '/map',
+      icon: <MapPin size={18} className="text-white" />,
+    },
   ]
 
   function toggleCollapsed() {
@@ -124,7 +198,11 @@ export default function Sidebar() {
   }
 
   return (
-    <aside className={`flex-shrink-0 bg-black text-white transition-all duration-200 ${collapsed ? 'w-20' : 'w-64'}`}>
+    <aside
+      className={`flex-shrink-0 bg-black text-white transition-all duration-200 ${
+        collapsed ? 'w-20' : 'w-64'
+      }`}
+    >
       <div className="flex flex-col h-full">
         {/* Header */}
         <div className="p-2 flex items-center justify-end">
@@ -133,14 +211,25 @@ export default function Sidebar() {
             onClick={toggleCollapsed}
             className="p-1 rounded hover:bg-yellow-400 hover:text-black transition text-white"
           >
-            {collapsed ? <ChevronRight size={18} className="text-white" /> : <ChevronLeft size={18} className="text-white" />}
+            {collapsed ? (
+              <ChevronRight size={18} className="text-white" />
+            ) : (
+              <ChevronLeft size={18} className="text-white" />
+            )}
           </button>
         </div>
 
         {/* Navigation */}
         <nav className="px-2 mt-2 flex-1 overflow-y-auto space-y-1">
           {items.map((it) => (
-            <SidebarItem key={it.label} label={it.label} subtitle={it.subtitle} to={it.to} icon={it.icon} collapsed={collapsed} />
+            <SidebarItem
+              key={it.label}
+              label={it.label}
+              subtitle={it.subtitle}
+              to={it.to}
+              icon={it.icon}
+              collapsed={collapsed}
+            />
           ))}
         </nav>
 

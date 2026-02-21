@@ -28,6 +28,8 @@ import NewTrucksMarketPage from './pages/NewTrucksMarket'
 import MyJobsPage from './pages/MyJobs'
 import FinancesPage from './pages/Finances'
 import MapPage from './pages/Map'
+import FacilitiesPage from './pages/Facilities'
+import ContractJobsPage from './pages/ContractJobs'
 
 /* Settings pages */
 import SettingsProfilePage from './pages/Settings/Profile'
@@ -160,6 +162,8 @@ export default function App() {
               <Route path="/staff-market" element={<StaffMarketPage />} />
               <Route path="/market" element={<MarketPage />} />
               <Route path="/staging" element={<StagingAreaPage />} />
+              <Route path="/facilities" element={<FacilitiesPage />} />
+              <Route path="/contract-jobs" element={<ContractJobsPage />} />
               <Route path="/new-trucks-market" element={<NewTrucksMarketPage />} />
               <Route path="/my-jobs" element={<MyJobsPage />} />
               <Route path="/finances" element={<FinancesPage />} />

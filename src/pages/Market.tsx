@@ -20,6 +20,7 @@ import AcceptModal from '../components/market/AcceptModal'
 import { useAuth } from '../context/AuthContext'
 import { Filter } from 'lucide-react'
 import { getCountryName } from '../lib/countryNames'
+import { supabase } from '../lib/supabase'
 
 /**
  * Market API constants
@@ -792,18 +793,27 @@ export default function MarketPage(): JSX.Element {
     }
 
     try {
+      const session = await supabase.auth.getSession()
+      const accessToken = session.data.session?.access_token ?? null
+      const authHeader = accessToken ? `Bearer ${accessToken}` : `Bearer ${MARKET_SUPABASE_ANON_KEY}`
+
+      const carrierCompanyId = await resolveCarrierCompanyId(user, truckId, authHeader)
+      if (!carrierCompanyId) {
+        throw new Error('No carrier company linked to your account. Please create or join a company before accepting jobs.')
+      }
+
       /* 1️⃣ Create assignment */
       const assignRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
         method: 'POST',
         headers: {
           apikey: MARKET_SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
+          Authorization: authHeader,
           'Content-Type': 'application/json',
           Prefer: 'return=representation',
         },
         body: JSON.stringify({
           job_offer_id: jobId,
-          carrier_company_id: (user as any).company_id ?? null,
+          carrier_company_id: carrierCompanyId,
           user_id: (user as any).id ?? null,
           user_truck_id: truckId ?? null,
           status: 'assigned',
@@ -823,7 +833,7 @@ export default function MarketPage(): JSX.Element {
           method: 'PATCH',
           headers: {
             apikey: MARKET_SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
+            Authorization: authHeader,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
@@ -1048,6 +1058,83 @@ function readFollowedIds(): string[] {
   } catch {
     return []
   }
+}
+
+/**
+ * resolveCarrierCompanyId
+ *
+ * Resolve the carrier company id used for job assignment inserts.
+ *
+ * Resolution order:
+ * 1) user.company_id if present on auth context shape
+ * 2) public.users by auth_user_id, then by id
+ * 3) selected user_trucks row owner_company_id
+ * 4) user_trucks by owner_user_id
+ * 5) companies by owner_id
+ */
+async function resolveCarrierCompanyId(
+  user: { id?: string | null; company_id?: string | null } | null,
+  truckId?: string | null,
+  authorization?: string
+): Promise<string | null> {
+  const inlineCompanyId = user?.company_id ?? null
+  if (inlineCompanyId) return inlineCompanyId
+
+  const authUserId = user?.id ?? null
+  const headers = {
+    apikey: MARKET_SUPABASE_ANON_KEY,
+    Authorization: authorization ?? `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
+  }
+
+  try {
+    const queryUsersCompany = async (field: 'auth_user_id' | 'id', value: string): Promise<string | null> => {
+      const usersUrl = `${MARKET_API_BASE}/rest/v1/users?select=company_id&${field}=eq.${encodeURIComponent(value)}&limit=1`
+      const usersRes = await fetch(usersUrl, { headers })
+      if (!usersRes.ok) return null
+      const users = await usersRes.json().catch(() => null)
+      return Array.isArray(users) ? users[0]?.company_id ?? null : null
+    }
+
+    if (authUserId) {
+      const byAuthField = await queryUsersCompany('auth_user_id', authUserId)
+      if (byAuthField) return byAuthField
+
+      const byIdField = await queryUsersCompany('id', authUserId)
+      if (byIdField) return byIdField
+    }
+
+    if (truckId) {
+      const truckUrl = `${MARKET_API_BASE}/rest/v1/user_trucks?id=eq.${encodeURIComponent(truckId)}&select=owner_company_id&limit=1`
+      const truckRes = await fetch(truckUrl, { headers })
+      if (truckRes.ok) {
+        const trucks = await truckRes.json().catch(() => null)
+        const resolved = Array.isArray(trucks) ? trucks[0]?.owner_company_id : null
+        if (resolved) return resolved
+      }
+    }
+
+    if (authUserId) {
+      const ownerTruckUrl = `${MARKET_API_BASE}/rest/v1/user_trucks?owner_user_id=eq.${encodeURIComponent(authUserId)}&select=owner_company_id&limit=1`
+      const ownerTruckRes = await fetch(ownerTruckUrl, { headers })
+      if (ownerTruckRes.ok) {
+        const trucks = await ownerTruckRes.json().catch(() => null)
+        const resolved = Array.isArray(trucks) ? trucks[0]?.owner_company_id : null
+        if (resolved) return resolved
+      }
+
+      const companiesUrl = `${MARKET_API_BASE}/rest/v1/companies?owner_id=eq.${encodeURIComponent(authUserId)}&select=id&limit=1`
+      const companiesRes = await fetch(companiesUrl, { headers })
+      if (companiesRes.ok) {
+        const companies = await companiesRes.json().catch(() => null)
+        const resolved = Array.isArray(companies) ? companies[0]?.id : null
+        if (resolved) return resolved
+      }
+    }
+  } catch {
+    // ignore and fall back to null
+  }
+
+  return null
 }
 
 /**
