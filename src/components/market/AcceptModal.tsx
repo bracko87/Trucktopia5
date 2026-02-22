@@ -7,57 +7,36 @@
  * pickup/delivery timestamps to DD-MM-YYYY HH:MM:SS. Headline labels are rendered
  * in bold for better emphasis. Transport mode values are normalized to friendly
  * text (e.g. "trailer_cargo" -> "Trailer Cargo", "load_cargo" -> "Load Cargo").
+ *
+ * Added behavior:
+ * - Loads user's trucks on open and requires a truck selection before confirming.
+ * - Shows local errors (login/truck load/accept failure) without closing the modal.
+ *
+ * NOTE:
+ * - Your DB schema for public.user_trucks uses model_max_load_kg (capacity) and does NOT
+ *   have max_payload_kg / payload_kg / truck_model_id. This file matches your schema.
+ * - Your user_trucks table has both owner_user_id and owner_user_auth_id; this modal
+ *   automatically uses whichever matches the current auth user.
  */
 
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import type { JobRow } from './JobCard'
+import { supabase } from '../../lib/supabase'
 
 export interface AcceptModalProps {
-  /**
-   * Whether the modal is open.
-   */
   open: boolean
-  /**
-   * The job id (kept for compatibility). The modal will not render if missing.
-   */
   jobId: string | null
-  /**
-   * The job object passed from the parent. This file relies on this prop
-   * instead of performing an extra fetch.
-   */
   job: JobRow | null
-  /**
-   * Called when the modal should close.
-   */
   onClose: () => void
-  /**
-   * Called when the user confirms acceptance. The function may return a Promise.
-   */
   onConfirm: (truckId?: string) => Promise<void> | void
 }
 
-/**
- * formatNumber
- *
- * Formats numeric values for display (thousands separator, fallback).
- *
- * @param n number | null | undefined
- * @returns formatted string
- */
 function formatNumber(n: number | null | undefined): string {
   if (n == null || Number.isNaN(n)) return '—'
   if (Math.abs(n) >= 1000) return `${Math.round(n).toLocaleString()}`
   return n.toString()
 }
 
-/**
- * formatDateTime
- *
- * Convert an ISO date string to "DD-MM-YYYY HH:MM:SS". Uses local time.
- *
- * @param iso ISO date string
- * @returns formatted date/time or '—' when missing/invalid
- */
 function formatDateTime(iso?: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
@@ -74,18 +53,6 @@ function formatDateTime(iso?: string | null): string {
   return `${day}-${month}-${year} ${hours}:${minutes}:${seconds}`
 }
 
-/**
- * formatTransportMode
- *
- * Convert raw transport_mode values into friendly labels.
- *
- * Examples:
- * - "trailer_cargo" -> "Trailer Cargo"
- * - "load_cargo" -> "Load Cargo"
- *
- * @param m transport mode string
- * @returns human-friendly transport mode
- */
 function formatTransportMode(m?: string | null): string {
   if (!m) return '—'
   const s = String(m).trim().toLowerCase()
@@ -93,27 +60,20 @@ function formatTransportMode(m?: string | null): string {
   if (s === 'load_cargo') return 'Load Cargo'
   if (s.includes('trailer')) return 'Trailer Cargo'
   if (s.includes('load')) return 'Load Cargo'
-  // Fallback: replace underscores and title-case
   return s
-    .replace(/_/g, ' ')
-    .split(' ')
-    .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
-    .join(' ')
 }
 
-/**
- * AcceptModal
- *
- * Displays job summary and confirmation UI. Uses the provided `job` prop
- * as the source of truth and does NOT re-fetch from /rest/v1/job_offers.
- *
- * Clicking "Confirm" will immediately call onConfirm and there are no extra
- * UI steps after that. The button is disabled while the confirmation is in
- * progress to prevent duplicate actions.
- *
- * @param props AcceptModalProps
- * @returns JSX.Element | null
- */
+type TruckRow = {
+  id: string
+  name?: string | null
+  registration?: string | null
+  model_make?: string | null
+  model_model?: string | null
+  model_year?: number | null
+  model_max_load_kg?: number | null
+  created_at?: string | null
+}
+
 export default function AcceptModal({
   open,
   jobId,
@@ -121,18 +81,90 @@ export default function AcceptModal({
   onClose,
   onConfirm,
 }: AcceptModalProps) {
-  /**
-   * Local loading state to prevent double-clicks and indicate progress.
-   */
   const [confirming, setConfirming] = useState(false)
 
-  // Require modal open and a jobId (keeps behavior consistent with callers
-  // that provide both id and job). Avoids re-fetching which caused 404s.
+  const [trucks, setTrucks] = useState<Array<{ id: string; label: string }>>([])
+  const [selectedTruckId, setSelectedTruckId] = useState<string>('')
+  const [loadingTrucks, setLoadingTrucks] = useState(false)
+  const [localError, setLocalError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    let cancelled = false
+
+    setLocalError(null)
+    setSelectedTruckId('')
+    setTrucks([])
+    setLoadingTrucks(true)
+
+    ;(async () => {
+      try {
+        const session = await supabase.auth.getSession()
+        const authUserId = session.data.session?.user?.id ?? null
+        if (!authUserId) {
+          if (!cancelled) setLocalError('Please log in')
+          return
+        }
+
+        // Your user_trucks has BOTH owner_user_id and owner_user_auth_id.
+        // We try owner_user_auth_id first (most common), and if it returns 0 rows,
+        // fall back to owner_user_id.
+        const baseSelect =
+          'id,name,registration,model_make,model_model,model_year,model_max_load_kg,created_at'
+
+        const loadByField = async (field: 'owner_user_auth_id' | 'owner_user_id') => {
+          return await supabase
+            .from('user_trucks')
+            .select(baseSelect)
+            .eq(field, authUserId)
+            .order('created_at', { ascending: false })
+        }
+
+        // Try owner_user_auth_id first
+        let { data, error } = await loadByField('owner_user_auth_id')
+        if (error) throw error
+
+        // If none found, try owner_user_id
+        if (!data || data.length === 0) {
+          const res2 = await loadByField('owner_user_id')
+          if (res2.error) throw res2.error
+          data = res2.data as any
+        }
+
+        const rows = (data ?? []) as TruckRow[]
+
+        const mapped = rows.map((t) => {
+          const cap = t.model_max_load_kg != null ? `${formatNumber(Number(t.model_max_load_kg))} kg` : '—'
+          const makeModel = [t.model_make, t.model_model].filter(Boolean).join(' ')
+          const year = t.model_year ? String(t.model_year) : ''
+          const reg = t.registration ? `(${t.registration})` : ''
+          const nm = t.name ? t.name : `Truck ${String(t.id).slice(0, 8)}`
+          const desc = [makeModel, year].filter(Boolean).join(' ')
+          const label = `${nm} ${reg}${desc ? ` — ${desc}` : ''} | cap: ${cap}`
+
+          return { id: t.id, label }
+        })
+
+        if (!cancelled) {
+          setTrucks(mapped)
+          if (mapped.length === 1) setSelectedTruckId(mapped[0].id)
+        }
+      } catch (e: any) {
+        if (!cancelled) setLocalError(e?.message ?? 'Failed to load trucks')
+      } finally {
+        if (!cancelled) setLoadingTrucks(false)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
   if (!open || !jobId) return null
 
-  // Use the passed job (no fetch)
   const displayJob = job
-
   const mode = formatTransportMode(displayJob?.transport_mode ?? null)
 
   const reward =
@@ -140,33 +172,27 @@ export default function AcceptModal({
       ? displayJob?.reward_trailer_cargo ?? displayJob?.reward_load_cargo
       : displayJob?.reward_load_cargo ?? displayJob?.reward_trailer_cargo
 
-  const distance =
-    displayJob?.distance_km != null ? `${formatNumber(displayJob.distance_km)} km` : '—'
-
+  const distance = displayJob?.distance_km != null ? `${formatNumber(displayJob.distance_km)} km` : '—'
   const pickupFormatted = formatDateTime(displayJob?.pickup_time ?? null)
   const deliveryFormatted = formatDateTime(displayJob?.delivery_deadline ?? null)
 
-  /**
-   * handleConfirm
-   *
-   * Call the provided onConfirm handler and await it if it returns a Promise.
-   * Do not proceed to any other client-side steps here — the onConfirm handler
-   * is the final action and is responsible for updating parent state.
-   *
-   * If onConfirm throws, keep the modal open so the caller can surface an error.
-   */
   async function handleConfirm() {
     if (confirming) return
+
+    setLocalError(null)
+
+    if (!selectedTruckId) {
+      setLocalError('Please select a truck before accepting.')
+      return
+    }
+
     setConfirming(true)
     try {
-      await Promise.resolve(onConfirm())
-      // Do not call onClose here — parent will typically clear the acceptingJobId
-      // which unmounts this modal. If the parent does not, we still keep the modal
-      // open so the user can see results; closing is delegated to parent.
-    } catch (err) {
-      // swallow here; parent should set an error state that is visible on the page.
-      // We avoid automatically closing the modal on error.
+      await Promise.resolve(onConfirm(selectedTruckId))
+      onClose()
+    } catch (err: any) {
       console.error('AcceptModal onConfirm error', err)
+      setLocalError(err?.message ?? 'Accept failed')
     } finally {
       setConfirming(false)
     }
@@ -214,7 +240,36 @@ export default function AcceptModal({
           </div>
         </div>
 
-        <div className="flex justify-end gap-2">
+        <div className="mt-3">
+          <label className="block text-sm font-medium text-slate-700 mb-1">Select truck</label>
+
+          {loadingTrucks ? (
+            <div className="text-sm text-slate-500">Loading trucks…</div>
+          ) : trucks.length === 0 ? (
+            <div className="text-sm text-rose-600">No trucks found. Please add a truck first.</div>
+          ) : (
+            <select
+              className="w-full border rounded px-3 py-2 text-sm"
+              value={selectedTruckId}
+              onChange={(e) => setSelectedTruckId(e.target.value)}
+            >
+              <option value="">-- choose a truck --</option>
+              {trucks.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        {localError && (
+          <div className="mt-3 p-2 rounded bg-rose-50 border border-rose-100 text-rose-700 text-sm">
+            {localError}
+          </div>
+        )}
+
+        <div className="mt-4 flex justify-end gap-2">
           <button onClick={onClose} className="px-3 py-1 rounded border text-sm" disabled={confirming}>
             Cancel
           </button>

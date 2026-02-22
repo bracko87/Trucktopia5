@@ -7,7 +7,13 @@
  * - Keeps original layout and behavior.
  * - Normalizes country codes to lowercase throughout to avoid mismatches between
  *   hub resolution (which may return lowercase codes) and job data (which can be uppercase).
- * - Ensures filters.countries is set to the normalized hub country.
+ * - Ensures filters.country is set to the normalized hub country.
+ *
+ * Fix included:
+ * - Accepted jobs are hidden immediately AND stay hidden after refresh by:
+ *   1) Persisting accepted job ids in localStorage
+ *   2) Keeping them in React state (instant UI update)
+ *   3) Filtering them out inside filteredSortedJobs (render-time filtering)
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -99,20 +105,21 @@ function MarketPagination({
   )
 }
 
+/**
+ * pickStringJob
+ *
+ * Pick a human-friendly string from a related object.
+ */
 function pickStringJob(obj: any): string | null {
   if (!obj) return null
-  return (
-    obj.name ??
-    obj.title ??
-    obj.label ??
-    obj.display_name ??
-    obj.item_name ??
-    obj.type ??
-    obj.description ??
-    null
-  )
+  return obj.name ?? obj.title ?? obj.label ?? obj.display_name ?? obj.item_name ?? obj.type ?? obj.description ?? null
 }
 
+/**
+ * pickLogoJob
+ *
+ * Pick a likely logo/image url field from a related object.
+ */
 function pickLogoJob(obj: any): string | null {
   if (!obj) return null
   return obj.logo ?? obj.logo_url ?? obj.image_url ?? obj.icon_url ?? null
@@ -137,9 +144,7 @@ function shouldRetryWithoutRemainingPayload(status: number, bodyText: string): b
  */
 function stripRemainingPayloadFromEncodedSelect(encodedSelect: string): string {
   const decoded = decodeURIComponent(encodedSelect)
-  const cleaned = decoded
-    .replace(/,remaining_payload(?=,|$)/g, '')
-    .replace(/remaining_payload,(?=[^)]*$)/g, '')
+  const cleaned = decoded.replace(/,remaining_payload(?=,|$)/g, '').replace(/remaining_payload,(?=[^)]*$)/g, '')
   return encodeURIComponent(cleaned)
 }
 
@@ -157,8 +162,6 @@ async function fetchJobs(): Promise<JobRow[]> {
     'cargo_type_obj:cargo_type_id(*),' +
     'cargo_item_obj:cargo_item_id(*)'
 
-  // NOTE: remaining_payload does NOT need to be explicitly listed because `*` includes it when present.
-  // Explicitly listing it can break older views. We keep mapping fallback anyway.
   const fields = [
     'weight_kg',
     'volume_m3',
@@ -197,7 +200,6 @@ async function fetchJobs(): Promise<JobRow[]> {
     })
 
     let data: any[] = []
-
     if (!res.ok) {
       const txt = await res.text().catch(() => '')
       if (shouldRetryWithoutRemainingPayload(res.status, txt)) {
@@ -211,18 +213,14 @@ async function fetchJobs(): Promise<JobRow[]> {
         })
         if (!fallbackRes.ok) {
           const fallbackTxt = await fallbackRes.text().catch(() => '')
-          throw new Error(
-            `Failed to fetch jobs (page ${page}, offset ${offset}): ${fallbackRes.status} ${fallbackTxt}`
-          )
+          throw new Error(`Failed to fetch jobs (page ${page}, offset ${offset}): ${fallbackRes.status} ${fallbackTxt}`)
         }
         data = await fallbackRes.json().catch(() => [])
       } else {
-        throw new Error(
-          `Failed to fetch jobs (page ${page}, offset ${offset}): ${res.status} ${txt}`
-        )
+        throw new Error(`Failed to fetch jobs (page ${page}, offset ${offset}): ${res.status} ${txt}`)
       }
     } else {
-      data = await res.json().catch(() => [])
+      data = await res.json()
     }
 
     if (!Array.isArray(data) || data.length === 0) break
@@ -243,7 +241,6 @@ async function fetchJobs(): Promise<JobRow[]> {
         cargo_type: cargoTypeName ?? null,
         cargo_item: cargoItemName ?? null,
         weight_kg: j.weight_kg ?? null,
-        // ✅ always provide remaining_payload for UI + accept flow
         remaining_payload: j.remaining_payload ?? j.weight_kg ?? null,
         volume_m3: j.volume_m3 ?? null,
         pallets: j.pallets ?? null,
@@ -279,18 +276,13 @@ async function fetchJobs(): Promise<JobRow[]> {
 /**
  * resolveTruckPayloadCapacity
  *
- * Used by accept flow to calculate how much payload the selected truck can take.
+ * Query user_trucks for a single numeric capacity field (model_max_load_kg)
+ * and return it when available. Falls back to null on any error.
  */
-async function resolveTruckPayloadCapacity(
-  truckId: string | null | undefined,
-  authorization: string
-): Promise<number | null> {
+async function resolveTruckPayloadCapacity(truckId: string | null | undefined, authorization: string): Promise<number | null> {
   if (!truckId) return null
   try {
-    const url = `${MARKET_API_BASE}/rest/v1/user_trucks?id=eq.${encodeURIComponent(
-      truckId
-    )}&select=max_payload_kg,payload_kg,model:truck_model_id(max_load_kg)&limit=1`
-
+    const url = `${MARKET_API_BASE}/rest/v1/user_trucks?id=eq.${encodeURIComponent(truckId)}&select=model_max_load_kg&limit=1`
     const res = await fetch(url, {
       headers: {
         apikey: MARKET_SUPABASE_ANON_KEY,
@@ -298,206 +290,13 @@ async function resolveTruckPayloadCapacity(
       },
     })
     if (!res.ok) return null
-
     const rows = await res.json().catch(() => null)
     const row = Array.isArray(rows) ? rows[0] : null
-    const fromModel = Number((row?.model && row.model.max_load_kg) ?? NaN)
-    const fromTruck = Number(row?.max_payload_kg ?? row?.payload_kg ?? NaN)
-
-    if (Number.isFinite(fromModel) && fromModel > 0) return fromModel
-    if (Number.isFinite(fromTruck) && fromTruck > 0) return fromTruck
+    const cap = Number(row?.model_max_load_kg ?? NaN)
+    if (Number.isFinite(cap) && cap > 0) return cap
     return null
   } catch {
     return null
-  }
-}
-
-/**
- * fetchJobsForHub
- *
- * Not currently used by the page UI, but kept for future optimization.
- */
-export async function fetchJobsForHub(
-  country?: string | null,
-  city?: string | null
-): Promise<JobRow[]> {
-  const select =
-    '*,origin_city:origin_city_id(city_name,country_code),' +
-    'destination_city:destination_city_id(city_name,country_code),' +
-    'origin_company:origin_client_company_id(id,name,logo),' +
-    'destination_company:destination_client_company_id(id,name,logo),' +
-    'cargo_type_obj:cargo_type_id(*),' +
-    'cargo_item_obj:cargo_item_id(*)'
-
-  // do NOT list remaining_payload explicitly (older views may not have it)
-  const fields = [
-    'weight_kg',
-    'volume_m3',
-    'pallets',
-    'temperature_control',
-    'hazardous',
-    'special_requirements',
-    'currency',
-    'transport_mode',
-    'pickup_time',
-    'delivery_deadline',
-    'destination',
-    'job_offer_type_code',
-    'origin_city_id',
-    'destination_city_id',
-    'reward_trailer_cargo',
-    'reward_load_cargo',
-    'created_at',
-    'id',
-  ]
-
-  const encodedSelect = encodeURIComponent(select + ',' + fields.join(','))
-  const LIMIT = 500
-
-  try {
-    let cityIds: string[] = []
-
-    if (city) {
-      const cityName = String(city).trim()
-      if (cityName.length > 0) {
-        const citiesUrl = `${MARKET_API_BASE}/rest/v1/cities?select=id&city_name=eq.${encodeURIComponent(
-          cityName
-        )}&limit=1000`
-        const citiesRes = await fetch(citiesUrl, {
-          headers: {
-            apikey: MARKET_SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
-          },
-        })
-        if (!citiesRes.ok) {
-          const txt = await citiesRes.text().catch(() => '')
-          throw new Error(
-            `Failed to resolve cities for name "${cityName}": ${citiesRes.status} ${txt}`
-          )
-        }
-        const citiesData = await citiesRes.json().catch(() => [])
-        if (Array.isArray(citiesData) && citiesData.length > 0) {
-          cityIds = citiesData.map((r: any) => String(r.id)).filter(Boolean)
-        } else {
-          return []
-        }
-      }
-    } else if (country) {
-      const countryCode = String(country).trim()
-      if (countryCode.length > 0) {
-        const citiesUrl = `${MARKET_API_BASE}/rest/v1/cities?select=id&country_code=eq.${encodeURIComponent(
-          countryCode
-        )}&limit=1000`
-        const citiesRes = await fetch(citiesUrl, {
-          headers: {
-            apikey: MARKET_SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
-          },
-        })
-        if (!citiesRes.ok) {
-          const txt = await citiesRes.text().catch(() => '')
-          throw new Error(
-            `Failed to resolve cities for country "${countryCode}": ${citiesRes.status} ${txt}`
-          )
-        }
-        const citiesData = await citiesRes.json().catch(() => [])
-        if (Array.isArray(citiesData) && citiesData.length > 0) {
-          cityIds = citiesData.map((r: any) => String(r.id)).filter(Boolean)
-        } else {
-          return []
-        }
-      }
-    } else {
-      return []
-    }
-
-    if (cityIds.length === 0) return []
-
-    const idList = cityIds.join(',')
-    const orExpr = `(origin_city_id.in.(${idList}),destination_city_id.in.(${idList}))`
-
-    const url = `${MARKET_API_BASE}/rest/v1/active_job_offers_ui?select=${encodedSelect}&or=${encodeURIComponent(
-      orExpr
-    )}&limit=${LIMIT}`
-
-    const res = await fetch(url, {
-      headers: {
-        apikey: MARKET_SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
-      },
-    })
-
-    let data: any[] = []
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '')
-      if (shouldRetryWithoutRemainingPayload(res.status, txt)) {
-        const fallbackSelect = stripRemainingPayloadFromEncodedSelect(encodedSelect)
-        const fallbackUrl = `${MARKET_API_BASE}/rest/v1/active_job_offers_ui?select=${fallbackSelect}&or=${encodeURIComponent(
-          orExpr
-        )}&limit=${LIMIT}`
-        const fallbackRes = await fetch(fallbackUrl, {
-          headers: {
-            apikey: MARKET_SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${MARKET_SUPABASE_ANON_KEY}`,
-          },
-        })
-        if (!fallbackRes.ok) {
-          const fallbackTxt = await fallbackRes.text().catch(() => '')
-          throw new Error(`Failed to fetch hub jobs: ${fallbackRes.status} ${fallbackTxt}`)
-        }
-        data = await fallbackRes.json().catch(() => [])
-      } else {
-        throw new Error(`Failed to fetch hub jobs: ${res.status} ${txt}`)
-      }
-    } else {
-      data = await res.json().catch(() => [])
-    }
-
-    if (!Array.isArray(data)) return []
-
-    const mapped = (data as any[]).map((j) => {
-      const cargoTypeName = pickStringJob(j.cargo_type_obj)
-      const cargoItemName = pickStringJob(j.cargo_item_obj)
-
-      const originCompany = j.origin_company ?? null
-      const destinationCompany = j.destination_company ?? null
-
-      return {
-        ...j,
-        origin_city_name: j.origin_city?.city_name ?? null,
-        destination_city_name: j.destination_city?.city_name ?? null,
-        origin_country_code: j.origin_city?.country_code ?? null,
-        destination_country_code: j.destination_city?.country_code ?? null,
-        cargo_type: cargoTypeName ?? null,
-        cargo_item: cargoItemName ?? null,
-        weight_kg: j.weight_kg ?? null,
-        remaining_payload: j.remaining_payload ?? j.weight_kg ?? null,
-        volume_m3: j.volume_m3 ?? null,
-        pallets: j.pallets ?? null,
-        temperature_control: j.temperature_control ?? false,
-        hazardous: j.hazardous ?? false,
-        special_requirements: j.special_requirements ?? null,
-        currency: j.currency ?? null,
-        transport_mode: j.transport_mode ?? null,
-        origin_client_company_id: originCompany?.id ?? null,
-        origin_client_company_name: originCompany?.name ?? null,
-        origin_client_company_logo: pickLogoJob(originCompany),
-        destination_client_company_id: destinationCompany?.id ?? null,
-        destination_client_company_name: destinationCompany?.name ?? null,
-        destination_client_company_logo: pickLogoJob(destinationCompany),
-        reward_trailer_cargo: j.reward_trailer_cargo ?? null,
-        reward_load_cargo: j.reward_load_cargo ?? null,
-        job_offer_type_code: j.job_offer_type_code ?? null,
-        origin_city_id: j.origin_city_id ?? null,
-        destination_city_id: j.destination_city_id ?? null,
-        destination_text: j.destination ?? null,
-      } as JobRow
-    })
-
-    return mapped
-  } catch (err) {
-    console.warn('fetchJobsForHub failed, returning empty list:', err)
-    return []
   }
 }
 
@@ -530,6 +329,10 @@ export default function MarketPage(): JSX.Element {
   // Track whether a saved hub has been applied so auto hub resolution does not overwrite it.
   const [savedHubApplied, setSavedHubApplied] = useState(false)
 
+  // ✅ Hidden accepted jobs: keep in React state (instant UI update) + localStorage (persist)
+  const [hiddenMarketJobIds, setHiddenMarketJobIds] = useState<string[]>(() => readHiddenMarketJobIds())
+  const hiddenMarketSet = useMemo(() => new Set(hiddenMarketJobIds.map(String)), [hiddenMarketJobIds])
+
   useEffect(() => {
     console.log('AUTO COUNTRY:', preferredHubCountry)
   }, [preferredHubCountry])
@@ -543,8 +346,16 @@ export default function MarketPage(): JSX.Element {
       try {
         const data = await fetchJobs()
         if (!mounted) return
-        setJobs(data)
-        console.log('Loaded jobs:', Array.isArray(data) ? data.length : 0)
+
+        // ✅ refresh hidden state from localStorage (in case another tab accepted jobs)
+        const hiddenIds = readHiddenMarketJobIds()
+        setHiddenMarketJobIds(hiddenIds)
+
+        const hidden = new Set(hiddenIds.map(String))
+        const filtered = (Array.isArray(data) ? data : []).filter((j) => j?.id && !hidden.has(String(j.id)))
+
+        setJobs(filtered)
+        console.log('Loaded jobs (filtered):', filtered.length)
       } catch (err: any) {
         if (!mounted) return
         setError(err?.message ?? 'Failed to load jobs')
@@ -561,7 +372,6 @@ export default function MarketPage(): JSX.Element {
 
   useEffect(() => {
     let mounted = true
-
     if (!user) {
       setPreferredHubCity(null)
       setPreferredHubCountry(null)
@@ -570,6 +380,7 @@ export default function MarketPage(): JSX.Element {
       }
     }
 
+    // If the user already applied a saved hub during this session, do not auto-resolve.
     if (savedHubApplied) {
       return () => {
         mounted = false
@@ -578,6 +389,7 @@ export default function MarketPage(): JSX.Element {
 
     async function loadHub() {
       try {
+        // If the user explicitly saved a hub locally, apply it and skip auto resolution.
         try {
           const raw = localStorage.getItem('market_saved_hub')
           if (raw) {
@@ -592,18 +404,17 @@ export default function MarketPage(): JSX.Element {
               setFilters((prev) => ({
                 ...prev,
                 countries: savedCountry ? [savedCountry] : Array.isArray(prev.countries) ? prev.countries : [],
-                city: savedCity ?? prev.city ?? null,
+                city: savedCity ?? (prev as any).city ?? null,
               }))
               setSavedHubApplied(true)
               return
             }
           }
         } catch {
-          // ignore parse errors
+          // ignore parse errors and continue to auto-resolve
         }
 
         const hub = await fetchUserHub(user)
-        console.log('HUB RESULT:', hub)
         if (!mounted) return
 
         if (!hub) {
@@ -612,21 +423,8 @@ export default function MarketPage(): JSX.Element {
           return
         }
 
-        const city =
-          hub.city_name ??
-          hub.city ??
-          hub.hub_city ??
-          hub.cityName ??
-          hub.city_name ??
-          null
-
-        const country =
-          hub.country_code ??
-          hub.country ??
-          hub.hub_country ??
-          hub.countryCode ??
-          hub.country_code ??
-          null
+        const city = hub.city_name ?? hub.city ?? hub.hub_city ?? hub.cityName ?? null
+        const country = hub.country ?? hub.hub_country ?? hub.countryCode ?? hub.country_code ?? null
 
         const cityStr = city ? String(city).trim() : null
         const countryStr = country ? String(country).trim() : null
@@ -637,14 +435,11 @@ export default function MarketPage(): JSX.Element {
 
         setFilters((prev) => {
           const next = { ...prev } as MarketFilters & any
-
           if (resolvedCountry) {
             const prevList = Array.isArray(prev.countries) ? (prev.countries as string[]) : []
             const normPrev = prevList.map((c) => String(c ?? '').trim().toLowerCase())
-            if (!normPrev.includes(resolvedCountry)) next.countries = [resolvedCountry, ...prevList]
-            else next.countries = prevList
+            next.countries = normPrev.includes(resolvedCountry) ? prevList : [resolvedCountry, ...prevList]
           }
-
           if (cityStr) next.city = cityStr
           return next
         })
@@ -685,7 +480,6 @@ export default function MarketPage(): JSX.Element {
         if (on) entry.cities.add(on)
         map.set(code, entry)
       }
-
       if (dc) {
         const code = String(dc).trim().toLowerCase()
         const entry = map.get(code) ?? { code, name: code, cities: new Set<string>() }
@@ -705,13 +499,10 @@ export default function MarketPage(): JSX.Element {
     if (!preferredHubCity) return
     if (!countries || countries.length === 0) return
 
-    const hasCity = countries.some((c) =>
-      Array.isArray(c.cities) &&
-      c.cities.some((city) => city.toLowerCase() === preferredHubCity.toLowerCase())
-    )
+    const hasCity = countries.some((c) => Array.isArray(c.cities) && c.cities.some((city) => city.toLowerCase() === preferredHubCity.toLowerCase()))
     if (!hasCity) return
 
-    setFilters((prev) => {
+    setFilters((prev: any) => {
       if ((prev.city ?? '').toLowerCase() === preferredHubCity.toLowerCase()) return prev
       return { ...prev, city: preferredHubCity }
     })
@@ -728,7 +519,7 @@ export default function MarketPage(): JSX.Element {
       if (!savedCountry && !savedCity) return
       if (!countries || countries.length === 0) return
 
-      setFilters((prev) => ({
+      setFilters((prev: any) => ({
         ...prev,
         countries: savedCountry ? [savedCountry] : Array.isArray(prev.countries) ? prev.countries : [],
         city: savedCity ?? prev.city ?? null,
@@ -747,8 +538,11 @@ export default function MarketPage(): JSX.Element {
 
   const filteredSortedJobs = useMemo(() => {
     const out = jobs.filter((j) => {
+      // ✅ ALWAYS hide accepted ids at render-time
+      if (hiddenMarketSet.has(String(j.id))) return false
+
       const cityFilterSource =
-        (filters.city && String(filters.city).trim()) ||
+        ((filters as any).city && String((filters as any).city).trim()) ||
         (preferredHubCity && String(preferredHubCity).trim()) ||
         null
 
@@ -786,8 +580,7 @@ export default function MarketPage(): JSX.Element {
       }
 
       if (filters.cargoType !== 'all') {
-        if (((j.cargo_type ?? j.cargo_item ?? '') as string).toLowerCase() !== filters.cargoType.toLowerCase())
-          return false
+        if (((j.cargo_type ?? j.cargo_item ?? '') as string).toLowerCase() !== filters.cargoType.toLowerCase()) return false
       }
 
       return true
@@ -820,7 +613,7 @@ export default function MarketPage(): JSX.Element {
     }
 
     return out
-  }, [jobs, filters, preferredHubCity])
+  }, [jobs, filters, preferredHubCity, hiddenMarketSet])
 
   useEffect(() => {
     setPage(1)
@@ -848,13 +641,16 @@ export default function MarketPage(): JSX.Element {
 
     if (!user) {
       setActionError('Please log in')
-      setAcceptingJobId(null)
       throw new Error('Please log in')
+    }
+
+    if (!truckId) {
+      setActionError('Please select a truck before accepting.')
+      throw new Error('Missing truck id')
     }
 
     const jobId = acceptingJobId
     if (!jobId) {
-      setAcceptingJobId(null)
       throw new Error('Missing job id')
     }
 
@@ -870,10 +666,12 @@ export default function MarketPage(): JSX.Element {
 
       const selectedJob = jobs.find((j) => j.id === jobId) ?? null
       const remainingBefore = Number(selectedJob?.remaining_payload ?? selectedJob?.weight_kg ?? 0)
+
       const truckCapacity = await resolveTruckPayloadCapacity(truckId, authHeader)
       const thisRunPayload = Math.max(0, Math.min(remainingBefore, Number(truckCapacity ?? remainingBefore)))
       const remainingAfter = Math.max(0, remainingBefore - thisRunPayload)
 
+      // 1) Create assignment
       const assignRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
         method: 'POST',
         headers: {
@@ -886,10 +684,11 @@ export default function MarketPage(): JSX.Element {
           job_offer_id: jobId,
           carrier_company_id: carrierCompanyId,
           user_id: (user as any).id ?? null,
-          user_truck_id: truckId ?? null,
+          user_truck_id: truckId,
           status: 'assigned',
           accepted_at: new Date().toISOString(),
-          payload_this_run: thisRunPayload,
+          assigned_payload_kg: thisRunPayload,
+          payload_remaining_kg: remainingAfter,
         }),
       })
 
@@ -898,17 +697,19 @@ export default function MarketPage(): JSX.Element {
         throw new Error(txt)
       }
 
+      // 2) Close offer in DB
       const patchRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobId)}`, {
         method: 'PATCH',
         headers: {
           apikey: MARKET_SUPABASE_ANON_KEY,
           Authorization: authHeader,
           'Content-Type': 'application/json',
+          Prefer: 'return=representation',
         },
         body: JSON.stringify({
           remaining_payload: remainingAfter,
-          status: remainingAfter > 0 ? 'open' : 'assigned',
-          assigned_user_truck_id: remainingAfter > 0 ? null : truckId ?? null,
+          status: 'assigned',
+          assigned_user_truck_id: truckId,
         }),
       })
 
@@ -917,26 +718,21 @@ export default function MarketPage(): JSX.Element {
         throw new Error(txt)
       }
 
-      if (remainingAfter > 0) {
-        setJobs((prev) =>
-          prev.map((j) =>
-            j.id === jobId
-              ? { ...j, remaining_payload: remainingAfter, weight_kg: remainingAfter }
-              : j
-          )
-        )
-      } else {
-        setJobs((prev) => prev.filter((j) => j.id !== jobId))
-      }
+      // ✅ 3) Hide immediately + persist after refresh
+      addHiddenMarketJobId(jobId)
+      setHiddenMarketJobIds((prev) => (prev.includes(jobId) ? prev : [...prev, jobId]))
 
-      setSuccessMessage(remainingAfter > 0 ? 'Run assigned. Job still has remaining payload.' : 'Job accepted')
+      // 4) Remove from in-memory jobs list too
+      setJobs((prev) => prev.filter((j) => j.id !== jobId))
+
+      setSuccessMessage('Job accepted')
+      setAcceptingJobId(null)
       return
     } catch (err: any) {
       console.error('accept error', err)
       setActionError(err?.message ?? 'Accept failed')
       throw err
     } finally {
-      setAcceptingJobId(null)
       setTimeout(() => setSuccessMessage(null), 3000)
     }
   }
@@ -955,17 +751,10 @@ export default function MarketPage(): JSX.Element {
           <div className="flex items-center gap-3">
             <div className="hidden md:flex items-center gap-2 text-sm text-slate-600">
               <span>Results</span>
-              <div className="px-3 py-1 bg-slate-50 border border-slate-100 rounded text-sm font-medium">
-                {filteredSortedJobs.length}
-              </div>
+              <div className="px-3 py-1 bg-slate-50 border border-slate-100 rounded text-sm font-medium">{filteredSortedJobs.length}</div>
             </div>
 
-            <button
-              type="button"
-              className="md:hidden p-2 rounded bg-sky-600 text-white"
-              onClick={() => setMobileFiltersOpen(true)}
-              aria-label="Open filters"
-            >
+            <button type="button" className="md:hidden p-2 rounded bg-sky-600 text-white" onClick={() => setMobileFiltersOpen(true)} aria-label="Open filters">
               <Filter className="w-4 h-4" />
             </button>
           </div>
@@ -975,13 +764,7 @@ export default function MarketPage(): JSX.Element {
           <div>
             <h2 className="text-sm font-semibold mb-3">Filters</h2>
             <div className="bg-white p-4 rounded-md shadow-sm">
-              <FilterBar
-                key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}`}
-                filters={filters}
-                cargoTypes={cargoTypes}
-                countries={countries}
-                onChange={setFilters}
-              />
+              <FilterBar key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}`} filters={filters} cargoTypes={cargoTypes} countries={countries} onChange={setFilters} />
               <div className="mt-3 text-xs text-slate-500">Sort by reward, distance or deadline.</div>
               {preferredHubCity && (
                 <div className="mt-2 text-xs text-slate-600">
@@ -997,46 +780,30 @@ export default function MarketPage(): JSX.Element {
             <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
               <CountrySelect
                 countries={countries}
-                value={
-                  Array.isArray(filters.countries) && filters.countries.length > 0
-                    ? filters.countries[0]
-                    : preferredHubCountry ?? ''
-                }
+                value={Array.isArray(filters.countries) && filters.countries.length > 0 ? filters.countries[0] : preferredHubCountry ?? ''}
                 onChange={(code) => {
                   const next = code ? [code] : []
-                  setFilters((prev) => ({ ...prev, countries: next, city: null }))
+                  setFilters((prev: any) => ({ ...prev, countries: next, city: null }))
                 }}
               />
               <CitySelect
                 cities={(() => {
-                  const sel =
-                    (Array.isArray(filters.countries) && filters.countries.length > 0
-                      ? filters.countries[0]
-                      : preferredHubCountry) ?? ''
+                  const sel = (Array.isArray(filters.countries) && filters.countries.length > 0 ? filters.countries[0] : preferredHubCountry) ?? ''
                   const obj = countries.find((c) => c.code === String(sel).trim().toLowerCase())
                   return obj?.cities ?? []
                 })()}
-                value={filters.city ?? ''}
-                disabled={
-                  !(
-                    (Array.isArray(filters.countries) && filters.countries.length > 0) ||
-                    Boolean(preferredHubCountry)
-                  )
-                }
-                onChange={(c) => setFilters((prev) => ({ ...prev, city: c || null }))}
+                value={(filters as any).city ?? ''}
+                disabled={!((Array.isArray(filters.countries) && filters.countries.length > 0) || Boolean(preferredHubCountry))}
+                onChange={(c) => setFilters((prev: any) => ({ ...prev, city: c || null }))}
               />
             </div>
 
             <SavedHubControl
-              selectedCountry={
-                Array.isArray(filters.countries) && filters.countries.length > 0
-                  ? filters.countries[0]
-                  : preferredHubCountry ?? ''
-              }
-              selectedCity={filters.city ?? ''}
+              selectedCountry={Array.isArray(filters.countries) && filters.countries.length > 0 ? filters.countries[0] : preferredHubCountry ?? ''}
+              selectedCity={(filters as any).city ?? ''}
               onApply={(country, city) => {
                 const normCountry = country ? String(country).trim().toLowerCase() : ''
-                setFilters((prev) => ({
+                setFilters((prev: any) => ({
                   ...prev,
                   countries: normCountry ? [normCountry] : [],
                   city: city ?? null,
@@ -1068,7 +835,9 @@ export default function MarketPage(): JSX.Element {
           </div>
 
           <div className="flex items-center justify-between">
-            <div className="text-sm text-slate-600">Page {page} of {totalPages}</div>
+            <div className="text-sm text-slate-600">
+              Page {page} of {totalPages}
+            </div>
             <MarketPagination current={page} totalPages={totalPages} onChange={setPage} />
           </div>
         </section>
@@ -1083,13 +852,7 @@ export default function MarketPage(): JSX.Element {
                   Close
                 </button>
               </div>
-              <FilterBar
-                key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}-mobile`}
-                filters={filters}
-                cargoTypes={cargoTypes}
-                countries={countries}
-                onChange={setFilters}
-              />
+              <FilterBar key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}-mobile`} filters={filters} cargoTypes={cargoTypes} countries={countries} onChange={setFilters} />
             </div>
           </div>
         )}
@@ -1109,6 +872,42 @@ export default function MarketPage(): JSX.Element {
   )
 }
 
+/**
+ * Hidden market jobs helpers
+ *
+ * Persist a list of hidden/accepted job offer ids locally so accepted offers
+ * are immediately hidden client-side and remain hidden after refresh.
+ */
+const HIDDEN_MARKET_JOBS_KEY = 'market_hidden_job_offer_ids_v1'
+
+function readHiddenMarketJobIds(): string[] {
+  try {
+    if (typeof window === 'undefined') return []
+    const raw = localStorage.getItem(HIDDEN_MARKET_JOBS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(String) : []
+  } catch {
+    return []
+  }
+}
+
+function addHiddenMarketJobId(id: string) {
+  try {
+    if (typeof window === 'undefined') return
+    const existing = new Set(readHiddenMarketJobIds())
+    existing.add(String(id))
+    localStorage.setItem(HIDDEN_MARKET_JOBS_KEY, JSON.stringify(Array.from(existing)))
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * readFollowedIds
+ *
+ * Read followed job ids from localStorage.
+ */
 function readFollowedIds(): string[] {
   try {
     const s = localStorage.getItem('followed_job_offers')
@@ -1120,6 +919,11 @@ function readFollowedIds(): string[] {
   }
 }
 
+/**
+ * resolveCarrierCompanyId
+ *
+ * Resolve the carrier company id used for job assignment inserts.
+ */
 async function resolveCarrierCompanyId(
   user: { id?: string | null; company_id?: string | null } | null,
   truckId?: string | null,
@@ -1179,12 +983,17 @@ async function resolveCarrierCompanyId(
       }
     }
   } catch {
-    // ignore
+    // ignore and fall back to null
   }
 
   return null
 }
 
+/**
+ * fetchUserHub
+ *
+ * Try to obtain the user's main hub (city + country) from public.hubs or companies.
+ */
 async function fetchUserHub(user: { id: string; company_id?: string | null } | null) {
   if (!user) return null
   try {

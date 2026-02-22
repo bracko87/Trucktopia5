@@ -129,6 +129,18 @@ export async function fetchCompanyTrailers(companyId: string): Promise<any[]> {
  * @param row - raw DB row from fetchCompanyTrailers
  * @returns TrailerCardRow
  */
+/**
+ * Map raw DB row → TrailerCardRow consumed by the UI.
+ *
+ * Notes:
+ * - Prefer server-provided embedded relations when available:
+ *   - location_city (from cities) => row.location_city.city_name
+ *   - cargo_type (from cargo_types) => row.cargo_type.name
+ * - Preserve backward-compatible fallbacks when embeds are not present.
+ *
+ * @param row - raw DB row from fetchCompanyTrailers
+ * @returns TrailerCardRow
+ */
 export function mapTrailerRow(row: any): TrailerCardRow {
   // Normalize joined trailer_models which may be returned as an array (PostgREST) or object
   const model: TrailerModel | null = Array.isArray(row?.trailer_models)
@@ -153,11 +165,17 @@ export function mapTrailerRow(row: any): TrailerCardRow {
   } else if (row?.cargo_types) {
     cargoTypesJoined = Array.isArray(row.cargo_types) ? row.cargo_types[0] : row.cargo_types
   }
-  const cargoTypeName = cargoTypesJoined?.name ?? null
 
-  // Resolve joined cities (may be returned as array or object)
+  // Prefer an explicit top-level embedded cargo_type if present (returned by the new query)
+  const cargoTypeName = row?.cargo_type?.name ?? cargoTypesJoined?.name ?? null
+
+  // Resolve joined location city:
+  // Prefer explicit embedded location_city returned by the new query, fall back to older shapes.
   let locationCityName: string | null = null
-  if (row?.cities) {
+  if (row?.location_city) {
+    // expected shape: { id, city_name }
+    locationCityName = row.location_city?.city_name ?? null
+  } else if (row?.cities) {
     const c = Array.isArray(row.cities) ? row.cities[0] : row.cities
     locationCityName = c?.city_name ?? null
   } else if (row?.location_city_id) {

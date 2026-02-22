@@ -32,6 +32,8 @@ import WeatherBadge from './WeatherBadge'
  */
 export interface JobRow {
   id: string
+  remaining_payload?: number | null
+  remaining_payload?: number | null
   /** Prefer this for multi-run offers (remaining payload left on offer). */
   remaining_payload?: number | null
 
@@ -822,7 +824,7 @@ export default function JobCard({
   const transportMode = job.transport_mode ?? '—'
   const modeKey = normalizedTransportMode(transportMode)
 
-  // ✅ key fix: display remaining payload when present
+  // Display remaining payload when present (fallback to weight)
   const displayPayloadKg = getDisplayPayloadKg(job)
   const payload = formatPayload(displayPayloadKg)
 

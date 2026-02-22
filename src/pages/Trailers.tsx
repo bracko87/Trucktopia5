@@ -38,7 +38,7 @@ export default function TrailersPage(): JSX.Element {
 
     try {
       const qs = encodeURI(
-        `/rest/v1/user_trailers?select=*,trailer_models(*)&order=created_at.desc&limit=500`
+        `/rest/v1/user_trailers?select=*,trailer_models(*),location_city:cities(id,city_name),cargo_type:cargo_types(id,name)&order=created_at.desc&limit=500`
       )
 
       const res = await supabaseFetch(qs)
