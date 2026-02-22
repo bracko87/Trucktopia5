@@ -1,4 +1,3 @@
-
 /**
  * JobCard.tsx
  *
@@ -33,34 +32,44 @@ import WeatherBadge from './WeatherBadge'
  */
 export interface JobRow {
   id: string
+  /** Prefer this for multi-run offers (remaining payload left on offer). */
+  remaining_payload?: number | null
+
   origin_city_id?: string | null
   origin_city_name?: string | null
   origin_country_code?: string | null
   destination_city_id?: string | null
   destination_city_name?: string | null
   destination_country_code?: string | null
+
   cargo_type?: string | null
   cargo_item?: string | null
   distance_km?: number | null
+
   pickup_time?: string | null
   delivery_deadline?: string | null
+
   transport_mode?: string | null
   reward_trailer_cargo?: number | null
   reward_load_cargo?: number | null
+
   weight_kg?: number | null
   volume_m3?: number | null
   pallets?: number | null
+
   temperature_control?: boolean | null
   hazardous?: boolean | null
   requires_customs?: boolean | null
   special_requirements?: any | null
   currency?: string | null
+
   origin_client_company_id?: string | null
   origin_client_company_name?: string | null
   origin_client_company_logo?: string | null
   destination_client_company_id?: string | null
   destination_client_company_name?: string | null
   destination_client_company_logo?: string | null
+
   posted_by_user_name?: string | null
   status?: string | null
   job_offer_type_code?: string | null
@@ -68,14 +77,13 @@ export interface JobRow {
   driving_session_phase?: string | null
   computed_status?: string | null
   is_deadline_expired?: boolean | null
+
   /** pickup_ready - authoritative flag from server: now() >= pickup_time */
   pickup_ready?: boolean | null
 }
 
 /**
  * JobCardProps
- *
- * Props for the JobCard component.
  */
 export interface JobCardProps {
   job: JobRow
@@ -84,17 +92,10 @@ export interface JobCardProps {
   onCancel?: (job: JobRow) => void
   actionsVariant?: 'default' | 'my-jobs'
   variant?: 'default' | 'waiting' | 'active'
-  /** mode influences disabled behavior: 'market' keeps future pickups selectable */ 
+  /** mode influences disabled behavior: 'market' keeps future pickups selectable */
   mode?: 'market' | 'staging' | 'my-jobs' | 'default'
 }
 
-/**
- * smallDate
- *
- * Render a compact local date/time string or a placeholder.
- *
- * @param s - ISO date string
- */
 function smallDate(s?: string | null) {
   if (!s) return '—'
   const dt = new Date(s)
@@ -102,13 +103,6 @@ function smallDate(s?: string | null) {
   return dt.toLocaleString(undefined, { hour12: false })
 }
 
-/**
- * formatPayload
- *
- * Convert weight in kilograms to a friendly string in tonnes or kg.
- *
- * @param kg - weight in kilograms
- */
 function formatPayload(kg?: number | null) {
   if (kg === null || kg === undefined) return '—'
   if (kg >= 1000) {
@@ -119,13 +113,30 @@ function formatPayload(kg?: number | null) {
 }
 
 /**
- * SquareFlag
+ * getDisplayPayloadKg
  *
- * Presentational flag chip. Renders a normal rectangular flag instead of a
- * tightly cropped square so flags keep their natural aspect ratio and
- * look correct visually.
+ * Prefer authoritative remaining payload for multi-run offers.
+ * Fallback to original job weight for legacy/single-run rows.
  */
-function SquareFlag({ code, alt = '', size = 20 }: { code?: string | null; alt?: string; size?: number }) {
+function getDisplayPayloadKg(job: JobRow): number | null {
+  const remaining = Number(job.remaining_payload)
+  if (Number.isFinite(remaining) && remaining >= 0) return remaining
+
+  const weight = Number(job.weight_kg)
+  if (Number.isFinite(weight) && weight >= 0) return weight
+
+  return null
+}
+
+function SquareFlag({
+  code,
+  alt = '',
+  size = 20,
+}: {
+  code?: string | null
+  alt?: string
+  size?: number
+}) {
   const initialSrc = (() => {
     if (!code) return null
     const cc = String(code).trim().toLowerCase()
@@ -136,23 +147,16 @@ function SquareFlag({ code, alt = '', size = 20 }: { code?: string | null; alt?:
   const [src, setSrc] = useState<string | null>(initialSrc)
   const [triedAlternate, setTriedAlternate] = useState(false)
 
-  /**
-   * countryCodeToEmoji
-   *
-   * Fallback emoji rendering for country codes.
-   */
   function countryCodeToEmoji(code?: string | null) {
     if (!code) return '🌍'
     const cc = code.trim().toUpperCase()
     if (cc.length !== 2) return '🌍'
-    return cc.split('').map((c) => String.fromCodePoint(127397 + c.charCodeAt(0))).join('')
+    return cc
+      .split('')
+      .map((c) => String.fromCodePoint(127397 + c.charCodeAt(0)))
+      .join('')
   }
 
-  /**
-   * onImageError
-   *
-   * Try an alternate CDN on first failure, then fall back to emoji.
-   */
   function onImageError() {
     if (!triedAlternate && src) {
       const cc = String(code || '').trim().toLowerCase()
@@ -177,33 +181,60 @@ function SquareFlag({ code, alt = '', size = 20 }: { code?: string | null; alt?:
     >
       {src ? (
         // eslint-disable-next-line jsx-a11y/alt-text
-        <img src={src} className="w-full h-full object-cover block" onError={onImageError} />
+        <img
+          src={src}
+          className="w-full h-full object-cover block"
+          onError={onImageError}
+        />
       ) : (
-        <span style={{ fontSize: Math.max(10, Math.floor((size || 20) * 0.6)), lineHeight: 1 }}>{countryCodeToEmoji(code)}</span>
+        <span
+          style={{
+            fontSize: Math.max(10, Math.floor((size || 20) * 0.6)),
+            lineHeight: 1,
+          }}
+        >
+          {countryCodeToEmoji(code)}
+        </span>
       )}
     </div>
   )
 }
 
-/**
- * CompanyAvatar
- *
- * Display a circular company avatar with fallback initials.
- */
-function CompanyAvatar({ name, logoUrl, size = 36 }: { name?: string | null; logoUrl?: string | null; size?: number }) {
+function CompanyAvatar({
+  name,
+  logoUrl,
+  size = 36,
+}: {
+  name?: string | null
+  logoUrl?: string | null
+  size?: number
+}) {
   const [imgError, setImgError] = useState(false)
   const placeholder = name
     ? `https://pub-cdn.sider.ai/u/U0KAH9N4VLX/web-coder/6956ef545599fc8caeb3a137/resource/dd5233b6-ba87-488e-92c2-3b9305a9295b.jpg`
     : 'https://pub-cdn.sider.ai/u/U0KAH9N4VLX/web-coder/6956ef545599fc8caeb3a137/resource/daad456b-384d-4c94-a27e-75a47ffb2120.jpg'
   const src = logoUrl ?? placeholder
-  const initials = (name || 'C').split(/\s+/).map((s) => s[0]).slice(0, 2).join('').toUpperCase()
+  const initials = (name || 'C')
+    .split(/\s+/)
+    .map((s) => s[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase()
   const fontSize = Math.max(10, Math.floor(size * 0.4))
 
   return (
-    <div className="rounded-full overflow-hidden bg-white border border-slate-100 shadow-sm flex items-center justify-center" style={{ width: size, height: size }} title={name || 'Company'}>
+    <div
+      className="rounded-full overflow-hidden bg-white border border-slate-100 shadow-sm flex items-center justify-center"
+      style={{ width: size, height: size }}
+      title={name || 'Company'}
+    >
       {!imgError && src ? (
         // eslint-disable-next-line jsx-a11y/alt-text
-        <img src={src} className="w-full h-full object-cover block" onError={() => setImgError(true)} />
+        <img
+          src={src}
+          className="w-full h-full object-cover block"
+          onError={() => setImgError(true)}
+        />
       ) : (
         <span style={{ fontSize, lineHeight: 1 }} className="text-slate-700 font-semibold">
           {initials}
@@ -213,11 +244,6 @@ function CompanyAvatar({ name, logoUrl, size = 36 }: { name?: string | null; log
   )
 }
 
-/**
- * normalizedTransportMode
- *
- * Normalize a transport_mode string into 'load' | 'trailer' | 'unknown'.
- */
 function normalizedTransportMode(m?: string | null): 'load' | 'trailer' | 'unknown' {
   if (!m) return 'unknown'
   const s = String(m).toLowerCase()
@@ -227,39 +253,12 @@ function normalizedTransportMode(m?: string | null): 'load' | 'trailer' | 'unkno
   return 'unknown'
 }
 
-/**
- * formatDistance
- *
- * Format distance in km into a user-friendly string.
- */
 function formatDistance(km?: number | null) {
   if (km === null || km === undefined) return '—'
   if (Number.isNaN(Number(km))) return '—'
   return `${Math.round(km)} km`
 }
 
-/**
- * openCityModal
- *
- * Dispatch a global event to open the City modal. Accepts optional cityId and/or cityName.
- *
- * @param cityId - optional UUID of the city
- * @param cityName - optional human-friendly city name
- */
-function openCityModal(cityId?: string | null, cityName?: string | null) {
-  try {
-    window.dispatchEvent(new CustomEvent('open-city-modal', { detail: { cityId, cityName } }))
-  } catch {
-    // ignore non-browser environments
-  }
-}
-
-/**
- * PHASE_LABELS_SHORT
- *
- * Map technical DB phase values to short, user-friendly badge labels.
- * Keep DB values untouched; map only in UI.
- */
 const PHASE_LABELS_SHORT: Record<string, string> = {
   TO_PICKUP: 'Picking up',
   PICKING_LOAD: 'Picking up',
@@ -274,13 +273,6 @@ const PHASE_LABELS_SHORT: Record<string, string> = {
   'TO DELIVERY': 'Delivering',
 }
 
-/**
- * StatusBadge
- *
- * Small presentational badge showing assignment status with color coding.
- *
- * @param props.status - raw status/phase string
- */
 function StatusBadge({ status }: { status?: string | null }) {
   const raw = String(status ?? '').trim()
   const transformedKey = raw
@@ -291,13 +283,15 @@ function StatusBadge({ status }: { status?: string | null }) {
         .replace(/__+/g, '_')
     : 'ASSIGNED'
 
-  const label = PHASE_LABELS_SHORT[transformedKey] ?? (() => {
-    const human = transformedKey.replace(/_/g, ' ').toLowerCase()
-    return human
-      .split(' ')
-      .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
-      .join(' ')
-  })()
+  const label =
+    PHASE_LABELS_SHORT[transformedKey] ??
+    (() => {
+      const human = transformedKey.replace(/_/g, ' ').toLowerCase()
+      return human
+        .split(' ')
+        .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
+        .join(' ')
+    })()
 
   const styles: Record<string, string> = {
     ASSIGNED: 'bg-blue-100 text-blue-700',
@@ -322,13 +316,6 @@ function StatusBadge({ status }: { status?: string | null }) {
   )
 }
 
-/**
- * TopRouteRow
- *
- * Compact summary row with origin -> destination, primary reward and chevron.
- *
- * Accepts pickupReady which is authoritative when provided by the server.
- */
 function TopRouteRow({
   origin,
   originCode,
@@ -374,7 +361,6 @@ function TopRouteRow({
   pickupReady?: boolean | null
   disabled?: boolean
 }) {
-  // If pickupReady not provided by API, fall back to local time comparison.
   const pickupReadyComputed = (() => {
     if (typeof pickupReady === 'boolean') return pickupReady
     if (!pickup) return false
@@ -404,8 +390,8 @@ function TopRouteRow({
     variant === 'waiting'
       ? 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-sky-50 to-white/80 border border-sky-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-sky-200'
       : variant === 'active'
-      ? 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-emerald-50 to-white/80 border border-emerald-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-200'
-      : 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-amber-50 to-white/80 border border-amber-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-200'
+        ? 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-emerald-50 to-white/80 border border-emerald-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-200'
+        : 'w-full rounded-lg px-4 py-3 bg-gradient-to-br from-amber-50 to-white/80 border border-amber-100 flex items-center gap-4 cursor-pointer focus:outline-none focus:ring-2 focus:ring-amber-200'
 
   const topRowClass = `${topRowBase} ${disabled ? 'opacity-70 filter grayscale cursor-not-allowed' : ''}`
 
@@ -443,13 +429,15 @@ function TopRouteRow({
           </div>
 
           <div className="ml-auto text-right flex items-center gap-3">
-            {/* Status badge shown before price */}
             <StatusBadge status={assignmentStatus} />
 
-            {/* Use Currency formatter on My Jobs to show symbol; keep PricePill otherwise. */}
             {actionsVariant === 'my-jobs' ? (
               <div aria-hidden>
-                <Currency value={primaryReward ?? 0} currency={currency ?? 'USD'} className="text-slate-900 text-lg font-semibold" />
+                <Currency
+                  value={primaryReward ?? 0}
+                  currency={currency ?? 'USD'}
+                  className="text-slate-900 text-lg font-semibold"
+                />
               </div>
             ) : (
               <PricePill amount={primaryReward} currency={currency ?? undefined} />
@@ -502,12 +490,16 @@ function TopRouteRow({
 
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
             <Clock className="w-3 h-3 text-slate-500" />
-            <span className={`${pickupReadyFinal ? 'font-bold text-emerald-700' : 'font-bold text-rose-600'}`}>Pickup: {smallDate(pickup)}</span>
+            <span className={`${pickupReadyFinal ? 'font-bold text-emerald-700' : 'font-bold text-rose-600'}`}>
+              Pickup: {smallDate(pickup)}
+            </span>
           </div>
 
           <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-white border border-slate-100 text-slate-600 shadow-sm">
             <Clock className="w-3 h-3 text-slate-500" />
-            <span className={isDeadlineExpired ? 'text-rose-600 font-semibold' : ''}>Deadline: {smallDate(deadline)}</span>
+            <span className={isDeadlineExpired ? 'text-rose-600 font-semibold' : ''}>
+              Deadline: {smallDate(deadline)}
+            </span>
           </div>
         </div>
       </div>
@@ -515,11 +507,6 @@ function TopRouteRow({
   )
 }
 
-/**
- * MetaBox
- *
- * Center-bottom box showing pickup, deadline and tags inside expanded area.
- */
 function MetaBox({
   pickup,
   deadline,
@@ -568,7 +555,9 @@ function MetaBox({
             </div>
             <div>
               <div className="text-xs text-slate-500">Deadline</div>
-              <div className={isExpired ? 'text-rose-600 font-semibold text-sm' : 'text-sm text-slate-800'}>{smallDate(deadline)}</div>
+              <div className={isExpired ? 'text-rose-600 font-semibold text-sm' : 'text-sm text-slate-800'}>
+                {smallDate(deadline)}
+              </div>
             </div>
           </div>
         </div>
@@ -599,7 +588,11 @@ function MetaBox({
         </div>
 
         <div className="mt-2 flex items-center gap-2">
-          {hazardous && <span className="px-2 py-0.5 rounded-full bg-rose-50 border border-rose-100 text-rose-700 text-xs">Hazardous</span>}
+          {hazardous && (
+            <span className="px-2 py-0.5 rounded-full bg-rose-50 border border-rose-100 text-rose-700 text-xs">
+              Hazardous
+            </span>
+          )}
         </div>
 
         {special_requirements && (
@@ -613,15 +606,6 @@ function MetaBox({
   )
 }
 
-/**
- * RewardsBox
- *
- * Two-column rewards / insights box used in JobCard expanded view.
- *
- * onAccept is a simple void callback that triggers parent accept flow.
- * The actions area can be controlled with actionsVariant to allow page-specific
- * buttons (for example My Jobs shows only Cancel Load).
- */
 function RewardsBox({
   trailer,
   load,
@@ -644,24 +628,19 @@ function RewardsBox({
   disabled?: boolean
 }) {
   let primary = 0
-  let primaryLabel = 'Total'
-
-  if (modeKey === 'load') {
-    primary = load
-    primaryLabel = 'Load'
-  } else if (modeKey === 'trailer') {
-    primary = trailer
-    primaryLabel = 'Trailer'
-  } else {
-    primary = Math.max(trailer, load)
-    primaryLabel = load >= trailer ? 'Load' : 'Trailer'
-  }
+  if (modeKey === 'load') primary = load
+  else if (modeKey === 'trailer') primary = trailer
+  else primary = Math.max(trailer, load)
 
   function inferHandicaps(): string[] {
     const out: string[] = []
     try {
       const req = job.special_requirements
-      const s = req ? (typeof req === 'string' ? req.toLowerCase() : JSON.stringify(req).toLowerCase()) : ''
+      const s = req
+        ? typeof req === 'string'
+          ? req.toLowerCase()
+          : JSON.stringify(req).toLowerCase()
+        : ''
       if (s.includes('city') || s.includes('urban') || s.includes('downtown')) out.push('City drive')
       if (s.includes('narrow') || s.includes('low bridge') || s.includes('restricted')) out.push('Narrow access')
       if (s.includes('toll') || s.includes('tolls')) out.push('Tolls')
@@ -736,7 +715,10 @@ function RewardsBox({
               <div className="text-xs text-slate-500 mb-1">Advantages</div>
               <div className="flex flex-wrap gap-2">
                 {advantages.map((a) => (
-                  <span key={a} className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-700 text-xs shadow-sm">
+                  <span
+                    key={a}
+                    className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-700 text-xs shadow-sm"
+                  >
                     {a}
                   </span>
                 ))}
@@ -749,7 +731,10 @@ function RewardsBox({
               <div className="text-xs text-slate-500 mb-1">Disadvantages</div>
               <div className="flex flex-wrap gap-2">
                 {handicaps.map((h) => (
-                  <span key={h} className="px-2 py-0.5 rounded-full bg-rose-50 border border-rose-100 text-rose-700 text-xs shadow-sm">
+                  <span
+                    key={h}
+                    className="px-2 py-0.5 rounded-full bg-rose-50 border border-rose-100 text-rose-700 text-xs shadow-sm"
+                  >
                     {h}
                   </span>
                 ))}
@@ -763,7 +748,6 @@ function RewardsBox({
         <div className="w-full mt-2 flex items-baseline justify-between">
           <div className="text-sm text-slate-500">Total</div>
 
-          {/* Use Currency formatter on My Jobs to show symbol; keep PricePill otherwise. */}
           {actionsVariant === 'my-jobs' ? (
             <Currency value={primary} currency={job.currency ?? 'USD'} className="text-slate-900 text-lg font-semibold" />
           ) : (
@@ -779,7 +763,9 @@ function RewardsBox({
                 type="button"
                 onClick={() => onCancel?.()}
                 disabled={disabled}
-                className={`px-4 py-2 rounded-md text-white text-sm transition shadow ${disabled ? 'bg-rose-300 cursor-not-allowed opacity-60' : 'bg-rose-600 hover:bg-rose-700'}`}
+                className={`px-4 py-2 rounded-md text-white text-sm transition shadow ${
+                  disabled ? 'bg-rose-300 cursor-not-allowed opacity-60' : 'bg-rose-600 hover:bg-rose-700'
+                }`}
               >
                 Cancel Load
               </button>
@@ -801,7 +787,9 @@ function RewardsBox({
                   onAccept()
                 }}
                 disabled={disabled}
-                className={`px-4 py-2 rounded-md text-sm transition shadow ${disabled ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-70' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+                className={`px-4 py-2 rounded-md text-sm transition shadow ${
+                  disabled ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-70' : 'bg-sky-600 text-white hover:bg-sky-700'
+                }`}
               >
                 Accept
               </button>
@@ -816,15 +804,16 @@ function RewardsBox({
 
 /**
  * JobCard
- *
- * Exported component that composes the small summary and the expanded details.
- *
- * Behavior note:
- * - The component uses job.pickup_ready (if present) to decide whether the job
- *   is currently assignable. When not assignable the card is visually muted
- *   and assignment buttons are disabled.
  */
-export default function JobCard({ job, onView, onAccept, onCancel, variant = 'default', actionsVariant = 'default', mode = undefined }: JobCardProps) {
+export default function JobCard({
+  job,
+  onView,
+  onAccept,
+  onCancel,
+  variant = 'default',
+  actionsVariant = 'default',
+  mode = undefined,
+}: JobCardProps) {
   const [expanded, setExpanded] = useState(false)
 
   const rewardTrailer = job.reward_trailer_cargo ?? 0
@@ -832,7 +821,11 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
   const cargoLabel = job.cargo_type ?? job.cargo_item ?? 'Cargo'
   const transportMode = job.transport_mode ?? '—'
   const modeKey = normalizedTransportMode(transportMode)
-  const payload = formatPayload(job.weight_kg)
+
+  // ✅ key fix: display remaining payload when present
+  const displayPayloadKg = getDisplayPayloadKg(job)
+  const payload = formatPayload(displayPayloadKg)
+
   const cargoType = job.cargo_type ?? job.cargo_item ?? null
 
   let primaryReward = 0
@@ -845,11 +838,6 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
   const [selectedCompanyName, setSelectedCompanyName] = useState<string | null>(null)
   const [selectedCompanyLogo, setSelectedCompanyLogo] = useState<string | null>(null)
 
-  /**
-   * openCompanyModal
-   *
-   * Open the company profile modal with the provided company info.
-   */
   function openCompanyModal(id?: string | null, name?: string | null, logo?: string | null) {
     setSelectedCompanyId(id ?? null)
     setSelectedCompanyName(name ?? null)
@@ -861,32 +849,22 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
     setCompanyModalOpen(false)
   }
 
-  /**
-   * Determine the authoritative status/phase string for the badge.
-   *
-   * Preference order:
-   * 1) driving_session_phase (authoritative when present)
-   * 2) job.status (database assignment/job status)
-   * 3) job.assignment_status (legacy)
-   * 4) job.computed_status (normalized string provided by pages)
-   */
-  const authoritativePhase = (job.driving_session_phase ?? job.status ?? job.assignment_status ?? job.computed_status ?? 'ASSIGNED') as string
+  const authoritativePhase = (job.driving_session_phase ??
+    job.status ??
+    job.assignment_status ??
+    job.computed_status ??
+    'ASSIGNED') as string
 
-  /**
-   * Determine pickup readiness and disabled state.
-   *
-   * Jobs are only disabled (grayed out / unassignable) when pickup time is in the future
-   * AND the card is rendered in a context that requires readiness (staging or my-jobs).
-   * The Market keeps jobs selectable even if pickup is in the future.
-   */
-  const pickupReady = typeof job.pickup_ready === 'boolean' ? job.pickup_ready : (() => {
-    if (!job.pickup_time) return false
-    const t = new Date(String(job.pickup_time)).getTime()
-    if (Number.isNaN(t)) return false
-    return Date.now() >= t
-  })()
+  const pickupReady =
+    typeof job.pickup_ready === 'boolean'
+      ? job.pickup_ready
+      : (() => {
+          if (!job.pickup_time) return false
+          const t = new Date(String(job.pickup_time)).getTime()
+          if (Number.isNaN(t)) return false
+          return Date.now() >= t
+        })()
 
-  // Determine render mode: explicit prop overrides, otherwise infer from actionsVariant.
   const effectiveMode: 'market' | 'staging' | 'my-jobs' | 'default' =
     (mode as any) ?? (actionsVariant === 'my-jobs' ? 'my-jobs' : 'market')
 
@@ -895,8 +873,10 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
   return (
     <article
       aria-labelledby={`job-${job.id}-title`}
-      data-jobcard-version="v3-cargo-payload-company-v2"
-      className={`group rounded-xl border border-slate-100 shadow-sm hover:shadow-lg transition-shadow duration-150 p-3 bg-white ${disabled ? 'opacity-75 filter grayscale' : ''}`}
+      data-jobcard-version="v3-cargo-payload-company-v3"
+      className={`group rounded-xl border border-slate-100 shadow-sm hover:shadow-lg transition-shadow duration-150 p-3 bg-white ${
+        disabled ? 'opacity-75 filter grayscale' : ''
+      }`}
       aria-disabled={disabled}
       role="article"
     >
@@ -926,7 +906,12 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
         />
       </div>
 
-      <div className={`overflow-hidden transition-[max-height,opacity] duration-300 ${expanded ? 'max-h-96 opacity-100' : 'max-h-0 opacity-0'}`} aria-hidden={!expanded}>
+      <div
+        className={`overflow-hidden transition-[max-height,opacity] duration-300 ${
+          expanded ? 'max-h-96 opacity-100' : 'max-h-0 opacity-0'
+        }`}
+        aria-hidden={!expanded}
+      >
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
           <div className="rounded-lg p-4 bg-white border border-slate-100 shadow-sm h-full flex flex-col justify-between">
             <div className="min-w-0">
@@ -950,7 +935,13 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
               {job.origin_client_company_name && (
                 <button
                   type="button"
-                  onClick={() => openCompanyModal(job.origin_client_company_id, job.origin_client_company_name, job.origin_client_company_logo ?? undefined)}
+                  onClick={() =>
+                    openCompanyModal(
+                      job.origin_client_company_id,
+                      job.origin_client_company_name,
+                      job.origin_client_company_logo ?? undefined
+                    )
+                  }
                   className="flex items-center gap-3 w-full text-left p-0"
                   aria-label={`Open profile for ${job.origin_client_company_name}`}
                 >
@@ -965,11 +956,21 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
               {job.destination_client_company_name && (
                 <button
                   type="button"
-                  onClick={() => openCompanyModal(job.destination_client_company_id, job.destination_client_company_name, job.destination_client_company_logo ?? undefined)}
+                  onClick={() =>
+                    openCompanyModal(
+                      job.destination_client_company_id,
+                      job.destination_client_company_name,
+                      job.destination_client_company_logo ?? undefined
+                    )
+                  }
                   className="flex items-center gap-3 w-full text-left p-0"
                   aria-label={`Open profile for ${job.destination_client_company_name}`}
                 >
-                  <CompanyAvatar name={job.destination_client_company_name} logoUrl={job.destination_client_company_logo} size={56} />
+                  <CompanyAvatar
+                    name={job.destination_client_company_name}
+                    logoUrl={job.destination_client_company_logo}
+                    size={56}
+                  />
                   <div className="min-w-0">
                     <div className="text-xs text-slate-500">Destination client</div>
                     <div className="text-sm font-medium truncate">{job.destination_client_company_name}</div>
@@ -984,7 +985,8 @@ export default function JobCard({ job, onView, onAccept, onCancel, variant = 'de
               pickup={job.pickup_time}
               deadline={job.delivery_deadline}
               item={job.cargo_item}
-              weight_kg={job.weight_kg}
+              // ✅ key fix: use remaining payload for weight display
+              weight_kg={displayPayloadKg}
               volume_m3={job.volume_m3}
               pallets={job.pallets}
               temperature_control={job.temperature_control}
