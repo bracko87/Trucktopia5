@@ -1,39 +1,60 @@
 /**
- * AcceptModal.tsx
+ * src/components/market/AcceptModal.tsx
  *
- * Confirmation modal shown when accepting a job.
+ * Presentational confirmation modal used when accepting a job.
+ * - Simplified: no truck selector UI. Truck resolution is performed in the Market page.
+ * - onConfirm is a no-argument callback: () => Promise<void> | void
  *
- * This variant uses the job prop passed by the caller (no fetch) and formats
- * pickup/delivery timestamps to DD-MM-YYYY HH:MM:SS. Headline labels are rendered
- * in bold for better emphasis. Transport mode values are normalized to friendly
- * text (e.g. "trailer_cargo" -> "Trailer Cargo", "load_cargo" -> "Load Cargo").
- *
- * Added behavior:
- * - Loads candidate trucks on open and requires a truck selection before confirming.
- * - Resolves trucks using multiple ownership filters (auth user + public user + company)
- *   to avoid false "No trucks found" states in manager/company accounts.
- * - Shows local errors (login/truck load/accept failure) without closing the modal.
+ * Notes:
+ * - Keeps formatting helpers and local error/confirming state.
+ * - The modal shows job summary + Confirm/Cancel buttons only.
  */
 
-import React, { useState, useEffect } from 'react'
+import React, { useState } from 'react'
 import type { JobRow } from './JobCard'
-import { supabase } from '../../lib/supabase'
 import { useAuth } from '../../context/AuthContext'
 
+/**
+ * AcceptModalProps
+ *
+ * Props for the AcceptModal component.
+ */
 export interface AcceptModalProps {
   open: boolean
   jobId: string | null
   job: JobRow | null
   onClose: () => void
-  onConfirm: (truckId?: string) => Promise<void> | void
+  /**
+   * onConfirm
+   *
+   * No-argument confirm callback. Truck resolution / selection is performed by
+   * the caller (Market page). The modal only confirms the action.
+   */
+  onConfirm: () => Promise<void> | void
 }
 
+/**
+ * formatNumber
+ *
+ * Pretty-format small numbers for UI.
+ *
+ * @param n numeric value
+ * @returns formatted string
+ */
 function formatNumber(n: number | null | undefined): string {
   if (n == null || Number.isNaN(n)) return '—'
   if (Math.abs(n) >= 1000) return `${Math.round(n).toLocaleString()}`
-  return n.toString()
+  return String(n)
 }
 
+/**
+ * formatDateTime
+ *
+ * Convert ISO timestamp to DD-MM-YYYY HH:MM:SS or '—' when invalid.
+ *
+ * @param iso ISO datetime string
+ * @returns formatted datetime or placeholder
+ */
 function formatDateTime(iso?: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
@@ -50,6 +71,14 @@ function formatDateTime(iso?: string | null): string {
   return `${day}-${month}-${year} ${hours}:${minutes}:${seconds}`
 }
 
+/**
+ * formatTransportMode
+ *
+ * Human-friendly transport mode label.
+ *
+ * @param m transport mode string
+ * @returns pretty label
+ */
 function formatTransportMode(m?: string | null): string {
   if (!m) return '—'
   const s = String(m).trim().toLowerCase()
@@ -60,18 +89,13 @@ function formatTransportMode(m?: string | null): string {
   return s
 }
 
-type TruckRow = {
-  id: string
-  name?: string | null
-  registration?: string | null
-  model_make?: string | null
-  model_model?: string | null
-  model_year?: number | null
-  model_max_load_kg?: number | null
-  status?: string | null
-  created_at?: string | null
-}
-
+/**
+ * AcceptModal
+ *
+ * Presentational confirmation modal used when accepting a job. Truck selection
+ * is intentionally absent; the caller resolves the truck before calling the
+ * accept RPC. On success this modal closes; on failure it shows a local error.
+ */
 export default function AcceptModal({
   open,
   jobId,
@@ -81,105 +105,7 @@ export default function AcceptModal({
 }: AcceptModalProps) {
   const { user } = useAuth()
   const [confirming, setConfirming] = useState(false)
-
-  const [trucks, setTrucks] = useState<Array<{ id: string; label: string }>>([])
-  const [selectedTruckId, setSelectedTruckId] = useState<string>('')
-  const [loadingTrucks, setLoadingTrucks] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (!open) return
-
-    let cancelled = false
-
-    setLocalError(null)
-    setSelectedTruckId('')
-    setTrucks([])
-    setLoadingTrucks(true)
-
-    ;(async () => {
-      try {
-        const session = await supabase.auth.getSession()
-        const authUserId = session.data.session?.user?.id ?? null
-        if (!authUserId) {
-          if (!cancelled) setLocalError('Please log in')
-          return
-        }
-
-        const baseSelect = 'id,name,registration,model_make,model_model,model_year,model_max_load_kg,status,created_at,owner_user_auth_id,owner_user_id,owner_company_id'
-
-        const tryLoad = async (field: string, value: string | null | undefined) => {
-          if (!value) return [] as TruckRow[]
-          const { data, error } = await supabase
-            .from('user_trucks')
-            .select(baseSelect)
-            .eq(field, value)
-            .order('created_at', { ascending: false })
-
-          if (error) return []
-          return (data ?? []) as TruckRow[]
-        }
-
-        const publicUserByAuth = await supabase
-          .from('users')
-          .select('id,company_id')
-          .eq('auth_user_id', authUserId)
-          .limit(1)
-          .maybeSingle()
-
-        const publicUserId = publicUserByAuth.data?.id ? String(publicUserByAuth.data.id) : null
-        const resolvedCompanyId =
-          (user as any)?.company_id ??
-          (publicUserByAuth.data?.company_id ? String(publicUserByAuth.data.company_id) : null)
-
-        const buckets = await Promise.all([
-          tryLoad('owner_user_auth_id', authUserId),
-          tryLoad('owner_user_id', authUserId),
-          tryLoad('owner_user_id', publicUserId),
-          tryLoad('owner_company_id', resolvedCompanyId),
-        ])
-
-        const mergedById = new Map<string, TruckRow>()
-        for (const rows of buckets) {
-          for (const t of rows) {
-            if (!t?.id) continue
-            if (!mergedById.has(String(t.id))) mergedById.set(String(t.id), t)
-          }
-        }
-
-        const rows = Array.from(mergedById.values())
-
-        const mapped = rows.map((t) => {
-          const cap = t.model_max_load_kg != null ? `${formatNumber(Number(t.model_max_load_kg))} kg` : '—'
-          const makeModel = [t.model_make, t.model_model].filter(Boolean).join(' ')
-          const year = t.model_year ? String(t.model_year) : ''
-          const reg = t.registration ? `(${t.registration})` : ''
-          const status = t.status ? String(t.status) : 'unknown'
-          const nm = t.name ? t.name : `Truck ${String(t.id).slice(0, 8)}`
-          const desc = [makeModel, year].filter(Boolean).join(' ')
-          const label = `${nm} ${reg}${desc ? ` — ${desc}` : ''} | cap: ${cap} | ${status}`
-
-          return { id: t.id, label }
-        })
-
-        if (!cancelled) {
-          setTrucks(mapped)
-          if (mapped.length > 0) setSelectedTruckId(mapped[0].id)
-          if (mapped.length === 0) {
-            setLocalError('No trucks available for your account/company. Check truck ownership/company mapping and truck status.')
-          }
-        }
-      } catch (e: any) {
-        if (!cancelled) setLocalError(e?.message ?? 'Failed to load trucks')
-      } finally {
-        if (!cancelled) setLoadingTrucks(false)
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [open, user])
 
   if (!open || !jobId) return null
 
@@ -195,19 +121,19 @@ export default function AcceptModal({
   const pickupFormatted = formatDateTime(displayJob?.pickup_time ?? null)
   const deliveryFormatted = formatDateTime(displayJob?.delivery_deadline ?? null)
 
+  /**
+   * handleConfirm
+   *
+   * Call the caller-provided onConfirm (no args). Keep confirming state and
+   * surface any thrown error as a local error message without closing modal.
+   */
   async function handleConfirm() {
     if (confirming) return
 
     setLocalError(null)
-
-    if (!selectedTruckId) {
-      setLocalError('Please select a truck before accepting.')
-      return
-    }
-
     setConfirming(true)
     try {
-      await Promise.resolve(onConfirm(selectedTruckId))
+      await Promise.resolve(onConfirm())
       onClose()
     } catch (err: any) {
       console.error('AcceptModal onConfirm error', err)
@@ -257,29 +183,6 @@ export default function AcceptModal({
               <div className="text-black/80">{distance}</div>
             </div>
           </div>
-        </div>
-
-        <div className="mt-3">
-          <label className="block text-sm font-medium text-slate-700 mb-1">Select truck</label>
-
-          {loadingTrucks ? (
-            <div className="text-sm text-slate-500">Loading trucks…</div>
-          ) : trucks.length === 0 ? (
-            <div className="text-sm text-rose-600">No trucks found. Please add a truck first.</div>
-          ) : (
-            <select
-              className="w-full border rounded px-3 py-2 text-sm"
-              value={selectedTruckId}
-              onChange={(e) => setSelectedTruckId(e.target.value)}
-            >
-              <option value="">-- choose a truck --</option>
-              {trucks.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.label}
-                </option>
-              ))}
-            </select>
-          )}
         </div>
 
         {localError && (

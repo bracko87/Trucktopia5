@@ -26,6 +26,11 @@ import { finalizeAssignmentDirect } from '../../services/assignmentService'
 import StagingAssignmentsPanel from './StagingAssignmentsPanel'
 
 /**
+ * Temporary safety switch: keep preview flow enabled but disable final acceptance writes.
+ */
+const ASSIGNMENT_FINALIZE_ENABLED = false
+
+/**
  * DroppedItem
  *
  * Lightweight shape for an item dropped onto a slot.
@@ -1051,6 +1056,11 @@ export default function AssignmentPanel({
    * Uses previewData + assignment slots + current user to construct the opts.
    */
   async function handleConfirmFinalize() {
+    if (!ASSIGNMENT_FINALIZE_ENABLED) {
+      setPreviewError('Job acceptance is temporarily disabled while the assignment flow is under review.')
+      return
+    }
+
     if (!previewId || !previewData) return
 
     // Resolve identifiers using best-effort from preview, assignment and current user.
@@ -1378,9 +1388,14 @@ export default function AssignmentPanel({
             <button
               type="button"
               onClick={handleConfirmFinalize}
-              className="px-4 py-2 rounded font-medium transition bg-emerald-600 hover:bg-emerald-700 text-white"
+              disabled={!ASSIGNMENT_FINALIZE_ENABLED}
+              className={`px-4 py-2 rounded font-medium transition ${
+                ASSIGNMENT_FINALIZE_ENABLED
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                  : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
+              }`}
             >
-              Confirm Assignment
+              {ASSIGNMENT_FINALIZE_ENABLED ? 'Confirm Assignment' : 'Assignment confirm disabled'}
             </button>
           </div>
         }
@@ -1388,6 +1403,9 @@ export default function AssignmentPanel({
         <div className="space-y-4">
           <div className="text-sm text-slate-700 space-y-1">
             <div>Please review the assignment before confirming.</div>
+            {!ASSIGNMENT_FINALIZE_ENABLED && (
+              <div className="text-xs text-amber-700">Final assignment acceptance is temporarily disabled while this flow is under review.</div>
+            )}
             <div className="text-xs text-amber-600">Server preview is used when available. Client-side heuristics are used as fallback.</div>
           </div>
 
