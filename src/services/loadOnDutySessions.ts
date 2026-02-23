@@ -88,6 +88,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
       .select(
         [
           'id',
+          'status',
           'carrier_company_id',
           'user_truck_id',
           'user_trailer_id',
@@ -249,30 +250,22 @@ export async function loadOnDutySessions(companyId?: string | null) {
     }
 
     /**
-     * Active phases normalization set (safe + future-proof)
+     * Terminal phase/status values.
      *
-     * This list contains common normalized forms. We normalize by lowercasing
-     * and replacing spaces/hyphens with underscores before testing.
+     * The backend has had multiple naming variants over time, so treat anything
+     * not terminal as active instead of hard-coding a small allow-list.
      */
-    const activePhases = new Set([
-      'waiting_driver',
-      'waiting',
-      'awaiting_driver',
-
-      'assigned',
-
-      'to_pickup',
-      'picking_load',
-      'loading',
-
-      'to_delivery',
-      'delivering',
-
-      'unloading',
-
-      'return_to_hub',
-      'returning',
-      'return',
+    const terminalPhases = new Set([
+      'completed',
+      'delivered',
+      'cancelled',
+      'canceled',
+      'failed',
+      'aborted',
+      'done',
+      'closed',
+      'finished',
+      'idle',
     ])
 
     // Attach related data and resolve reward fallback
@@ -340,11 +333,12 @@ export async function loadOnDutySessions(companyId?: string | null) {
           },
         }
       })
-      // Filter to active phases using normalization
+      // Filter to active sessions using phase first, then assignment status fallback.
       .filter((row: any) => {
-        const phaseRaw = String(row.phase ?? '')
-        const phase = phaseRaw.toLowerCase().replace(/[\s-]/g, '_')
-        return activePhases.has(phase)
+        const phaseRaw = row.phase ?? row.job_assignment?.status ?? ''
+        const normalized = String(phaseRaw).trim().toLowerCase().replace(/[\s-]/g, '_')
+        if (!normalized) return false
+        return !terminalPhases.has(normalized)
       })
       // Company ownership filter (only filter if assignment exists)
       .filter((row: any) => {

@@ -4,6 +4,12 @@
  * Panel component that lists company leases and shows a brief payment summary.
  * Preserves existing visual layout and design. Implements server-side pagination
  * using PostgREST range queries and shows a maximum of 10 entries per page.
+ *
+ * FIXES:
+ * - Robust companyId resolution (user fields + user_metadata + window + localStorage + DB fallback)
+ * - useEffect dependency fixed (runs when user loads/changes)
+ * - Includes created_at in select (since we order by it)
+ * - Uses explicit FK join hint for truck_models to avoid ambiguous joins
  */
 
 import React from 'react'
@@ -24,6 +30,7 @@ interface LeaseRow {
   lease_end?: string | null
   lease_rate?: number | string | null
   status?: string | null
+  is_active?: boolean | null
   truck_models?: {
     make?: string | null
     model?: string | null
@@ -58,10 +65,6 @@ interface PaymentInfo {
  * weeksDiffInclusive
  *
  * Compute inclusive week difference between two dates (minimum 0).
- *
- * @param start Start date
- * @param end End date
- * @returns number of inclusive weeks
  */
 function weeksDiffInclusive(start: Date, end: Date): number {
   const diffMs = end.getTime() - start.getTime()
@@ -75,9 +78,6 @@ function weeksDiffInclusive(start: Date, end: Date): number {
  * Compute a simple payment breakdown for a lease row. The installment amount
  * is derived from the total lease value (lease_rate) divided by number of weekly
  * payments between start and end.
- *
- * @param lease LeaseRow
- * @returns PaymentInfo | null
  */
 function computePaymentInfo(lease: LeaseRow): PaymentInfo | null {
   if (!lease.lease_start || !lease.lease_end) return null
@@ -134,51 +134,66 @@ function computePaymentInfo(lease: LeaseRow): PaymentInfo | null {
 
 /**
  * IntroCard
- *
- * Small header card describing the leases panel.
- *
- * @returns JSX.Element
  */
 function IntroCard(): JSX.Element {
   return (
-    <section className="bg-white p-6 rounded-xl shadow" style={{ pointerEvents: 'auto' }}>
+    <section
+      className="bg-white p-6 rounded-xl shadow"
+      style={{ pointerEvents: 'auto' }}
+    >
       <h2 className="text-lg font-semibold mb-4">Leases</h2>
-      <p className="text-sm text-slate-500 mt-1">Company leases. Showing up to 10 entries per page.</p>
+      <p className="text-sm text-slate-500 mt-1">
+        Company leases. Showing up to 10 entries per page.
+      </p>
     </section>
   )
 }
 
-/**
- * LeasesPanel
- *
- * Main exported component. Loads leases for the resolved company and renders a
- * paginated list (10 entries per page). Per-lease actions "Cancel Leasing" and
- * "Purchase Truck" are provided with conservative DB updates/inserts.
- *
- * @returns JSX.Element
- */
 export default function LeasesPanel(): JSX.Element {
   const { user } = useAuth()
+
   const [leases, setLeases] = React.useState<LeaseWithName[] | null>(null)
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const [actionLoadingId, setActionLoadingId] = React.useState<string | null>(null)
+  const [actionLoadingId, setActionLoadingId] = React.useState<string | null>(
+    null
+  )
 
   // Pagination state
   const PAGE_SIZE = 10
   const [page, setPage] = React.useState(1)
   const [totalCount, setTotalCount] = React.useState<number | null>(null)
 
+  // Cache the resolved company id so actions (purchase/cancel) don’t depend on fragile user shape
+  const companyIdRef = React.useRef<string | null>(null)
+
+  // Flip this to true temporarily if you want console logs
+  const DEBUG = false
+
   /**
-   * resolveCompanyId
+   * resolveCompanyIdFromUser
    *
-   * Read company id from user object, window global, or localStorage.
-   *
-   * @returns company id or null
+   * Best-effort extraction from whatever shape AuthContext provides.
    */
-  function resolveCompanyId(): string | null {
-    const authCompany = (user as any)?.company_id ?? (user as any)?.companyId ?? null
-    if (authCompany) return String(authCompany)
+  function resolveCompanyIdFromUser(u: any): string | null {
+    if (!u) return null
+    const candidates = [
+      u.company_id,
+      u.companyId,
+      u.company?.id,
+      u.user_metadata?.company_id,
+      u.user_metadata?.companyId,
+      u.profile?.company_id,
+      u.profile?.companyId,
+    ].filter(Boolean)
+
+    return candidates.length ? String(candidates[0]) : null
+  }
+
+  /**
+   * resolveCompanyIdFromBrowser
+   */
+  function resolveCompanyIdFromBrowser(): string | null {
     try {
       const w = (window as any).__CURRENT_COMPANY_ID
       if (w) return String(w)
@@ -189,12 +204,91 @@ export default function LeasesPanel(): JSX.Element {
   }
 
   /**
+   * resolveCompanyIdFromDb
+   *
+   * Best-effort fallback: try common column names in `public.users`.
+   * If your schema differs, adjust the column checks below.
+   */
+  async function resolveCompanyIdFromDb(u: any): Promise<string | null> {
+    const uid =
+      u?.id ?? u?.auth_id ?? u?.authId ?? u?.user_id ?? u?.userId ?? null
+    if (!uid) return null
+
+    // Try common shapes in your `public.users` table
+    const attempts: Array<{
+      column: string
+      value: string
+    }> = [
+      { column: 'auth_id', value: String(uid) },
+      { column: 'owner_user_auth_id', value: String(uid) },
+      { column: 'user_auth_id', value: String(uid) },
+      { column: 'id', value: String(uid) },
+    ]
+
+    for (const a of attempts) {
+      const { data, error } = await supabase
+        .from('users')
+        .select('company_id')
+        .eq(a.column as any, a.value)
+        .maybeSingle()
+
+      if (DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log('resolveCompanyIdFromDb attempt', a, { data, error })
+      }
+
+      if (!error && data?.company_id) {
+        return String(data.company_id)
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * resolveCompanyId
+   *
+   * Full resolution (cached):
+   * 1) cached ref
+   * 2) from user object
+   * 3) from window/localStorage
+   * 4) DB fallback
+   */
+  async function resolveCompanyId(): Promise<string | null> {
+    if (companyIdRef.current) return companyIdRef.current
+
+    const fromUser = resolveCompanyIdFromUser(user as any)
+    if (fromUser) {
+      companyIdRef.current = fromUser
+      try {
+        localStorage.setItem('current_company_id', fromUser)
+      } catch {}
+      return fromUser
+    }
+
+    const fromBrowser = resolveCompanyIdFromBrowser()
+    if (fromBrowser) {
+      companyIdRef.current = fromBrowser
+      return fromBrowser
+    }
+
+    const fromDb = await resolveCompanyIdFromDb(user as any)
+    if (fromDb) {
+      companyIdRef.current = fromDb
+      try {
+        localStorage.setItem('current_company_id', fromDb)
+      } catch {}
+      return fromDb
+    }
+
+    return null
+  }
+
+  /**
    * fetchLeases
    *
    * Load a single page of leases and the exact total count so we can render
    * pagination controls.
-   *
-   * @param p page number (1-based)
    */
   async function fetchLeases(p: number = 1) {
     setLoading(true)
@@ -202,9 +296,24 @@ export default function LeasesPanel(): JSX.Element {
     setLeases(null)
 
     try {
-      const companyId = resolveCompanyId()
+      const companyId = await resolveCompanyId()
+
+      if (DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log('leases: user=', user)
+        // eslint-disable-next-line no-console
+        console.log('leases: resolved companyId=', companyId)
+        // eslint-disable-next-line no-console
+        console.log(
+          'leases: ls current_company_id=',
+          localStorage.getItem('current_company_id')
+        )
+      }
+
       if (!companyId) {
-        setError('No company context available.')
+        setError(
+          'No company context available. Please set current_company_id or ensure the logged-in user has a company_id.'
+        )
         setLeases([])
         setTotalCount(0)
         return
@@ -216,10 +325,24 @@ export default function LeasesPanel(): JSX.Element {
       // Request exact count and only the page slice
       const { data, error: sbError, count } = await supabase
         .from('user_leases')
-        .select('id,asset_model_id,owner_company_id,lease_start,lease_end,lease_rate,status,truck_models(make,model)', {
-          count: 'exact',
-        })
+        .select(
+          `
+          id,
+          asset_model_id,
+          owner_company_id,
+          lease_start,
+          lease_end,
+          lease_rate,
+          status,
+          is_active,
+          created_at,
+          truck_models!user_leases_asset_model_id_fkey(make,model)
+        `,
+          { count: 'exact' }
+        )
         .eq('owner_company_id', companyId)
+        // Optional: show only active leases; comment out if you want history too.
+        // .eq('is_active', true)
         .order('created_at', { ascending: false })
         .range(start, end)
 
@@ -233,7 +356,8 @@ export default function LeasesPanel(): JSX.Element {
       const rows = (data ?? []) as LeaseRow[]
       const mapped: LeaseWithName[] = rows.map((r) => {
         const joined = r.truck_models
-        const joinedName = joined && [joined.make, joined.model].filter(Boolean).join(' ')
+        const joinedName =
+          joined && [joined.make, joined.model].filter(Boolean).join(' ')
         return {
           ...r,
           asset_name: joinedName ?? r.asset_model_id ?? null,
@@ -252,10 +376,14 @@ export default function LeasesPanel(): JSX.Element {
     }
   }
 
+  // IMPORTANT: depend on user (or user?.id) so it reruns when auth finishes loading
   React.useEffect(() => {
+    if (!user) return
+    // Clear cached company when user changes
+    companyIdRef.current = null
     fetchLeases(1).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.company_id])
+  }, [user])
 
   const currencyFormatter = new Intl.NumberFormat(undefined, {
     style: 'currency',
@@ -264,20 +392,19 @@ export default function LeasesPanel(): JSX.Element {
 
   /**
    * cancelLease
-   *
-   * Safely cancel a lease (confirm, then update DB).
-   *
-   * @param id lease id
    */
   async function cancelLease(id: string) {
     if (!window.confirm('Cancel this leasing agreement?')) return
     setActionLoadingId(id)
     try {
-      const { error } = await supabase.from('user_leases').update({ status: 'cancelled', is_active: false }).eq('id', id)
+      const { error } = await supabase
+        .from('user_leases')
+        .update({ status: 'cancelled', is_active: false })
+        .eq('id', id)
+
       if (error) {
         setError(error.message || 'Failed to cancel lease')
       } else {
-        // reload current page
         await fetchLeases(page)
       }
     } catch (e: any) {
@@ -289,17 +416,14 @@ export default function LeasesPanel(): JSX.Element {
 
   /**
    * purchaseTruck
-   *
-   * Insert a minimal user_trucks row and mark the lease as purchased.
-   *
-   * @param lease LeaseWithName
    */
   async function purchaseTruck(lease: LeaseWithName) {
     if (!window.confirm('Purchase this truck now?')) return
     const id = lease.id
     setActionLoadingId(id)
+
     try {
-      const companyId = resolveCompanyId()
+      const companyId = await resolveCompanyId()
       if (!companyId) {
         setError('No company context available for purchase.')
         setActionLoadingId(null)
@@ -318,18 +442,25 @@ export default function LeasesPanel(): JSX.Element {
         owner_company_id: companyId,
         purchase_date: new Date().toISOString(),
       }
+
       if (purchasePrice !== null && !isNaN(purchasePrice)) {
         insertPayload.purchase_price = purchasePrice
       }
 
-      const { error: insertErr } = await supabase.from('user_trucks').insert(insertPayload)
+      const { error: insertErr } = await supabase
+        .from('user_trucks')
+        .insert(insertPayload)
+
       if (insertErr) {
         setError(insertErr.message || 'Failed to create truck record')
         setActionLoadingId(null)
         return
       }
 
-      const { error: updateErr } = await supabase.from('user_leases').update({ status: 'purchased', is_active: false }).eq('id', id)
+      const { error: updateErr } = await supabase
+        .from('user_leases')
+        .update({ status: 'purchased', is_active: false })
+        .eq('id', id)
 
       if (updateErr) {
         setError(updateErr.message || 'Failed to update lease after purchase')
@@ -345,8 +476,6 @@ export default function LeasesPanel(): JSX.Element {
 
   /**
    * gotoPrevPage
-   *
-   * Navigate to previous page (if any).
    */
   function gotoPrevPage() {
     if (page <= 1) return
@@ -355,8 +484,6 @@ export default function LeasesPanel(): JSX.Element {
 
   /**
    * gotoNextPage
-   *
-   * Navigate to next page (if any).
    */
   function gotoNextPage() {
     if (!totalCount) return
@@ -375,7 +502,9 @@ export default function LeasesPanel(): JSX.Element {
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
             <div>
-              <div className="text-xs text-slate-500">Published company truck lease deals</div>
+              <div className="text-xs text-slate-500">
+                Published company truck lease deals
+              </div>
             </div>
           </div>
 
@@ -398,7 +527,10 @@ export default function LeasesPanel(): JSX.Element {
           const isActing = actionLoadingId === l.id
 
           return (
-            <div key={l.id} className="p-3 bg-slate-50 rounded border flex justify-between mb-3">
+            <div
+              key={l.id}
+              className="p-3 bg-slate-50 rounded border flex justify-between mb-3"
+            >
               <div>
                 <div className="text-sm font-medium">{l.asset_name ?? l.id}</div>
 
@@ -408,7 +540,8 @@ export default function LeasesPanel(): JSX.Element {
                     <span className="font-semibold text-emerald-600">
                       {currencyFormatter.format(paymentInfo.installmentAmount ?? 0)}
                     </span>{' '}
-                    each • Next: {paymentInfo.nextPaymentDate?.toLocaleDateString() ?? '—'}
+                    each • Next:{' '}
+                    {paymentInfo.nextPaymentDate?.toLocaleDateString() ?? '—'}
                   </div>
                 )}
 
@@ -438,15 +571,17 @@ export default function LeasesPanel(): JSX.Element {
               <div className="text-right text-xs">
                 <div>{l.status}</div>
                 <div>
-                  {l.lease_start ? new Date(l.lease_start).toLocaleDateString() : '—'} →{' '}
-                  {l.lease_end ? new Date(l.lease_end).toLocaleDateString() : '—'}
+                  {l.lease_start ? new Date(l.lease_start).toLocaleDateString() : '—'}{' '}
+                  → {l.lease_end ? new Date(l.lease_end).toLocaleDateString() : '—'}
                 </div>
               </div>
             </div>
           )
         })}
 
-        {leases && leases.length === 0 && <div className="text-xs text-slate-500">No leases published.</div>}
+        {leases && leases.length === 0 && (
+          <div className="text-xs text-slate-500">No leases published.</div>
+        )}
 
         {/* Pagination controls */}
         <div className="mt-4 flex items-center justify-between">

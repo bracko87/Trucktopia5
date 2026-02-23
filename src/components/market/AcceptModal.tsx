@@ -9,19 +9,16 @@
  * text (e.g. "trailer_cargo" -> "Trailer Cargo", "load_cargo" -> "Load Cargo").
  *
  * Added behavior:
- * - Loads user's trucks on open and requires a truck selection before confirming.
+ * - Loads candidate trucks on open and requires a truck selection before confirming.
+ * - Resolves trucks using multiple ownership filters (auth user + public user + company)
+ *   to avoid false "No trucks found" states in manager/company accounts.
  * - Shows local errors (login/truck load/accept failure) without closing the modal.
- *
- * NOTE:
- * - Your DB schema for public.user_trucks uses model_max_load_kg (capacity) and does NOT
- *   have max_payload_kg / payload_kg / truck_model_id. This file matches your schema.
- * - Your user_trucks table has both owner_user_id and owner_user_auth_id; this modal
- *   automatically uses whichever matches the current auth user.
  */
 
 import React, { useState, useEffect } from 'react'
 import type { JobRow } from './JobCard'
 import { supabase } from '../../lib/supabase'
+import { useAuth } from '../../context/AuthContext'
 
 export interface AcceptModalProps {
   open: boolean
@@ -71,6 +68,7 @@ type TruckRow = {
   model_model?: string | null
   model_year?: number | null
   model_max_load_kg?: number | null
+  status?: string | null
   created_at?: string | null
 }
 
@@ -81,6 +79,7 @@ export default function AcceptModal({
   onClose,
   onConfirm,
 }: AcceptModalProps) {
+  const { user } = useAuth()
   const [confirming, setConfirming] = useState(false)
 
   const [trucks, setTrucks] = useState<Array<{ id: string; label: string }>>([])
@@ -107,48 +106,68 @@ export default function AcceptModal({
           return
         }
 
-        // Your user_trucks has BOTH owner_user_id and owner_user_auth_id.
-        // We try owner_user_auth_id first (most common), and if it returns 0 rows,
-        // fall back to owner_user_id.
-        const baseSelect =
-          'id,name,registration,model_make,model_model,model_year,model_max_load_kg,created_at'
+        const baseSelect = 'id,name,registration,model_make,model_model,model_year,model_max_load_kg,status,created_at,owner_user_auth_id,owner_user_id,owner_company_id'
 
-        const loadByField = async (field: 'owner_user_auth_id' | 'owner_user_id') => {
-          return await supabase
+        const tryLoad = async (field: string, value: string | null | undefined) => {
+          if (!value) return [] as TruckRow[]
+          const { data, error } = await supabase
             .from('user_trucks')
             .select(baseSelect)
-            .eq(field, authUserId)
+            .eq(field, value)
             .order('created_at', { ascending: false })
+
+          if (error) return []
+          return (data ?? []) as TruckRow[]
         }
 
-        // Try owner_user_auth_id first
-        let { data, error } = await loadByField('owner_user_auth_id')
-        if (error) throw error
+        const publicUserByAuth = await supabase
+          .from('users')
+          .select('id,company_id')
+          .eq('auth_user_id', authUserId)
+          .limit(1)
+          .maybeSingle()
 
-        // If none found, try owner_user_id
-        if (!data || data.length === 0) {
-          const res2 = await loadByField('owner_user_id')
-          if (res2.error) throw res2.error
-          data = res2.data as any
+        const publicUserId = publicUserByAuth.data?.id ? String(publicUserByAuth.data.id) : null
+        const resolvedCompanyId =
+          (user as any)?.company_id ??
+          (publicUserByAuth.data?.company_id ? String(publicUserByAuth.data.company_id) : null)
+
+        const buckets = await Promise.all([
+          tryLoad('owner_user_auth_id', authUserId),
+          tryLoad('owner_user_id', authUserId),
+          tryLoad('owner_user_id', publicUserId),
+          tryLoad('owner_company_id', resolvedCompanyId),
+        ])
+
+        const mergedById = new Map<string, TruckRow>()
+        for (const rows of buckets) {
+          for (const t of rows) {
+            if (!t?.id) continue
+            if (!mergedById.has(String(t.id))) mergedById.set(String(t.id), t)
+          }
         }
 
-        const rows = (data ?? []) as TruckRow[]
+        const rows = Array.from(mergedById.values())
 
         const mapped = rows.map((t) => {
           const cap = t.model_max_load_kg != null ? `${formatNumber(Number(t.model_max_load_kg))} kg` : '—'
           const makeModel = [t.model_make, t.model_model].filter(Boolean).join(' ')
           const year = t.model_year ? String(t.model_year) : ''
           const reg = t.registration ? `(${t.registration})` : ''
+          const status = t.status ? String(t.status) : 'unknown'
           const nm = t.name ? t.name : `Truck ${String(t.id).slice(0, 8)}`
           const desc = [makeModel, year].filter(Boolean).join(' ')
-          const label = `${nm} ${reg}${desc ? ` — ${desc}` : ''} | cap: ${cap}`
+          const label = `${nm} ${reg}${desc ? ` — ${desc}` : ''} | cap: ${cap} | ${status}`
 
           return { id: t.id, label }
         })
 
         if (!cancelled) {
           setTrucks(mapped)
-          if (mapped.length === 1) setSelectedTruckId(mapped[0].id)
+          if (mapped.length > 0) setSelectedTruckId(mapped[0].id)
+          if (mapped.length === 0) {
+            setLocalError('No trucks available for your account/company. Check truck ownership/company mapping and truck status.')
+          }
         }
       } catch (e: any) {
         if (!cancelled) setLocalError(e?.message ?? 'Failed to load trucks')
@@ -160,7 +179,7 @@ export default function AcceptModal({
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, user])
 
   if (!open || !jobId) return null
 
