@@ -10,10 +10,16 @@
  * - Ensures filters.country is set to the normalized hub country.
  *
  * Changes made:
- * - confirmAccept now takes no truckId parameter.
- * - Removed client-side truck-required validation and truck-capacity assignment logic.
- * - Accept flow now uses a single RPC: accept_job_step1_v2 (via supabase.rpc) to perform
- *   server-side acceptance steps and reduce client-side coupling to truck selection.
+ * - confirmAccept now allows nullable truck from resolver path (no hard fail when no truck).
+ * - Carrier company resolution now receives resolved truckId (nullable) for fallback resolution.
+ * - Accept flow computes payload client-side:
+ *   - truck -> assign payload up to capacity
+ *   - no truck -> assign 0 payload (remaining stays the same)
+ * - Force pre-dispatch status to "assigned" always (per catalog/state machine).
+ *   // Keep accepted market jobs in the "assigned" lane so they appear in Waiting/Staging
+ *   // even when truck is attached later in staging.
+ * - Inserts job assignment with nullable user_truck_id and patches job offer accordingly.
+ * - Adds backend policy error mapping for job_assignments_truck_required.
  * - AcceptModal binding updated to call confirmAccept with no arguments.
  */
 
@@ -279,8 +285,6 @@ async function fetchJobs(): Promise<JobRow[]> {
  *
  * Query user_trucks for a single numeric capacity field (model_max_load_kg)
  * and return it when available. Falls back to null on any error.
- *
- * Note: left in file for compatibility but NOT used by client accept flow anymore.
  */
 async function resolveTruckPayloadCapacity(truckId: string | null | undefined, authorization: string): Promise<number | null> {
   if (!truckId) return null
@@ -646,16 +650,14 @@ export default function MarketPage(): JSX.Element {
   /**
    * confirmAccept
    *
-   * Accept the currently selected job. This version runs without a client-side
-   * truck id: server-side RPC will resolve assignment details and perform DB changes.
+   * Accept the currently selected job. This version allows accept without a truck:
+   * - If a truck is found => payload is assigned immediately up to capacity
+   * - If no truck is found => payload assigned is 0 (remaining stays the same)
    *
-   * Steps:
-   * - Ensure user session and get auth header
-   * - Resolve carrier company id (may use user/company/truck fallbacks)
-   * - Call server RPC 'accept_job_step1_v2' to perform acceptance logic
-   * - On success hide/persist the accepted job id client-side
-   *
-   * @returns Promise<void>
+   * IMPORTANT:
+   * Force pre-dispatch status to "assigned" always (per catalog/state machine).
+   * Keep accepted market jobs in the "assigned" lane so they appear in Waiting/Staging
+   * even when truck is attached later in staging.
    */
   async function confirmAccept() {
     setActionError(null)
@@ -672,39 +674,85 @@ export default function MarketPage(): JSX.Element {
     }
 
     try {
-      // Read session and auth user id for robust truck resolution
+      // Read session and auth user id
       const session = await supabase.auth.getSession()
       const accessToken = session.data.session?.access_token ?? null
       const authUserId = session.data.session?.user?.id ?? null
       const authHeader = accessToken ? `Bearer ${accessToken}` : `Bearer ${MARKET_SUPABASE_ANON_KEY}`
 
-      // Resolve carrier company id (may use user/company/truck fallbacks)
-      const carrierCompanyId = await resolveCarrierCompanyId(user, null, authHeader)
+      // Resolve truck id (nullable path allowed)
+      const truckId = await resolveAcceptTruckId(user, authHeader, authUserId)
+
+      // Resolve carrier company id (may use truck fallback)
+      const carrierCompanyId = await resolveCarrierCompanyId(user, truckId, authHeader)
       if (!carrierCompanyId) {
         throw new Error('No carrier company linked to your account. Please create or join a company before accepting jobs.')
       }
 
-      // Try to auto-resolve a suitable truck id to avoid missing-truck DB insert errors.
-      // This lookup uses authUserId (from session) and carrierCompanyId when available.
-      const resolvedTruckId = await resolveAcceptTruckId(authUserId, authHeader, carrierCompanyId)
+      const currentJob = jobs.find((j) => String(j.id) === String(jobId)) ?? null
+      const remainingBeforeRaw = Number(currentJob?.remaining_payload ?? currentJob?.weight_kg ?? 0)
+      const remainingBefore = Number.isFinite(remainingBeforeRaw) && remainingBeforeRaw > 0 ? remainingBeforeRaw : 0
 
-      // Build RPC params (include resolved truck id when available)
-      const rpcParams: any = {
-        p_job_offer_id: jobId,
-        p_company_id: carrierCompanyId,
-        p_user_id: (user as any).id ?? null,
+      const truckCapacity = await resolveTruckPayloadCapacity(truckId, authHeader)
+      const thisRunPayload = truckId ? Math.max(0, Math.min(remainingBefore, Number(truckCapacity ?? remainingBefore))) : 0
+      const remainingAfter = truckId ? Math.max(0, remainingBefore - thisRunPayload) : remainingBefore
+
+      // Keep accepted market jobs in the "assigned" lane so they appear in Waiting/Staging
+      // even when truck is attached later in staging.
+      const assignmentStatus = 'assigned'
+
+      const commonHeaders: Record<string, string> = {
+        apikey: MARKET_SUPABASE_ANON_KEY,
+        Authorization: authHeader,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
       }
-      if (resolvedTruckId) rpcParams.p_user_truck_id = resolvedTruckId
 
-      const rpcRes = await supabase.rpc('accept_job_step1_v2', rpcParams)
+      // 1) Insert assignment (nullable truck supported)
+      const insertAssignmentRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
+        method: 'POST',
+        headers: commonHeaders,
+        body: JSON.stringify({
+          job_offer_id: jobId,
+          carrier_company_id: carrierCompanyId,
+          user_id: (user as any).id ?? null,
+          user_truck_id: truckId ?? null,
+          status: assignmentStatus,
+          accepted_at: new Date().toISOString(),
+          assigned_payload_kg: thisRunPayload,
+          payload_remaining_kg: remainingAfter,
+        }),
+      })
 
-      if ((rpcRes as any)?.error) throw (rpcRes as any).error
+      if (!insertAssignmentRes.ok) {
+        const txt = await insertAssignmentRes.text().catch(() => '')
+        throw new Error(txt || `Assignment insert failed (${insertAssignmentRes.status})`)
+      }
 
-      // ✅ 3) Hide immediately + persist after refresh
+      // 2) Patch job offer
+      const patchJobRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobId)}`, {
+        method: 'PATCH',
+        headers: {
+          ...commonHeaders,
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          remaining_payload: remainingAfter,
+          status: assignmentStatus,
+          assigned_user_truck_id: truckId ?? null,
+        }),
+      })
+
+      if (!patchJobRes.ok) {
+        const txt = await patchJobRes.text().catch(() => '')
+        throw new Error(txt || `Job offer update failed (${patchJobRes.status})`)
+      }
+
+      // ✅ Hide immediately + persist after refresh
       addHiddenMarketJobId(jobId)
       setHiddenMarketJobIds((prev) => (prev.includes(jobId) ? prev : [...prev, jobId]))
 
-      // 4) Remove from in-memory jobs list too
+      // Remove from in-memory jobs list too
       setJobs((prev) => prev.filter((j) => j.id !== jobId))
 
       setSuccessMessage('Job accepted')
@@ -712,7 +760,12 @@ export default function MarketPage(): JSX.Element {
       return
     } catch (err: any) {
       console.error('accept error', err)
-      setActionError(err?.message ?? 'Accept failed')
+      const msg = String(err?.message ?? 'Accept failed')
+      if (msg.includes('job_assignments_truck_required')) {
+        setActionError('Backend policy still requires a truck on accept. Deploy Step-1/Step-2 SQL to allow accept without truck, then retry.')
+      } else {
+        setActionError(msg)
+      }
       throw err
     } finally {
       setTimeout(() => setSuccessMessage(null), 3000)
@@ -736,7 +789,12 @@ export default function MarketPage(): JSX.Element {
               <div className="px-3 py-1 bg-slate-50 border border-slate-100 rounded text-sm font-medium">{filteredSortedJobs.length}</div>
             </div>
 
-            <button type="button" className="md:hidden p-2 rounded bg-sky-600 text-white" onClick={() => setMobileFiltersOpen(true)} aria-label="Open filters">
+            <button
+              type="button"
+              className="md:hidden p-2 rounded bg-sky-600 text-white"
+              onClick={() => setMobileFiltersOpen(true)}
+              aria-label="Open filters"
+            >
               <Filter className="w-4 h-4" />
             </button>
           </div>
@@ -746,7 +804,13 @@ export default function MarketPage(): JSX.Element {
           <div>
             <h2 className="text-sm font-semibold mb-3">Filters</h2>
             <div className="bg-white p-4 rounded-md shadow-sm">
-              <FilterBar key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}`} filters={filters} cargoTypes={cargoTypes} countries={countries} onChange={setFilters} />
+              <FilterBar
+                key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}`}
+                filters={filters}
+                cargoTypes={cargoTypes}
+                countries={countries}
+                onChange={setFilters}
+              />
               <div className="mt-3 text-xs text-slate-500">Sort by reward, distance or deadline.</div>
               {preferredHubCity && (
                 <div className="mt-2 text-xs text-slate-600">
@@ -834,7 +898,13 @@ export default function MarketPage(): JSX.Element {
                   Close
                 </button>
               </div>
-              <FilterBar key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}-mobile`} filters={filters} cargoTypes={cargoTypes} countries={countries} onChange={setFilters} />
+              <FilterBar
+                key={`${preferredHubCountry ?? 'none'}-${preferredHubCity ?? 'none'}-mobile`}
+                filters={filters}
+                cargoTypes={cargoTypes}
+                countries={countries}
+                onChange={setFilters}
+              />
             </div>
           </div>
         )}
@@ -978,17 +1048,22 @@ async function resolveCarrierCompanyId(
  * Tries multiple ownership buckets in order:
  *  - owner_user_auth_id = authUserId
  *  - owner_user_id = authUserId
+ *  - owner_user_id = publicUserId (user.id)
  *  - owner_company_id = companyId
  *
  * The function prefers available trucks, highest numeric model_max_load_kg,
  * falling back to the newest created_at when capacity is equal.
  *
+ * @param user Public user object (may contain id/company_id)
+ * @param authorization Authorization header to use for REST calls
  * @param authUserId Auth user id from session (may be null)
- * @param authorization Authorization header value to use for REST calls
- * @param companyId Optional company id to consider
  * @returns user_truck id or null when none found
  */
-async function resolveAcceptTruckId(authUserId: string | null, authorization: string, companyId?: string | null): Promise<string | null> {
+async function resolveAcceptTruckId(
+  user: { id?: string | null; company_id?: string | null } | null,
+  authorization: string,
+  authUserId: string | null
+): Promise<string | null> {
   try {
     const headers = {
       apikey: MARKET_SUPABASE_ANON_KEY,
@@ -998,7 +1073,7 @@ async function resolveAcceptTruckId(authUserId: string | null, authorization: st
     const buildUrl = (filter: string) =>
       `${MARKET_API_BASE}/rest/v1/user_trucks?${filter}&status=eq.available&select=id,model_max_load_kg,created_at&order=model_max_load_kg.desc.nullslast,created_at.desc&limit=1`
 
-    // 1) Try owner_user_auth_id
+    // 1) Try owner_user_auth_id = authUserId (best)
     if (authUserId) {
       const url1 = buildUrl(`owner_user_auth_id=eq.${encodeURIComponent(authUserId)}`)
       const res1 = await fetch(url1, { headers })
@@ -1007,7 +1082,7 @@ async function resolveAcceptTruckId(authUserId: string | null, authorization: st
         if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
       }
 
-      // 2) Try owner_user_id
+      // 2) Try owner_user_id = authUserId
       const url2 = buildUrl(`owner_user_id=eq.${encodeURIComponent(authUserId)}`)
       const res2 = await fetch(url2, { headers })
       if (res2.ok) {
@@ -1016,12 +1091,24 @@ async function resolveAcceptTruckId(authUserId: string | null, authorization: st
       }
     }
 
-    // 3) Try owner_company_id
-    if (companyId) {
-      const url3 = buildUrl(`owner_company_id=eq.${encodeURIComponent(companyId)}`)
+    // 3) Try owner_user_id = public user id (user.id)
+    const publicUserId = user?.id ?? null
+    if (publicUserId) {
+      const url3 = buildUrl(`owner_user_id=eq.${encodeURIComponent(publicUserId)}`)
       const res3 = await fetch(url3, { headers })
       if (res3.ok) {
         const rows = await res3.json().catch(() => [])
+        if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
+      }
+    }
+
+    // 4) Try owner_company_id
+    const companyId = user?.company_id ?? null
+    if (companyId) {
+      const url4 = buildUrl(`owner_company_id=eq.${encodeURIComponent(companyId)}`)
+      const res4 = await fetch(url4, { headers })
+      if (res4.ok) {
+        const rows = await res4.json().catch(() => [])
         if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
       }
     }

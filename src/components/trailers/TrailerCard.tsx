@@ -6,12 +6,15 @@
  * - Uses a 3-column grid to match HiredStaffCard visuals:
  *   [Identity] [Stats] [Meta / actions]
  * - Keeps existing editable-name persistence using supabaseFetch.
- * - Adds image resolution logic that mirrors the staff card behaviour.
+ * - Adds image resolution logic that mirrors staff card behaviour.
+ * - Adds inline Image URL field (Save / Copy / Preview) for user_trailers.image_url
+ *   similar to the hired staff card.
+ * - Preview opens in-page modal popup (not new tab/window).
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import type { TrailerCardRow } from '../../lib/api/trailersApi'
-import { Gauge, Menu, Truck } from 'lucide-react'
+import { Menu, Truck, X } from 'lucide-react'
 import EditableTrailerName from './EditableTrailerName'
 import { supabaseFetch } from '../../lib/supabase'
 
@@ -34,12 +37,14 @@ export interface TrailerCardProps {
  */
 function resolveImageUrl(trailer: any): string | undefined {
   const candidates = [
-    trailer.image_url,
-    trailer.imageUrl,
-    trailer.avatar_url,
-    trailer.photo_url,
-    trailer.image,
-    trailer.avatar,
+    trailer?.image_url,
+    trailer?.imageUrl,
+    trailer?._raw?.image_url,
+    trailer?._raw?.imageUrl,
+    trailer?.avatar_url,
+    trailer?.photo_url,
+    trailer?.image,
+    trailer?.avatar,
   ]
   for (const c of candidates) {
     if (typeof c === 'string' && c.trim().length > 0) return c.trim()
@@ -77,7 +82,11 @@ function statusClass(s?: string | null) {
  * @param props.className additional classes
  */
 function StatPill({ children, className = '' }: { children: React.ReactNode; className?: string }) {
-  return <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ring-1 ${className}`}>{children}</span>
+  return (
+    <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ring-1 ${className}`}>
+      {children}
+    </span>
+  )
 }
 
 /**
@@ -92,12 +101,7 @@ function Avatar({ image, onError }: { image?: string; onError?: () => void }) {
     return (
       <div className="w-12 h-12 rounded-full border border-slate-100 bg-white flex items-center justify-center overflow-hidden flex-shrink-0">
         {/* eslint-disable-next-line jsx-a11y/img-redundant-alt */}
-        <img
-          src={image}
-          alt="Trailer"
-          className="w-full h-full object-cover"
-          onError={onError}
-        />
+        <img src={image} alt="Trailer" className="w-full h-full object-cover" onError={onError} />
       </div>
     )
   }
@@ -105,6 +109,180 @@ function Avatar({ image, onError }: { image?: string; onError?: () => void }) {
   return (
     <div className="w-12 h-12 rounded-full border border-slate-100 bg-white flex items-center justify-center text-slate-400 flex-shrink-0">
       <Truck className="w-5 h-5" />
+    </div>
+  )
+}
+
+/**
+ * TrailerImageUrlField
+ *
+ * Inline image URL editor for user_trailers.image_url.
+ * Matches the HiredStaff image field UX (URL input + Save / Copy / Preview).
+ * Preview opens as in-page modal popup.
+ */
+function TrailerImageUrlField({
+  trailerId,
+  initialUrl,
+  onUpdated,
+}: {
+  trailerId: string
+  initialUrl?: string | null
+  onUpdated?: (url?: string) => void
+}) {
+  const [value, setValue] = useState(initialUrl ?? '')
+  const [saving, setSaving] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewImageError, setPreviewImageError] = useState(false)
+
+  useEffect(() => {
+    setValue(initialUrl ?? '')
+  }, [initialUrl, trailerId])
+
+  useEffect(() => {
+    if (!previewOpen) return
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setPreviewOpen(false)
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [previewOpen])
+
+  const trimmed = value.trim()
+  const previewUrl = trimmed.length > 0 ? trimmed : undefined
+
+  async function save() {
+    setSaving(true)
+    setErrorMsg(null)
+    try {
+      await supabaseFetch(`/rest/v1/user_trailers?id=eq.${encodeURIComponent(trailerId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ image_url: trimmed || null }),
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+      })
+      onUpdated?.(trimmed || undefined)
+    } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error('Failed saving trailer image_url', e)
+      setErrorMsg(e?.message ?? 'Failed to save image URL')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function copyToClipboard() {
+    try {
+      if (!trimmed) return
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(trimmed)
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1200)
+      }
+    } catch {
+      // ignore clipboard errors silently
+    }
+  }
+
+  function openPreview() {
+    if (!previewUrl) return
+    setPreviewImageError(false)
+    setPreviewOpen(true)
+  }
+
+  return (
+    <div className="w-full">
+      <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+        <input
+          type="url"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="https://example.com/trailer-image.jpg"
+          className="min-w-0 flex-1 h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-700 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-400"
+        />
+
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="h-9 px-3 rounded-md border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+        >
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+
+        <button
+          type="button"
+          onClick={copyToClipboard}
+          disabled={!trimmed}
+          className="h-9 px-3 rounded-md border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          title="Copy image URL"
+        >
+          {copied ? 'Copied!' : 'Copy'}
+        </button>
+
+        <button
+          type="button"
+          onClick={openPreview}
+          disabled={!previewUrl}
+          className="h-9 px-3 rounded-md border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          title="Preview image"
+        >
+          Preview
+        </button>
+      </div>
+
+      {errorMsg ? <div className="mt-1 text-xs text-red-600">{errorMsg}</div> : null}
+
+      {/* In-page preview modal */}
+      {previewOpen && (
+        <div
+          className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Trailer image preview"
+          onClick={() => setPreviewOpen(false)}
+        >
+          <div
+            className="relative w-full max-w-4xl max-h-[90vh] rounded-xl bg-white shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+              <div className="text-sm font-medium text-slate-700 truncate pr-4">Image Preview</div>
+              <button
+                type="button"
+                onClick={() => setPreviewOpen(false)}
+                className="inline-flex items-center justify-center w-8 h-8 rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                aria-label="Close preview"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="bg-slate-50 p-3 border-b border-slate-200">
+              <div className="text-xs text-slate-500 break-all">{previewUrl}</div>
+            </div>
+
+            <div className="flex items-center justify-center bg-slate-100 p-4 max-h-[70vh] overflow-auto">
+              {!previewImageError && previewUrl ? (
+                // eslint-disable-next-line jsx-a11y/img-redundant-alt
+                <img
+                  src={previewUrl}
+                  alt="Trailer preview image"
+                  className="max-w-full max-h-[66vh] object-contain rounded"
+                  onError={() => setPreviewImageError(true)}
+                />
+              ) : (
+                <div className="text-sm text-red-600 py-10">Failed to load image preview from this URL.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -133,6 +311,7 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
   const [displayName, setDisplayName] = useState<string>((trailer._raw as any)?.name ?? trailer.label ?? 'Unnamed trailer')
 
   const mileage = trailer.mileageKm ?? 0
+
   /**
    * locationDisplay
    *
@@ -150,11 +329,28 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
   const cargoTypeDisplay = trailer.cargoTypeName ?? '—'
 
   const [imageError, setImageError] = useState(false)
-  const resolvedImage = resolveImageUrl(trailer)
+
+  /**
+   * persistedImageUrl
+   *
+   * Local source-of-truth for image_url after inline saves.
+   * Falls back to initial trailer row image value.
+   */
+  const [persistedImageUrl, setPersistedImageUrl] = useState<string | undefined>(resolveImageUrl(trailer))
+
+  useEffect(() => {
+    setPersistedImageUrl(resolveImageUrl(trailer))
+  }, [trailer.id, trailer])
+
+  const resolvedImage = useMemo(() => {
+    const localCandidate = (persistedImageUrl ?? '').trim()
+    return localCandidate || resolveImageUrl(trailer)
+  }, [persistedImageUrl, trailer])
+
   const imageToShow = !imageError ? resolvedImage : undefined
 
   useEffect(() => {
-    // Reset image error when trailer changes
+    // Reset image error when trailer / image changes
     setImageError(false)
   }, [resolvedImage, trailer.id])
 
@@ -170,17 +366,14 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
     setDisplayName(newName)
 
     try {
-      await supabaseFetch(
-        `/rest/v1/user_trailers?id=eq.${encodeURIComponent(trailer.id)}`,
-        {
-          method: 'PATCH',
-          body: JSON.stringify({ name: newName }),
-          headers: {
-            'Content-Type': 'application/json',
-            Prefer: 'return=representation',
-          },
-        }
-      )
+      await supabaseFetch(`/rest/v1/user_trailers?id=eq.${encodeURIComponent(trailer.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName }),
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+      })
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error('Failed saving trailer name', e)
@@ -278,56 +471,88 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
                 onClick={() => setExpanded((s) => !s)}
                 className="inline-flex items-center justify-center w-9 h-9 rounded border border-slate-100 bg-slate-50 text-slate-600 hover:bg-slate-100"
                 aria-expanded={expanded}
+                aria-label={expanded ? 'Collapse trailer details' : 'Expand trailer details'}
               >
-                <Menu className="w-4 h-4" />
+                {expanded ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
               </button>
             </div>
           </div>
         </div>
       </div>
 
-      {/* details - unchanged (expandable) */}
-      <div className={`px-4 transition-all duration-200 overflow-hidden ${expanded ? 'max-h-64 py-4' : 'max-h-0 py-0'}`}>
-        <div className="bg-slate-50 border border-slate-100 rounded-md p-3 shadow-sm">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <div className="text-xs text-slate-500">Model</div>
-              <div className="text-sm font-medium">{modelDisplay}</div>
-            </div>
+      {/* expandable section (now includes image URL field like staff card) */}
+      <div
+        className={`transition-[max-height] duration-200 ease-in-out overflow-hidden ${
+          expanded ? 'max-h-[520px]' : 'max-h-0'
+        }`}
+        aria-hidden={!expanded}
+      >
+        <div className="pt-2 border-t border-slate-100 p-4 bg-white rounded-b-xl">
+          {/* Image URL field row */}
+          <div className="mb-4">
+            <TrailerImageUrlField
+              trailerId={trailer.id}
+              initialUrl={persistedImageUrl}
+              onUpdated={(nextUrl) => {
+                setPersistedImageUrl(nextUrl)
+                setImageError(false)
+              }}
+            />
+          </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Year</div>
-              <div className="text-sm font-medium">{model?.manufacture_year ?? '—'}</div>
-            </div>
+          {/* details panel */}
+          <div className="bg-slate-50 border border-slate-100 rounded-md p-3 shadow-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <div className="text-xs text-slate-500">Model</div>
+                <div className="text-sm font-medium">{modelDisplay}</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Payload</div>
-              <div className="text-sm font-medium">{model?.max_load_kg ? `${Number(model.max_load_kg).toLocaleString()} kg` : trailer.payloadKg ? `${trailer.payloadKg.toLocaleString()} kg` : '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Year</div>
+                <div className="text-sm font-medium">{model?.manufacture_year ?? '—'}</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Tonnage</div>
-              <div className="text-sm font-medium">{model?.tonnage ?? '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Payload</div>
+                <div className="text-sm font-medium">
+                  {model?.max_load_kg
+                    ? `${Number(model.max_load_kg).toLocaleString()} kg`
+                    : trailer.payloadKg
+                    ? `${trailer.payloadKg.toLocaleString()} kg`
+                    : '—'}
+                </div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">GCW</div>
-              <div className="text-sm font-medium">{model?.gcw ?? '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Tonnage</div>
+                <div className="text-sm font-medium">{model?.tonnage ?? '—'}</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Mileage</div>
-              <div className="text-sm font-medium">{Number(mileage).toLocaleString()} km</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">GCW</div>
+                <div className="text-sm font-medium">{model?.gcw ?? '—'}</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Condition</div>
-              <div className="text-sm font-medium">{condition}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Mileage</div>
+                <div className="text-sm font-medium">{Number(mileage).toLocaleString()} km</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Cargo type</div>
-              <div className="text-sm font-medium">{cargoTypeDisplay}</div>
+              <div>
+                <div className="text-xs text-slate-500">Condition</div>
+                <div className="text-sm font-medium">{condition}</div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Cargo type</div>
+                <div className="text-sm font-medium">{cargoTypeDisplay}</div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Current location</div>
+                <div className="text-sm font-medium">{locationDisplay}</div>
+              </div>
             </div>
           </div>
         </div>
