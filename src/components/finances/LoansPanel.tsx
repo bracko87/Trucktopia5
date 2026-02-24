@@ -65,6 +65,7 @@ type LoanOffer = {
   id: string
   bankName: string
   logoText: string
+  logoUrl?: string
   aprMin: number
   aprMax: number
   factorRateMin: number
@@ -89,6 +90,8 @@ type EnrichedLoanOffer = LoanOffer & {
 type CompanyContextState = 'ready' | 'loading' | 'missing'
 
 const COMPANY_CONTEXT_GRACE_MS = 1200
+const LOAN_DISBURSEMENT_TYPE_CODE_CANDIDATES = ['LOAN_DISBURSEMENT', 'LOAN_PROCEEDS']
+const LOAN_REPAYMENT_TYPE_CODE_CANDIDATES = ['LOAN_REPAYMENT']
 
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -125,6 +128,25 @@ function toFriendlyLoanCreateError(message?: string): string {
   }
 
   return 'We could not create the loan right now. Please try again.'
+}
+
+function toFriendlyLoanRepayError(message?: string): string {
+  const raw = (message ?? '').toLowerCase()
+
+  if (raw.includes('violates row-level security') || raw.includes('permission denied')) {
+    return 'You do not have permission to repay this loan for the selected company.'
+  }
+
+  if (
+    raw.includes('pgrst205') ||
+    raw.includes('pgrst204') ||
+    (raw.includes('relation') && raw.includes('does not exist')) ||
+    (raw.includes('could not find the') && raw.includes('column'))
+  ) {
+    return 'We could not finalize the repayment right now because the finance activity log is not configured correctly yet.'
+  }
+
+  return 'We could not complete the loan repayment right now. Please try again.'
 }
 
 function calculateSimpleAprLoan(
@@ -241,6 +263,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-northbridge',
     bankName: 'NorthBridge Capital',
     logoText: 'NB',
+    logoUrl: 'https://i.ibb.co/xSvfwCZK/north-bridge-logo.jpg',
     aprMin: 8.9,
     aprMax: 14.5,
     factorRateMin: 1.08,
@@ -259,6 +282,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-maple-crest',
     bankName: 'Maple Crest Finance',
     logoText: 'MC',
+    logoUrl: 'https://i.ibb.co/gbJnC84J/Chat-GPT-Image-Feb-24-2026-09-05-12-AM.png',
     aprMin: 10.5,
     aprMax: 18.9,
     factorRateMin: 1.1,
@@ -277,6 +301,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-riverstone',
     bankName: 'Riverstone Lending Group',
     logoText: 'RL',
+    logoUrl: 'https://i.ibb.co/P82K4fS/Chat-GPT-Image-Feb-24-2026-09-03-00-AM.png',
     aprMin: 7.95,
     aprMax: 12.75,
     factorRateMin: 1.06,
@@ -295,6 +320,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-blueharbor',
     bankName: 'BlueHarbor Business Credit',
     logoText: 'BH',
+    logoUrl: 'https://i.ibb.co/jP71dz79/Chat-GPT-Image-Feb-24-2026-09-01-11-AM.png',
     aprMin: 9.75,
     aprMax: 16.25,
     factorRateMin: 1.09,
@@ -313,6 +339,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-summit-peak',
     bankName: 'SummitPeak Funding',
     logoText: 'SP',
+    logoUrl: 'https://i.ibb.co/SwZ1b1k2/Chat-GPT-Image-Feb-24-2026-09-01-22-AM.png',
     aprMin: 12.9,
     aprMax: 22.5,
     factorRateMin: 1.14,
@@ -331,6 +358,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-cedarline',
     bankName: 'CedarLine Commercial Finance',
     logoText: 'CL',
+    logoUrl: 'https://i.ibb.co/jvJsdRjm/Chat-GPT-Image-Feb-24-2026-09-01-23-AM.png',
     aprMin: 8.5,
     aprMax: 13.9,
     factorRateMin: 1.07,
@@ -346,6 +374,40 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     notes: 'Competitive terms for stable businesses.',
   },
 ]
+
+function LenderLogo({
+  bankName,
+  logoText,
+  logoUrl,
+  sizeClass = 'h-44 w-44',
+}: {
+  bankName: string
+  logoText: string
+  logoUrl?: string
+  sizeClass?: string
+}): JSX.Element {
+  const [imageFailed, setImageFailed] = useState(false)
+
+  return (
+    <div
+      className={`${sizeClass} rounded-lg border border-slate-200 bg-white flex items-center justify-center overflow-hidden shrink-0`}
+      title={bankName}
+      aria-label={`${bankName} logo`}
+    >
+      {logoUrl && !imageFailed ? (
+        <img
+          src={logoUrl}
+          alt={`${bankName} logo`}
+          className="h-full w-full object-contain p-1"
+          loading="lazy"
+          onError={() => setImageFailed(true)}
+        />
+      ) : (
+        <span className="text-sm font-semibold text-slate-700">{logoText}</span>
+      )}
+    </div>
+  )
+}
 
 export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [loans, setLoans] = useState<CompanyLoan[]>([])
@@ -388,6 +450,14 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [confirmModalError, setConfirmModalError] = useState<string | null>(null)
 
   const [pageSuccessMessage, setPageSuccessMessage] = useState<string | null>(null)
+  const [pageWarningMessage, setPageWarningMessage] = useState<string | null>(null)
+  const [pageActionError, setPageActionError] = useState<string | null>(null)
+  const [repayingLoanId, setRepayingLoanId] = useState<string | null>(null)
+
+  // NEW: custom repay confirmation modal state
+  const [repayConfirmLoan, setRepayConfirmLoan] = useState<CompanyLoan | null>(null)
+  const [isRepayConfirmModalOpen, setIsRepayConfirmModalOpen] = useState<boolean>(false)
+  const [repayConfirmModalError, setRepayConfirmModalError] = useState<string | null>(null)
 
   // robust company id (prevents null company_id insert)
   const effectiveCompanyId = useMemo(() => {
@@ -523,6 +593,10 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     setConfirmOffer(null)
     setIsSubmittingLoan(false)
 
+    setIsRepayConfirmModalOpen(false)
+    setRepayConfirmLoan(null)
+    setRepayConfirmModalError(null)
+
     // leave the offers modal closed if the panel becomes invalid
     setIsOffersOpen(false)
   }, [companyContextState])
@@ -564,6 +638,345 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     }
 
     setLoading(false)
+  }
+
+  async function getCompanyFinancialAccountId(
+    companyId: string
+  ): Promise<{ ok: true; accountId: string } | { ok: false; errorMessage: string }> {
+    // Adjust the column name here if your financial_accounts table uses something else.
+    // Most likely it's `company_id`.
+    const { data, error } = await supabase
+      .from('financial_accounts')
+      .select('id')
+      .eq('company_id', companyId)
+      .limit(1)
+
+    if (error) {
+      console.error('[LoansPanel] Failed to load financial account for company', { companyId, error })
+      return {
+        ok: false,
+        errorMessage:
+          'Could not find the company financial account needed to record this transaction.',
+      }
+    }
+
+    const accountId =
+      Array.isArray(data) && data.length > 0 && data[0] && typeof data[0].id === 'string'
+        ? data[0].id
+        : ''
+
+    if (!accountId) {
+      return {
+        ok: false,
+        errorMessage:
+          'No financial account exists for this company yet, so the transaction could not be recorded.',
+      }
+    }
+
+    return { ok: true, accountId }
+  }
+
+  async function resolveExistingTransactionTypeCode(
+    candidates: string[]
+  ): Promise<{ ok: true; typeCode: string } | { ok: false; errorMessage: string }> {
+    const { data, error } = await supabase
+      .from('transaction_types')
+      .select('code')
+      .in('code', candidates)
+
+    if (error) {
+      console.error('[LoansPanel] Failed to query transaction_types', { candidates, error })
+      return {
+        ok: false,
+        errorMessage:
+          'Could not validate loan transaction types. Please check the transaction_types table configuration.',
+      }
+    }
+
+    const foundCodes = new Set(
+      (data ?? []).map((row) => String((row as { code?: string }).code ?? ''))
+    )
+    const chosen = candidates.find((c) => foundCodes.has(c))
+
+    if (!chosen) {
+      return {
+        ok: false,
+        errorMessage: `Missing transaction type code(s): ${candidates.join(', ')}. Please add them to transaction_types.`,
+      }
+    }
+
+    return { ok: true, typeCode: chosen }
+  }
+
+  async function insertLoanFinancialTransaction(params: {
+    companyId: string
+    loanId: string
+    amount: number
+    kind: 'income' | 'expense'
+    typeCodeCandidates: string[]
+    note: string
+    metadata?: Record<string, unknown>
+  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
+    const amount = round2(Number(params.amount ?? 0))
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return { ok: false, errorMessage: 'Invalid transaction amount for loan financial transaction.' }
+    }
+
+    const accountResult = await getCompanyFinancialAccountId(params.companyId)
+    if (!accountResult.ok) return accountResult
+
+    const typeCodeResult = await resolveExistingTransactionTypeCode(params.typeCodeCandidates)
+    if (!typeCodeResult.ok) return typeCodeResult
+
+    const payload = {
+      account_id: accountResult.accountId,
+      type_code: typeCodeResult.typeCode,
+      kind: params.kind,
+      amount,
+      currency: 'USD',
+      note: params.note,
+      metadata: {
+        loan_id: params.loanId,
+        company_id: params.companyId,
+        source: 'LoansPanel',
+        ...params.metadata,
+      },
+    }
+
+    const { error } = await supabase.from('financial_transactions').insert(payload)
+
+    if (error) {
+      console.error('[LoansPanel] Failed to insert financial_transactions row', { payload, error })
+
+      const raw = String(error.message ?? '').toLowerCase()
+
+      if (raw.includes('violates row-level security') || raw.includes('permission denied')) {
+        return {
+          ok: false,
+          errorMessage:
+            'Transaction could not be recorded because you do not have permission to write financial activity for this company.',
+        }
+      }
+
+      if (raw.includes('financial_transactions_type_code_fkey')) {
+        return {
+          ok: false,
+          errorMessage:
+            'Transaction type is not configured in transaction_types. Please add LOAN_DISBURSEMENT / LOAN_REPAYMENT codes.',
+        }
+      }
+
+      if (raw.includes('financial_transactions_account_id_fkey')) {
+        return {
+          ok: false,
+          errorMessage:
+            'The company financial account is invalid or missing. Please create/fix the company financial account first.',
+        }
+      }
+
+      if (raw.includes('enforce_sufficient_balance') || raw.includes('insufficient')) {
+        return {
+          ok: false,
+          errorMessage:
+            'The company does not have enough balance to complete this loan repayment.',
+        }
+      }
+
+      if (raw.includes('kind') && raw.includes('check')) {
+        return {
+          ok: false,
+          errorMessage:
+            'Loan transaction kind is not accepted by the financial_transactions table rules.',
+        }
+      }
+
+      return {
+        ok: false,
+        errorMessage: error.message || 'Failed to record loan transaction in financial history.',
+      }
+    }
+
+    return { ok: true }
+  }
+
+  async function recordLoanDisbursementTransaction(params: {
+    companyId: string
+    loanId: string
+    amount: number
+    lenderName: string
+    requestedWeeks: number
+    totalOwed: number
+  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
+    return insertLoanFinancialTransaction({
+      companyId: params.companyId,
+      loanId: params.loanId,
+      amount: params.amount,
+      kind: 'income',
+      typeCodeCandidates: LOAN_DISBURSEMENT_TYPE_CODE_CANDIDATES,
+      note: 'Emergency loan disbursement',
+      metadata: {
+        lender_name: params.lenderName,
+        term_weeks: params.requestedWeeks,
+        total_owed: round2(params.totalOwed),
+      },
+    })
+  }
+
+  async function recordLoanRepaymentTransaction(params: {
+    companyId: string
+    loanId: string
+    amount: number
+  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
+    return insertLoanFinancialTransaction({
+      companyId: params.companyId,
+      loanId: params.loanId,
+      amount: params.amount,
+      kind: 'expense',
+      typeCodeCandidates: LOAN_REPAYMENT_TYPE_CODE_CANDIDATES,
+      note: 'Emergency loan repayment',
+      metadata: {
+        repayment_mode: 'manual_full_repayment',
+      },
+    })
+  }
+
+  function closeRepayConfirmModal(): void {
+    if (repayingLoanId) return
+    setIsRepayConfirmModalOpen(false)
+    setRepayConfirmLoan(null)
+    setRepayConfirmModalError(null)
+  }
+
+  async function handleRepayLoan(loan: CompanyLoan): Promise<void> {
+    setPageSuccessMessage(null)
+    setPageActionError(null)
+    setPageWarningMessage(null)
+    setConfirmModalError(null)
+    setRepayConfirmModalError(null)
+
+    if (!loan.active) {
+      setPageActionError('This loan is already inactive/repaid.')
+      return
+    }
+
+    if (companyContextState === 'loading') {
+      setPageActionError('Company details are still loading. Please wait a moment and try again.')
+      return
+    }
+
+    if (companyContextState === 'missing' || !effectiveCompanyId) {
+      setPageActionError(
+        'No company is selected. Please reopen this page from a company and try again.'
+      )
+      return
+    }
+
+    setRepayConfirmLoan(loan)
+    setIsRepayConfirmModalOpen(true)
+  }
+
+  async function confirmRepayLoan(): Promise<void> {
+    if (!repayConfirmLoan) return
+
+    const loan = repayConfirmLoan
+    const repaymentAmount = round2(Number(loan.remaining_owed ?? 0))
+
+    setPageSuccessMessage(null)
+    setPageActionError(null)
+    setPageWarningMessage(null)
+    setConfirmModalError(null)
+    setRepayConfirmModalError(null)
+
+    if (!loan.active) {
+      setRepayConfirmModalError('This loan is already inactive/repaid.')
+      return
+    }
+
+    if (companyContextState === 'loading') {
+      setRepayConfirmModalError('Company details are still loading. Please wait a moment and try again.')
+      return
+    }
+
+    if (companyContextState === 'missing' || !effectiveCompanyId) {
+      setRepayConfirmModalError(
+        'No company is selected. Please reopen this page from a company and try again.'
+      )
+      return
+    }
+
+    setRepayingLoanId(loan.id)
+
+    try {
+      const targetCompanyId = effectiveCompanyId.trim()
+
+      const { error: updateError } = await supabase
+        .from('company_loans')
+        .update({
+          remaining_owed: 0,
+          active: false,
+        })
+        .eq('id', loan.id)
+        .eq('company_id', targetCompanyId)
+
+      if (updateError) {
+        const msg = toFriendlyLoanRepayError(updateError.message)
+        setRepayConfirmModalError(msg)
+        setPageActionError(msg)
+        return
+      }
+
+      const txResult = await recordLoanRepaymentTransaction({
+        companyId: targetCompanyId,
+        loanId: loan.id,
+        amount: repaymentAmount,
+      })
+
+      if (!txResult.ok) {
+        // Best-effort rollback so backend stays consistent if financial transaction insert fails.
+        console.error('[LoansPanel] Repayment transaction logging failed, attempting rollback', txResult)
+
+        const { error: rollbackError } = await supabase
+          .from('company_loans')
+          .update({
+            remaining_owed: loan.remaining_owed,
+            active: loan.active,
+          })
+          .eq('id', loan.id)
+          .eq('company_id', targetCompanyId)
+
+        const userMsg = rollbackError
+          ? `Loan repayment could not be finalized and rollback also failed. Please refresh and check both loan status and financial activity. Root issue: ${txResult.errorMessage}`
+          : txResult.errorMessage
+
+        if (rollbackError) {
+          console.error('[LoansPanel] Rollback also failed after repayment logging failure', {
+            rollbackError,
+            txResult,
+          })
+        }
+
+        setRepayConfirmModalError(userMsg)
+        setPageActionError(userMsg)
+        return
+      }
+
+      await refreshLoansForCompany(targetCompanyId)
+
+      setPageSuccessMessage(`Loan repaid successfully (${formatCurrency(repaymentAmount)}).`)
+      setPageWarningMessage(null)
+
+      setIsRepayConfirmModalOpen(false)
+      setRepayConfirmLoan(null)
+      setRepayConfirmModalError(null)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      const friendly = toFriendlyLoanRepayError(message)
+      setRepayConfirmModalError(friendly)
+      setPageActionError(friendly)
+    } finally {
+      setRepayingLoanId(null)
+    }
   }
 
   // Fetch loans (based on resolved/effective companyId)
@@ -689,7 +1102,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     const q = searchTerm.trim().toLowerCase()
     if (q) {
       result = result.filter((loan) => {
-        return loan.id.toLowerCase().includes(q) || loan.company_id.toLowerCase().includes(q)
+        return loan.id.toLowerCase().includes(q)
       })
     }
 
@@ -890,6 +1303,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
 
   const handleAcceptOffer = (offer: EnrichedLoanOffer): void => {
     setPageSuccessMessage(null)
+    setPageActionError(null)
+    setPageWarningMessage(null)
     setConfirmModalError(null)
 
     if (companyContextState === 'loading') {
@@ -934,6 +1349,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
 
     setIsSubmittingLoan(true)
     setConfirmModalError(null)
+    setPageActionError(null)
+    setPageWarningMessage(null)
 
     try {
       const targetCompanyId = effectiveCompanyId?.trim()
@@ -1004,7 +1421,11 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
         companyProfileId: companyProfile?.id ?? null,
       })
 
-      const { error: insertError } = await supabase.from('company_loans').insert(payload)
+      const { data: createdLoanRow, error: insertError } = await supabase
+        .from('company_loans')
+        .insert(payload)
+        .select('id')
+        .single()
 
       if (insertError) {
         console.error('Failed to create loan row:', {
@@ -1024,12 +1445,50 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
         return
       }
 
+      const createdLoanId = String((createdLoanRow as { id?: string } | null)?.id ?? '')
+
+      if (!createdLoanId) {
+        setConfirmModalError('Loan was created, but the new loan ID could not be read back.')
+        return
+      }
+
+      const loanDisbursementTx = await recordLoanDisbursementTransaction({
+        companyId: targetCompanyId,
+        loanId: createdLoanId,
+        amount: principal, // disbursement = principal credited to company account
+        lenderName: confirmOffer.bankName,
+        requestedWeeks,
+        totalOwed,
+      })
+
+      if (!loanDisbursementTx.ok) {
+        // Best-effort rollback of loan row because financial ledger row is required
+        const { error: rollbackCreateError } = await supabase
+          .from('company_loans')
+          .delete()
+          .eq('id', createdLoanId)
+          .eq('company_id', targetCompanyId)
+
+        console.error('[LoansPanel] Loan created but disbursement transaction failed', {
+          createdLoanId,
+          loanDisbursementTx,
+          rollbackCreateError,
+        })
+
+        const msg = rollbackCreateError
+          ? `Loan row was created but financial transaction logging failed (${loanDisbursementTx.errorMessage}). Please refresh and verify the loan list.`
+          : loanDisbursementTx.errorMessage
+
+        setConfirmModalError(msg)
+        return
+      }
+
       await refreshLoansForCompany(targetCompanyId)
 
       setPageSuccessMessage(
-        `Loan accepted successfully from ${confirmOffer.bankName} (${formatCurrency(
+        `Loan accepted successfully from ${confirmOffer.bankName}. Funds were added to the company account (${formatCurrency(
           requestedAmount
-        )}, ${requestedWeeks} weeks).`
+        )}).`
       )
 
       setIsConfirmModalOpen(false)
@@ -1055,6 +1514,18 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
             {pageSuccessMessage && (
               <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 px-3 py-2 text-sm">
                 {pageSuccessMessage}
+              </div>
+            )}
+
+            {pageWarningMessage && (
+              <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 text-amber-800 px-3 py-2 text-sm">
+                {pageWarningMessage}
+              </div>
+            )}
+
+            {pageActionError && (
+              <div className="mt-3 rounded-md border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+                {pageActionError}
               </div>
             )}
 
@@ -1114,7 +1585,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
           {/* Filters */}
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
             <div className="flex flex-col gap-1">
-              <label className="text-xs text-slate-500">Search (Loan ID / Company ID)</label>
+              <label className="text-xs text-slate-500">Search (Loan ID)</label>
               <input
                 type="text"
                 value={searchTerm}
@@ -1244,7 +1715,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                 <thead className="bg-slate-50 text-slate-600">
                   <tr>
                     <th className="text-left font-medium px-4 py-3">Loan ID</th>
-                    <th className="text-left font-medium px-4 py-3">Company ID</th>
                     <th className="text-left font-medium px-4 py-3">Principal</th>
                     <th className="text-left font-medium px-4 py-3">Fee</th>
                     <th className="text-left font-medium px-4 py-3">Total Owed</th>
@@ -1252,90 +1722,130 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                     <th className="text-left font-medium px-4 py-3">Created At</th>
                     <th className="text-left font-medium px-4 py-3">Expires At</th>
                     <th className="text-left font-medium px-4 py-3">Active</th>
+                    <th className="text-left font-medium px-4 py-3">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredLoans.map((loan) => (
-                    <tr key={loan.id} className="border-t border-slate-100 hover:bg-slate-50/60">
-                      <td className="px-4 py-3 font-mono text-xs">{loan.id}</td>
-                      <td className="px-4 py-3 font-mono text-xs">{loan.company_id}</td>
-                      <td className="px-4 py-3">{formatCurrency(Number(loan.principal))}</td>
-                      <td className="px-4 py-3">{formatCurrency(Number(loan.fee))}</td>
-                      <td className="px-4 py-3">{formatCurrency(Number(loan.total_owed))}</td>
-                      <td className="px-4 py-3">{formatCurrency(Number(loan.remaining_owed))}</td>
-                      <td className="px-4 py-3">{formatDate(loan.created_at)}</td>
-                      <td className="px-4 py-3">{formatDate(loan.expires_at)}</td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={[
-                            'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
-                            loan.active
-                              ? 'bg-emerald-100 text-emerald-700'
-                              : 'bg-slate-100 text-slate-700',
-                          ].join(' ')}
-                        >
-                          {loan.active ? 'Active' : 'Inactive'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredLoans.map((loan) => {
+                    const isRepayingThisLoan = repayingLoanId === loan.id
+                    const repayDisabled =
+                      repayingLoanId !== null || !loan.active || companyContextState !== 'ready'
+
+                    return (
+                      <tr key={loan.id} className="border-t border-slate-100 hover:bg-slate-50/60">
+                        <td className="px-4 py-3 font-mono text-xs">{loan.id}</td>
+                        <td className="px-4 py-3">{formatCurrency(Number(loan.principal))}</td>
+                        <td className="px-4 py-3">{formatCurrency(Number(loan.fee))}</td>
+                        <td className="px-4 py-3">{formatCurrency(Number(loan.total_owed))}</td>
+                        <td className="px-4 py-3">{formatCurrency(Number(loan.remaining_owed))}</td>
+                        <td className="px-4 py-3">{formatDate(loan.created_at)}</td>
+                        <td className="px-4 py-3">{formatDate(loan.expires_at)}</td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={[
+                              'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+                              loan.active
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : 'bg-slate-100 text-slate-700',
+                            ].join(' ')}
+                          >
+                            {loan.active ? 'Active' : 'Inactive'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void handleRepayLoan(loan)
+                            }}
+                            disabled={repayDisabled}
+                            className="inline-flex items-center justify-center rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                            title={
+                              !loan.active
+                                ? 'This loan is already repaid/inactive'
+                                : companyContextState !== 'ready'
+                                ? 'Company context is not ready yet'
+                                : `Repay ${formatCurrency(Number(loan.remaining_owed))}`
+                            }
+                          >
+                            {isRepayingThisLoan ? 'Repaying…' : loan.active ? 'Repay' : 'Repaid'}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
 
             {/* Mobile / tablet cards */}
             <div className="lg:hidden space-y-3">
-              {filteredLoans.map((loan) => (
-                <div key={loan.id} className="rounded-lg border border-slate-200 p-4">
-                  <div className="flex items-start justify-between gap-3 mb-3">
-                    <div>
-                      <div className="text-xs text-slate-500">Loan ID</div>
-                      <div className="font-mono text-xs break-all">{loan.id}</div>
-                    </div>
-                    <span
-                      className={[
-                        'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
-                        loan.active
-                          ? 'bg-emerald-100 text-emerald-700'
-                          : 'bg-slate-100 text-slate-700',
-                      ].join(' ')}
-                    >
-                      {loan.active ? 'Active' : 'Inactive'}
-                    </span>
-                  </div>
+              {filteredLoans.map((loan) => {
+                const isRepayingThisLoan = repayingLoanId === loan.id
+                const repayDisabled =
+                  repayingLoanId !== null || !loan.active || companyContextState !== 'ready'
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                    <div>
-                      <div className="text-xs text-slate-500">Company ID</div>
-                      <div className="font-mono text-xs break-all">{loan.company_id}</div>
+                return (
+                  <div key={loan.id} className="rounded-lg border border-slate-200 p-4">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                      <div>
+                        <div className="text-xs text-slate-500">Loan ID</div>
+                        <div className="font-mono text-xs break-all">{loan.id}</div>
+                      </div>
+                      <span
+                        className={[
+                          'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+                          loan.active
+                            ? 'bg-emerald-100 text-emerald-700'
+                            : 'bg-slate-100 text-slate-700',
+                        ].join(' ')}
+                      >
+                        {loan.active ? 'Active' : 'Inactive'}
+                      </span>
                     </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Principal</div>
-                      <div>{formatCurrency(Number(loan.principal))}</div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                      <div>
+                        <div className="text-xs text-slate-500">Principal</div>
+                        <div>{formatCurrency(Number(loan.principal))}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Fee</div>
+                        <div>{formatCurrency(Number(loan.fee))}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Total Owed</div>
+                        <div>{formatCurrency(Number(loan.total_owed))}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Remaining Owed</div>
+                        <div>{formatCurrency(Number(loan.remaining_owed))}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Created At</div>
+                        <div>{formatDate(loan.created_at)}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Expires At</div>
+                        <div>{formatDate(loan.expires_at)}</div>
+                      </div>
                     </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Fee</div>
-                      <div>{formatCurrency(Number(loan.fee))}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Total Owed</div>
-                      <div>{formatCurrency(Number(loan.total_owed))}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Remaining Owed</div>
-                      <div>{formatCurrency(Number(loan.remaining_owed))}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Created At</div>
-                      <div>{formatDate(loan.created_at)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-slate-500">Expires At</div>
-                      <div>{formatDate(loan.expires_at)}</div>
+
+                    <div className="mt-4 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleRepayLoan(loan)
+                        }}
+                        disabled={repayDisabled}
+                        className="rounded-md border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isRepayingThisLoan ? 'Repaying…' : loan.active ? 'Repay loan' : 'Repaid'}
+                      </button>
                     </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           </>
         )}
@@ -1677,9 +2187,12 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                       >
                         <div className="flex flex-col xl:flex-row gap-4 xl:items-start xl:justify-between">
                           <div className="flex gap-4 min-w-0">
-                            <div className="h-14 w-14 rounded-lg border border-slate-200 bg-slate-50 flex items-center justify-center text-sm font-semibold text-slate-700 shrink-0">
-                              {offer.logoText}
-                            </div>
+                            <LenderLogo
+                              bankName={offer.bankName}
+                              logoText={offer.logoText}
+                              logoUrl={offer.logoUrl}
+                              sizeClass="h-14 w-14"
+                            />
 
                             <div className="min-w-0">
                               <div className="flex items-center flex-wrap gap-2">
@@ -1918,9 +2431,12 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="rounded-lg border border-slate-200 p-4">
                       <div className="flex items-center gap-3 mb-3">
-                        <div className="h-12 w-12 rounded-lg border border-slate-200 bg-slate-50 flex items-center justify-center text-sm font-semibold text-slate-700">
-                          {confirmOffer.logoText}
-                        </div>
+                        <LenderLogo
+                          bankName={confirmOffer.bankName}
+                          logoText={confirmOffer.logoText}
+                          logoUrl={confirmOffer.logoUrl}
+                          sizeClass="h-12 w-12"
+                        />
                         <div>
                           <div className="font-semibold">{confirmOffer.bankName}</div>
                           <div className="text-xs text-slate-500">{confirmOffer.approvalSpeed}</div>
@@ -2043,6 +2559,111 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Repayment Confirmation Modal */}
+      {isRepayConfirmModalOpen && repayConfirmLoan && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4"
+          aria-modal="true"
+          role="dialog"
+        >
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            onClick={closeRepayConfirmModal}
+            aria-label="Close repayment confirmation modal"
+          />
+
+          <div className="relative w-full max-w-2xl rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-4">
+              <div>
+                <h4 className="text-lg font-semibold text-slate-800">Confirm Loan Repayment</h4>
+                <p className="text-sm text-slate-500 mt-1">
+                  Review the repayment details before continuing.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeRepayConfirmModal}
+                disabled={!!repayingLoanId}
+                className="rounded-md border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {repayConfirmModalError && (
+                <div className="rounded-md border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+                  {repayConfirmModalError}
+                </div>
+              )}
+
+              <div className="rounded-xl border border-slate-200 bg-slate-50/40 p-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                  <div>
+                    <div className="text-xs text-slate-500">Loan ID</div>
+                    <div
+                      className="font-mono text-xs md:text-sm break-all mt-1"
+                      title={repayConfirmLoan.id}
+                    >
+                      {repayConfirmLoan.id}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs text-slate-500">Repayment amount</div>
+                    <div className="text-xl font-semibold text-slate-800 mt-1">
+                      {formatCurrency(round2(Number(repayConfirmLoan.remaining_owed ?? 0)))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs text-slate-500">Created At</div>
+                    <div className="font-medium text-slate-700 mt-1">
+                      {formatDate(repayConfirmLoan.created_at)}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs text-slate-500">Expires At</div>
+                    <div className="font-medium text-slate-700 mt-1">
+                      {formatDate(repayConfirmLoan.expires_at)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-md border border-amber-200 bg-amber-50 text-amber-800 px-3 py-2.5 text-sm">
+                This will close the selected loan and update your company loan records. You’ll see the updated status on this page immediately.
+              </div>
+            </div>
+
+            <div className="px-5 py-4 border-t border-slate-200 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeRepayConfirmModal}
+                disabled={!!repayingLoanId}
+                className="rounded-md border border-slate-200 px-4 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  void confirmRepayLoan()
+                }}
+                disabled={!!repayingLoanId}
+                className="rounded-md bg-slate-900 text-white px-4 py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {repayingLoanId === repayConfirmLoan.id ? 'Confirming…' : 'Confirm repayment'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

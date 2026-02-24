@@ -84,6 +84,7 @@ import './lib/safeInsertPatch'
 import './lib/removeChildSafePatch'
 import './services/abortRpcPatch'
 import './lib/globalCityHelper'
+import './lib/legacyFixes'
 
 /* Import small class color overrides (non-layout CSS only) */
 import './styles/classColorOverrides.css'

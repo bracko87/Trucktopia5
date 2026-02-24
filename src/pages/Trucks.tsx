@@ -158,7 +158,7 @@ export default function TrucksPage(): JSX.Element {
               }}
               className="px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded shadow-sm"
             >
-              Purchase used truck
+              Refresh
             </button>
           </div>
         </header>

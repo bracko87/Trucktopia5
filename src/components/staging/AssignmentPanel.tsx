@@ -1079,11 +1079,35 @@ export default function AssignmentPanel({
 
       if (!driverCityId) {
         try {
-          const { data: staffRow, error: staffErr } = await supabase
+          // Schema differs across environments; try a wide select first, then fallback.
+          let staffRow: any = null
+          let staffErr: any = null
+
+          const wide = await supabase
             .from('hired_staff')
             .select('id, current_location_id, location_city_id')
             .eq('id', driverId)
-            .single()
+            .maybeSingle()
+
+          staffRow = wide.data
+          staffErr = wide.error
+
+          const staffErrMsg = String(staffErr?.message ?? '').toLowerCase()
+          const staffErrCode = String((staffErr as any)?.code ?? '')
+
+          if (
+            staffErr &&
+            (staffErrCode === '42703' || staffErrMsg.includes('current_location_id'))
+          ) {
+            const fallback = await supabase
+              .from('hired_staff')
+              .select('id, location_city_id')
+              .eq('id', driverId)
+              .maybeSingle()
+
+            staffRow = fallback.data
+            staffErr = fallback.error
+          }
 
           if (!staffErr && staffRow) {
             driverCityId = staffRow.current_location_id ?? staffRow.location_city_id ?? null

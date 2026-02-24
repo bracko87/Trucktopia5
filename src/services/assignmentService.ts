@@ -94,8 +94,8 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     user_truck_id: userTruckId ?? null,
     user_id: userId ?? null,
     accepted_at: acceptedAt,
-    // Use consistent enum casing to match truck status updates and DB expectations.
-    status: 'PICKING_LOAD',
+    // Normalize assignment status casing for environments using lowercase enums.
+    status: 'picking_load',
   }
 
   // Step 1 — Find an existing assignment for this job_offer
@@ -110,7 +110,17 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     .from('job_assignments')
     .select('*')
     .eq('job_offer_id', jobOfferKey)
-    .in('status', ['assigned', 'picking_load', 'in_progress', 'delivering'])
+    .in('status', [
+      'assigned',
+      'picking_load',
+      'PICKING_LOAD',
+      'in_progress',
+      'IN_PROGRESS',
+      'delivering',
+      'DELIVERING',
+      'to_pickup',
+      'TO_PICKUP',
+    ])
     .limit(1)
     .maybeSingle()
 
@@ -150,7 +160,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
         0
     ) || 0
 
-  const truckCapacity =
+  let resolvedTruckCapacity =
     Number(
       assignment?.truck?._raw?.model_max_load_kg ??
         assignment?.truck?._raw?.master_truck_id?.max_load_kg ??
@@ -159,11 +169,80 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
         0
     ) || 0
 
+  // Fallback: resolve capacity from user_trucks when UI payload omits capacity fields.
+  if (resolvedTruckCapacity <= 0 && userTruckId) {
+    try {
+      const { data: truckRow, error: truckCapErr } = await supabase
+        .from('user_trucks')
+        .select('model_max_load_kg')
+        .eq('id', userTruckId)
+        .limit(1)
+        .maybeSingle()
+
+      if (truckCapErr) {
+        // eslint-disable-next-line no-console
+        console.error('finalizeAssignmentDirect: failed to load truck capacity', truckCapErr)
+      } else {
+        resolvedTruckCapacity = Number(truckRow?.model_max_load_kg ?? 0) || 0
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('finalizeAssignmentDirect: truck capacity lookup exception', e)
+    }
+  }
+
   const assignedPayload = Math.max(
     0,
-    Math.min(sourcePayload, truckCapacity > 0 ? truckCapacity : sourcePayload)
+    Math.min(sourcePayload, resolvedTruckCapacity > 0 ? resolvedTruckCapacity : sourcePayload)
   )
   const remainingPayload = Math.max(0, sourcePayload - assignedPayload)
+
+  // Helper: resolve another owned truck id for follow-up "waiting" rows when the primary truck
+  // conflicts with a unique active-assignment constraint.
+  async function resolveAlternativeTruckId(): Promise<string | null> {
+    const excludeTruckId = userTruckId ?? null
+    if (!resolvedCarrierCompanyId) return null
+
+    const tryColumns = ['owner_company_id', 'company_id']
+
+    for (const companyColumn of tryColumns) {
+      try {
+        let query = supabase.from('user_trucks').select('id').eq(companyColumn, resolvedCarrierCompanyId)
+
+        if (excludeTruckId) {
+          query = query.neq('id', excludeTruckId)
+        }
+
+        const { data, error } = await query.limit(5)
+
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.debug('finalizeAssignmentDirect: alternative truck lookup failed for column', {
+            companyColumn,
+            error,
+          })
+          continue
+        }
+
+        const altTruckId =
+          (Array.isArray(data)
+            ? data.map((r: any) => String(r?.id ?? '')).find(Boolean)
+            : null) ?? null
+
+        if (altTruckId) {
+          return altTruckId
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.debug('finalizeAssignmentDirect: alternative truck lookup exception', {
+          companyColumn,
+          error: e,
+        })
+      }
+    }
+
+    return null
+  }
 
   // Step 2 — Update the existing assignment (do NOT insert)
   const { data: assignmentRow, error: updateErr } = await supabase
@@ -173,6 +252,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
       user_id: updatePayload.user_id,
       accepted_at: updatePayload.accepted_at,
       status: updatePayload.status,
+      assignment_preview_id: previewData?.id ?? existingAssignment?.assignment_preview_id ?? null,
       assigned_payload_kg: assignedPayload,
       payload_remaining_kg: remainingPayload,
     })
@@ -184,6 +264,24 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     // eslint-disable-next-line no-console
     console.error('finalizeAssignmentDirect: failed to update job_assignments', updateErr)
     throw updateErr
+  }
+
+  // Link preview back to assignment for trigger/routing functions that read assignment_preview_id.
+  if (previewData?.id) {
+    try {
+      const { error: previewLinkErr } = await supabase
+        .from('assignment_previews')
+        .update({ assignment_id: assignmentRow.id, company_id: resolvedCarrierCompanyId })
+        .eq('id', previewData.id)
+
+      if (previewLinkErr) {
+        // eslint-disable-next-line no-console
+        console.error('finalizeAssignmentDirect: failed to link assignment_previews row', previewLinkErr)
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('finalizeAssignmentDirect: assignment_previews link exception', e)
+    }
   }
 
   // Step 2b — For multi-run load cargo, create follow-up waiting assignment with remaining payload.
@@ -199,39 +297,105 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
 
     let followUpErr: any = null
 
+    const baseFollowUpPayload: any = {
+      carrier_company_id: resolvedCarrierCompanyId,
+      user_id: userId ?? null,
+      user_truck_id: null,
+      user_trailer_id: null,
+      accepted_at: acceptedAt,
+      assigned_payload_kg: 0,
+      payload_remaining_kg: remainingPayload,
+    }
+
     if (existingFollowUp?.id) {
-      const res = await supabase
+      let res = await supabase
         .from('job_assignments')
-        .update({
-          carrier_company_id: resolvedCarrierCompanyId,
-          user_id: userId ?? null,
-          user_truck_id: null,
-          user_trailer_id: null,
-          accepted_at: acceptedAt,
-          assigned_payload_kg: 0,
-          payload_remaining_kg: remainingPayload,
-        })
+        .update(baseFollowUpPayload)
         .eq('id', existingFollowUp.id)
+
+      // Some environments enforce user_truck_id NOT NULL for all rows.
+      if (
+        res.error?.code == '23514' &&
+        String(res.error?.message ?? '').includes('job_assignments_truck_required') &&
+        userTruckId
+      ) {
+        res = await supabase
+          .from('job_assignments')
+          .update({ ...baseFollowUpPayload, user_truck_id: userTruckId })
+          .eq('id', existingFollowUp.id)
+      }
+
+      // If same truck conflicts with unique active-assignment constraint, use another owned truck for waiting row.
+      if (
+        res.error?.code == '23505' &&
+        String(res.error?.message ?? '').includes('ux_job_offer_truck_active_assignment')
+      ) {
+        const altTruckId = await resolveAlternativeTruckId()
+        if (altTruckId) {
+          res = await supabase
+            .from('job_assignments')
+            .update({ ...baseFollowUpPayload, user_truck_id: altTruckId })
+            .eq('id', existingFollowUp.id)
+        }
+      }
+
       followUpErr = res.error
     } else {
-      const res = await supabase.from('job_assignments').insert({
+      let res = await supabase.from('job_assignments').insert({
         job_offer_id: jobOfferKey,
-        carrier_company_id: resolvedCarrierCompanyId,
-        user_id: userId ?? null,
-        user_truck_id: null,
-        user_trailer_id: null,
         status: 'assigned',
-        accepted_at: acceptedAt,
-        assigned_payload_kg: 0,
-        payload_remaining_kg: remainingPayload,
+        ...baseFollowUpPayload,
       })
+
+      // Some environments enforce user_truck_id NOT NULL for all rows.
+      if (
+        res.error?.code == '23514' &&
+        String(res.error?.message ?? '').includes('job_assignments_truck_required') &&
+        userTruckId
+      ) {
+        res = await supabase.from('job_assignments').insert({
+          job_offer_id: jobOfferKey,
+          status: 'assigned',
+          ...baseFollowUpPayload,
+          user_truck_id: userTruckId,
+        })
+      }
+
+      // If same truck conflicts with unique active-assignment constraint, use another owned truck for waiting row.
+      if (
+        res.error?.code == '23505' &&
+        String(res.error?.message ?? '').includes('ux_job_offer_truck_active_assignment')
+      ) {
+        const altTruckId = await resolveAlternativeTruckId()
+        if (altTruckId) {
+          res = await supabase.from('job_assignments').insert({
+            job_offer_id: jobOfferKey,
+            status: 'assigned',
+            ...baseFollowUpPayload,
+            user_truck_id: altTruckId,
+          })
+        }
+      }
+
       followUpErr = res.error
     }
 
     if (followUpErr) {
-      // eslint-disable-next-line no-console
-      console.error('finalizeAssignmentDirect: failed to create follow-up assigned row', followUpErr)
-      throw followUpErr
+      const isUniqueTruckActiveConflict =
+        followUpErr?.code == '23505' &&
+        String(followUpErr?.message ?? '').includes('ux_job_offer_truck_active_assignment')
+
+      if (isUniqueTruckActiveConflict) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          'finalizeAssignmentDirect: skipped follow-up row due to active assignment unique constraint',
+          followUpErr
+        )
+      } else {
+        // eslint-disable-next-line no-console
+        console.error('finalizeAssignmentDirect: failed to create follow-up assigned row', followUpErr)
+        throw followUpErr
+      }
     }
   }
 
@@ -248,7 +412,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     }
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.error('finalizeAssignmentDirect: job_offers remaining_payload update exception', e)
+    console.error('finalizeAssignmentDirect: job_offers update exception', e)
   }
 
   // Step 3 — Insert driving_sessions (best-effort; do not block the flow on failure)

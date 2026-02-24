@@ -8,13 +8,11 @@
  * Enhanced with maintenance UI and safe location handling:
  * - Tracks currentCity separately from hubCity so real truck location (location_city_id)
  *   is displayed when available.
- * - Hub remains a fallback and is not allowed to overwrite the real location.
+ * - Hub remains separate and is not allowed to overwrite the real location.
  */
 
 import React, { useEffect, useState } from 'react'
-import { Gauge, Calendar, MapPin, Menu, Edit3, Check, X } from 'lucide-react'
-import EditableField from './EditableField'
-import StatChip from './StatChip'
+import { Menu, Edit3, Check, X } from 'lucide-react'
 import { supabaseFetch, getTable } from '../../lib/supabase'
 import LogModal from './LogModal'
 import TruckSpecModal from './TruckSpecModal'
@@ -84,14 +82,50 @@ function formatModelDisplay(info?: ModelInfo | null, fallback?: string) {
  * @param s - status string
  * @returns Tailwind CSS classes
  */
+function formatStatusLabel(s?: string | null) {
+  const raw = String(s ?? 'unknown').trim()
+  if (!raw) return 'unknown'
+  return raw.replace(/_/g, ' ')
+}
+
+/**
+ * extractCityNameFromEmbeddedRelation
+ *
+ * PostgREST/Supabase relationship payloads may come back as either:
+ * - an object (many-to-one)
+ * - an array (one-to-many / ambiguous cardinality)
+ *
+ * This helper safely extracts city_name from either shape.
+ */
+function extractCityNameFromEmbeddedRelation(value: any): string | null {
+  if (!value) return null
+
+  if (Array.isArray(value)) {
+    const first = value[0]
+    return typeof first?.city_name === 'string' && first.city_name.trim()
+      ? first.city_name.trim()
+      : null
+  }
+
+  if (typeof value === 'object') {
+    return typeof value.city_name === 'string' && value.city_name.trim()
+      ? value.city_name.trim()
+      : null
+  }
+
+  return null
+}
+
 function statusClass(s: string) {
   switch (s) {
     case 'available':
       return 'bg-emerald-50 text-emerald-700 ring-emerald-100'
     case 'in_use':
     case 'assigned':
+    case 'in_transit':
       return 'bg-amber-50 text-amber-700 ring-amber-100'
     case 'maintenance':
+    case 'in_repair':
       return 'bg-rose-50 text-rose-700 ring-rose-100'
     case 'suspended':
       return 'bg-rose-600 text-white ring-rose-700'
@@ -436,38 +470,59 @@ export default function TruckCard({
   useEffect(() => {
     if (isMarket) return
     let mounted = true
+
     async function fetchLatestRow() {
       if (!id) return
       try {
-        // Use a safe join to fetch the city name (avoid requesting a non-existing column)
+        // Fetch the real current location via location_city_id -> cities(city_name).
+        // Alias as `location_city` for clarity, and also support older shapes in parsing.
         const res = await supabaseFetch(
           `/rest/v1/user_trucks?id=eq.${encodeURIComponent(
             id
-          )}&select=name,registration,hub,location_city_id,last_maintenance_at,next_maintenance_km,mileage_km,cities:location_city_id(city_name),acquisition_type&limit=1`,
+          )}&select=name,registration,hub,location_city_id,last_maintenance_at,next_maintenance_km,mileage_km,location_city:cities(city_name),acquisition_type&limit=1`,
           { method: 'GET' }
         )
+
         if (!mounted) return
+
         if (res && Array.isArray(res.data) && res.data.length > 0) {
           const row = res.data[0] as any
+
           if (typeof row.name === 'string') setName(row.name)
           if (typeof row.registration === 'string') setRegistration(row.registration)
 
-          // Hub remains hub
+          // Hub remains hub (separate from current location)
           if (typeof row.hub === 'string') setHubCity(row.hub)
 
-          // If the join returned a city row, treat it as the real current location (do NOT write over hub)
-          if (
-            row.cities &&
-            Array.isArray(row.cities) &&
-            row.cities.length > 0 &&
-            row.cities[0]?.city_name
-          ) {
-            setCurrentCity(row.cities[0].city_name)
-          }
+          // Resolve real current location from embedded relation first.
+          // Support both alias `location_city` and older `cities`, and both object/array shapes.
+          const embeddedLocationCityName =
+            extractCityNameFromEmbeddedRelation((row as any).location_city) ??
+            extractCityNameFromEmbeddedRelation((row as any).cities)
 
-          // If the join didn't include cities but payload has location_city_id or location_city_name
-          if (!row.cities && typeof row.location_city_id === 'string' && row.location_city_id) {
-            // leave as-is; backend should return cities join when available
+          if (embeddedLocationCityName) {
+            setCurrentCity(embeddedLocationCityName)
+          } else if (typeof row.location_city_id === 'string' && row.location_city_id) {
+            // Fallback: resolve directly from cities table using location_city_id
+            try {
+              const cityRes: any = await getTable(
+                'cities',
+                `?select=city_name&id=eq.${encodeURIComponent(row.location_city_id)}&limit=1`
+              )
+              const cityRows = Array.isArray(cityRes?.data) ? cityRes.data : []
+              const cityName = cityRows[0]?.city_name
+              if (typeof cityName === 'string' && cityName.trim()) {
+                setCurrentCity(cityName.trim())
+              } else {
+                setCurrentCity(null)
+              }
+            } catch (cityErr) {
+              // eslint-disable-next-line no-console
+              console.debug('Failed to resolve location city from location_city_id', cityErr)
+              setCurrentCity(null)
+            }
+          } else {
+            setCurrentCity(null)
           }
 
           if (typeof row.last_maintenance_at === 'string') {
@@ -489,6 +544,7 @@ export default function TruckCard({
         console.error('Failed to fetch latest truck row', err)
       }
     }
+
     fetchLatestRow()
     return () => {
       mounted = false
@@ -607,12 +663,12 @@ export default function TruckCard({
    */
   async function handleChangeHub(hubId: string) {
     const prevHub = hubCity
-    const prevLocationId = null
     const prevRegistration = registration
+    const prevCurrentCity = currentCity
 
     const selected = hubId ? hubs.find((h) => h.id === hubId) : undefined
     const selectedCity = selected?.city ?? null
-    let selectedCityId = selected?.city_id ?? null
+    const selectedCityId = selected?.city_id ?? null
 
     const [, currentDigits] = parseRegistration(registration ?? defaultRegistration ?? null)
     const newPrefix = makePrefixFromCity(selectedCity)
@@ -620,6 +676,8 @@ export default function TruckCard({
     const newRegistration = `${newPrefix}${newDigits}`
 
     setHubCity(selectedCity)
+    // Since this action also updates location_city_id, keep current location in sync optimistically
+    setCurrentCity(selectedCity)
     setNextMaintenanceKm(nextMaintenanceKm ?? nextMaintenanceKm)
     setRegistration(newRegistration)
 
@@ -644,6 +702,7 @@ export default function TruckCard({
 
       if (!res || res.status < 200 || res.status >= 300) {
         setHubCity(prevHub)
+        setCurrentCity(prevCurrentCity)
         setRegistration(prevRegistration)
         // eslint-disable-next-line no-console
         console.error('Failed to persist hub/location/registration', res)
@@ -651,14 +710,13 @@ export default function TruckCard({
         if (res.data && Array.isArray(res.data) && res.data.length > 0) {
           const returned = res.data[0] as any
           if (returned.registration) setRegistration(returned.registration)
-          if (returned.location_city_id) {
-            // nothing
-          }
           if (returned.hub) setHubCity(returned.hub)
+          // Keep currentCity as optimistic selected city unless a later refresh resolves precise value
         }
       }
     } catch (err) {
       setHubCity(prevHub)
+      setCurrentCity(prevCurrentCity)
       setRegistration(prevRegistration)
       // eslint-disable-next-line no-console
       console.error('Error saving hub/location/registration', err)
@@ -667,11 +725,11 @@ export default function TruckCard({
     }
   }
 
-  // Location display: prefer currentCity (live location), then truck prop, then hub fallback
+  // Location display: ONLY real truck location (user_trucks.location_city_id -> cities.city_name)
+  // Do not fall back to hub here, because hub is not the same thing as current location.
   const location =
     currentCity ??
     (truck as any)?.location_city_name ??
-    hubCity ??
     '—'
 
   function handleToggleExpand() {
@@ -714,9 +772,39 @@ export default function TruckCard({
     }
   }
 
+  const cargoPrimaryName = modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? null
+  const cargoSecondaryName = modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? null
+
+  const payloadValue =
+    (modelInfo as any)?.max_load_kg ??
+    truck?.model_max_load_kg ??
+    truck?.max_payload_kg ??
+    truck?.payload_kg ??
+    null
+
+  const payloadDisplay =
+    payloadValue !== null && payloadValue !== undefined
+      ? `${Number(payloadValue).toLocaleString()} kg`
+      : '—'
+
+  const truckClassForGcw =
+    (modelInfo?.class as string | undefined) ??
+    (truck?.model_class as string | undefined) ??
+    (truck?.truck_class as string | undefined) ??
+    (truck?.class as string | undefined) ??
+    null
+
+  const collapsedGcwLabel = (() => {
+    if (!truckClassForGcw || String(truckClassForGcw).toLowerCase() !== 'big') return '—'
+    const raw = fetchedCgwNum ?? (modelInfo as any)?.gcw ?? (truck as any)?.gcw ?? null
+    const num = raw !== null && raw !== undefined && !Number.isNaN(Number(raw)) ? Number(raw) : null
+    const mapping: Record<number, string> = { 1: 'A', 2: 'B', 3: 'C' }
+    return num != null ? mapping[num] ?? '—' : '—'
+  })()
+
   return (
     <div
-      className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200 ${
+      className={`modern-card relative w-full rounded-xl bg-white overflow-hidden border border-gray-100 shadow ${
         isSuspended ? 'opacity-70 grayscale' : ''
       } ${inTransit ? 'opacity-70' : ''}`}
       role="article"
@@ -742,29 +830,30 @@ export default function TruckCard({
         </div>
       )}
 
-      <div className="flex items-center gap-4 p-3 w-full">
-        <div className="h-12 w-1 rounded-full bg-gradient-to-b from-sky-400 to-emerald-400" />
-        {/* Truck image slot (small preview + edit) */}
-        <TruckImageField
-          truckId={id}
-          initialUrl={modelInfo?.image_url ?? (truck as any)?.image_url ?? (truck as any)?.photo_url ?? null}
-          className="w-12 h-12 rounded-sm border border-slate-100 bg-white object-cover"
-        />
+      {/* Top row converted to trailer-style 3-column grid */}
+      <div className="grid grid-cols-1 md:grid-cols-3 w-full divide-y md:divide-y-0 md:divide-x divide-slate-100">
+        {/* Column 1 - Identity */}
+        <div className="p-4 flex items-center">
+          <div className="flex items-center gap-3 w-full min-w-0">
+            {/* Truck image slot (small preview + edit) */}
+            <TruckImageField
+              truckId={id}
+              initialUrl={modelInfo?.image_url ?? (truck as any)?.image_url ?? (truck as any)?.photo_url ?? null}
+              className="w-12 h-12 rounded-full border border-slate-100 bg-white object-cover"
+            />
 
-        <div className="flex items-center gap-3 min-w-0 flex-1">
-          <div className="min-w-0 w-full">
-            <div className="flex items-center gap-3 w-full">
-              <div className="flex items-center gap-2 min-w-0">
-                <div className="text-xs text-slate-500">Truck Model:</div>
-                <div className="text-sm font-medium truncate">{modelDisplay}</div>
-              </div>
+            <div className="min-w-0 w-full">
+              <div className="font-semibold text-slate-900 truncate">{modelDisplay}</div>
 
-              <div className="inline-flex items-center gap-2 ml-4 min-w-0">
-                <div className="text-xs text-slate-500">Truck Name:</div>
-                <div className="min-w-0 flex items-center gap-2">
+              {/* Truck Name row (editable) */}
+              <div className="text-xs text-slate-500 mt-1 flex items-center gap-1 min-w-0">
+                <span className="font-medium shrink-0">Truck Name:</span>
+
+                <div className="min-w-0 flex items-center gap-1">
                   {!editingName ? (
                     <>
-                      <div className="text-sm font-medium truncate min-w-0">{name ?? defaultName ?? '—'}</div>
+                      <div className="truncate text-slate-700">{name ?? defaultName ?? '—'}</div>
+
                       {!isMarket && !isActionLocked && (
                         <button
                           type="button"
@@ -772,10 +861,10 @@ export default function TruckCard({
                             setEditingName(true)
                             setEditInput(name ?? defaultName ?? '')
                           }}
-                          className="p-1 rounded hover:bg-gray-100 text-slate-500"
+                          className="p-1 rounded hover:bg-gray-100 text-slate-500 shrink-0"
                           aria-label="Edit truck name"
                         >
-                          <Edit3 className="w-4 h-4" />
+                          <Edit3 className="w-3.5 h-3.5" />
                         </button>
                       )}
                     </>
@@ -786,16 +875,21 @@ export default function TruckCard({
                         setEditingName(false)
                         handleSaveName(editInput)
                       }}
-                      className="flex items-center gap-2"
+                      className="flex items-center gap-1 min-w-0"
                     >
                       <input
                         value={editInput}
                         onChange={(e) => setEditInput(e.target.value)}
-                        className="text-sm font-medium truncate min-w-0 px-2 py-1 border border-slate-200 rounded bg-white"
+                        className="h-8 text-xs min-w-0 px-2 border border-slate-200 rounded bg-white"
                         aria-label="Edit truck name input"
                       />
-                      <button type="submit" className="p-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white" aria-label="Save name">
-                        <Check className="w-4 h-4" />
+                      <button
+                        type="submit"
+                        className="p-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white shrink-0"
+                        aria-label="Save name"
+                        disabled={savingName}
+                      >
+                        <Check className="w-3.5 h-3.5" />
                       </button>
                       <button
                         type="button"
@@ -803,394 +897,422 @@ export default function TruckCard({
                           setEditingName(false)
                           setEditInput(name ?? defaultName ?? '')
                         }}
-                        className="p-1 rounded hover:bg-gray-100 text-slate-500"
+                        className="p-1 rounded hover:bg-gray-100 text-slate-500 shrink-0"
                         aria-label="Cancel edit"
                       >
-                        <X className="w-4 h-4" />
+                        <X className="w-3.5 h-3.5" />
                       </button>
                     </form>
                   )}
                 </div>
               </div>
-            </div>
-          </div>
-        </div>
 
-        {/* Cargo type icons OR GCW badge */}
-        <div className="flex items-center gap-3 ml-4 flex-shrink-0">
-          {(() => {
-            const truckClass =
-              modelInfo?.class ??
-              truck?.model_class ??
-              truck?.truck_class ??
-              truck?.class ??
-              null
-
-            const isBig =
-              truckClass &&
-              String(truckClass).toLowerCase() === 'big'
-
-            if (isBig) {
-              const mapping: Record<number, string> = {
-                1: 'A',
-                2: 'B',
-                3: 'C',
-              }
-
-              const label =
-                fetchedCgwNum != null
-                  ? mapping[Number(fetchedCgwNum)] ?? null
-                  : null
-
-              if (!label) return null
-
-              return (
-                <div className="w-10 h-10 flex items-center justify-center rounded-md border border-slate-200 bg-white font-semibold text-slate-700">
-                  {label}
-                </div>
-              )
-            }
-
-            // Small & Medium → cargo icons
-            return (
-              <div className="flex items-center gap-3">
-                {cargoIconUrl ? (
-                  <img
-                    src={cargoIconUrl}
-                    alt="Cargo type"
-                    className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
-                    style={{ flexShrink: 0 }}
-                  />
-                ) : null}
-
-                {cargoIconUrlSecondary ? (
-                  <img
-                    src={cargoIconUrlSecondary}
-                    alt="Secondary cargo type"
-                    className="w-10 h-10 rounded-sm border border-slate-100 bg-white object-cover"
-                    style={{ flexShrink: 0 }}
-                  />
-                ) : null}
+              <div className="text-xs text-slate-500 mt-1 truncate">
+                <span className="font-medium">Registration:</span> {registration ?? defaultRegistration ?? '—'}
               </div>
-            )
-          })()}
-        </div>
 
-        <div className="flex items-center gap-4 ml-6 flex-shrink-0">
-          <StatChip icon={<Gauge className="w-4 h-4 text-slate-400" />} label="Condition" value={`${conditionScore}`} className="min-w-[88px]" />
-
-          <div className="w-20 flex items-center justify-center flex-shrink-0">
-            <div className={`px-2 py-1 rounded-full text-xs font-medium ${statusClass(status)} ring-1 text-center`}>
-              <span className="capitalize">{status.replace('_', ' ')}</span>
+              <div className="text-xs text-slate-500 mt-1 truncate">
+                <span className="font-medium">Cargo type:</span>{' '}
+                {cargoPrimaryName && cargoSecondaryName
+                  ? `${cargoPrimaryName} / ${cargoSecondaryName}`
+                  : cargoPrimaryName ?? cargoSecondaryName ?? '—'}
+              </div>
             </div>
           </div>
         </div>
 
-        <div className="ml-auto flex items-center gap-4">
-          <div className="flex flex-col items-center text-center">
-            <div className="flex items-center gap-2 justify-center">
-              <MapPin className="w-4 h-4 text-slate-400" />
-              <div className="text-xs text-slate-500">Location</div>
+        {/* Column 2 - Condition & key stats */}
+        <div className="p-4 flex items-center">
+          <div className="w-full">
+            <div className="text-sm text-slate-700 font-medium mb-2">Condition</div>
+
+            <div className="flex items-center gap-3">
+              <div className="text-sm font-medium">{conditionScore}</div>
+
+              <div className="w-36 h-2 bg-slate-200 rounded overflow-hidden">
+                <div
+                  style={{
+                    width: `${Math.min(Math.max(Number(conditionScore) || 0, 0), 100)}%`,
+                    background: '#22c55e',
+                    height: '100%',
+                  }}
+                />
+              </div>
+
+              <div className="text-xs text-slate-500 w-20">Health</div>
             </div>
 
-            <div className="text-sm text-slate-700 font-medium truncate w-28" title={String(location)}>
-              {location}
+            <div className="mt-3 text-sm text-slate-700 grid grid-cols-2 gap-4">
+              <div>
+                <span className="font-semibold">Payload:</span> {payloadDisplay}
+              </div>
+
+              <div>
+                <span className="font-semibold">GCW:</span> {collapsedGcwLabel}
+              </div>
+            </div>
+
+            <div className="mt-2 text-xs">
+              <span className="font-medium text-slate-500">Next maintenance:</span>{' '}
+              <span
+                className={
+                  remainingKm === null
+                    ? 'text-slate-700'
+                    : remainingKm > 0
+                      ? 'text-slate-700'
+                      : remainingKm > -3000
+                        ? 'text-amber-700'
+                        : 'text-rose-700'
+                }
+              >
+                {remainingKm === null
+                  ? (nextMaintenanceKm !== null ? `${Number(nextMaintenanceKm).toLocaleString()} km` : '—')
+                  : `${remainingKm.toLocaleString()} km`}
+              </span>
             </div>
           </div>
+        </div>
 
-          <div className="relative">
-            <button type="button" aria-haspopup="true" aria-expanded={expanded} aria-label={expanded ? 'Close truck details' : 'Open truck details'} onClick={handleToggleExpand} className="p-2 rounded-md hover:bg-gray-100 text-slate-600">
-              <Menu className="w-5 h-5" />
-            </button>
+        {/* Column 3 - Status / mileage / location / actions */}
+        <div className="p-4 flex items-start">
+          <div className="flex items-start w-full">
+            <div className="text-sm text-slate-700">
+              <div className="mb-2">
+                <span className="font-semibold">Status:</span>{' '}
+                <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ring-1 ${statusClass(status)}`}>
+                  <span className="capitalize">{formatStatusLabel(status)}</span>
+                </span>
+              </div>
+
+              <div>
+                <span className="font-semibold">Mileage:</span> {Number(mileage).toLocaleString()} km
+              </div>
+
+              <div className="mt-1">
+                <span className="font-semibold">Current location:</span> {location}
+              </div>
+
+              {inTransit && (
+                <div className="mt-2 text-xs text-amber-700">
+                  <span className="font-medium">Transit:</span>{' '}
+                  {availableFromAt ? `Available in ${formatTimeLeftShort(availableFromAt)}` : 'Pending delivery'}
+                </div>
+              )}
+
+              {isSuspended && (
+                <div className="mt-2 text-xs text-rose-700">
+                  <span className="font-medium">Suspended:</span> maintenance required
+                </div>
+              )}
+            </div>
+
+            <div className="ml-auto">
+              <button
+                type="button"
+                onClick={handleToggleExpand}
+                className="inline-flex items-center justify-center w-9 h-9 rounded border border-slate-100 bg-slate-50 text-slate-600 hover:bg-slate-100"
+                aria-expanded={expanded}
+                aria-label={expanded ? 'Collapse truck details' : 'Expand truck details'}
+              >
+                {expanded ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
       {/* Expandable details panel */}
-      <div className={`px-4 overflow-hidden transition-all duration-200 ${expanded ? 'max-h-96 py-4' : 'max-h-0 py-0'}`} aria-hidden={!expanded}>
-        <div className="bg-slate-50 border border-slate-100 rounded-md p-3 shadow-sm">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <div className="text-xs text-slate-500">Truck model</div>
-              <div className="text-sm font-medium text-slate-800 truncate min-w-0">{modelDisplay}</div>
-            </div>
-
-            <div>
-              <div className="text-xs text-slate-500">Producer</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.make ?? truck?.model_make ?? truck?.make ?? truck?.producer ?? '—'}</div>
-            </div>
-
-            <div>
-              <div className="text-xs text-slate-500">GCW</div>
-              <div className="text-sm font-medium text-slate-800">
-                {(() => {
-                  /**
-                   * New GCW rendering:
-                   * - Only display GCW mapped label (A/B/C) for trucks of class "big"
-                   * - Prefer fetchedCgwNum (numeric 1/2/3) from the backend, then model/truck gcw
-                   * - If not applicable or missing, display '—'
-                   */
-                  const truckClass =
-                    (modelInfo?.class as string | undefined) ??
-                    (truck?.model_class as string | undefined) ??
-                    (truck?.truck_class as string | undefined) ??
-                    (truck?.class as string | undefined) ??
-                    null
-
-                  if (!truckClass || String(truckClass).toLowerCase() !== 'big') {
-                    return '—'
-                  }
-
-                  const raw =
-                    fetchedCgwNum ??
-                    (modelInfo as any)?.gcw ??
-                    (truck as any)?.gcw ??
-                    null
-
-                  const num = raw !== null && raw !== undefined && !Number.isNaN(Number(raw)) ? Number(raw) : null
-
-                  const mapping: Record<number, string> = {
-                    1: 'A',
-                    2: 'B',
-                    3: 'C',
-                  }
-
-                  return num != null ? mapping[num] ?? '—' : '—'
-                })()}
+      <div
+        className={`transition-[max-height] duration-200 ease-in-out overflow-hidden ${
+          expanded ? 'max-h-[1400px]' : 'max-h-0'
+        }`}
+        aria-hidden={!expanded}
+      >
+        <div className="pt-2 border-t border-slate-100 p-4 bg-white rounded-b-xl">
+          <div className="bg-slate-50 border border-slate-100 rounded-md p-3 shadow-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <div className="text-xs text-slate-500">Truck model</div>
+                <div className="text-sm font-medium text-slate-800 truncate min-w-0">{modelDisplay}</div>
               </div>
-            </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Class</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.class ?? truck?.model_class ?? truck?.truck_class ?? truck?.class ?? '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Producer</div>
+                <div className="text-sm font-medium text-slate-800">{modelInfo?.make ?? truck?.model_make ?? truck?.make ?? truck?.producer ?? '—'}</div>
+              </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Year</div>
-              {/* Prefer the denormalized year from user_trucks.model_year for active trucks,
-                  fall back to joined modelInfo.year or other year fields when absent. */}
-              <div className="text-sm font-medium text-slate-800">{(truck?.model_year ?? modelInfo?.year) ?? truck?.year ?? truck?.production_year ?? '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">GCW</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {(() => {
+                    /**
+                     * New GCW rendering:
+                     * - Only display GCW mapped label (A/B/C) for trucks of class "big"
+                     * - Prefer fetchedCgwNum (numeric 1/2/3) from the backend, then model/truck gcw
+                     * - If not applicable or missing, display '—'
+                     */
+                    const truckClass =
+                      (modelInfo?.class as string | undefined) ??
+                      (truck?.model_class as string | undefined) ??
+                      (truck?.truck_class as string | undefined) ??
+                      (truck?.class as string | undefined) ??
+                      null
 
-            <div>
-              <div className="text-xs text-slate-500">Max payload</div>
-              <div className="text-sm font-medium text-slate-800">{(modelInfo as any)?.max_load_kg ?? truck?.model_max_load_kg ?? truck?.max_payload_kg ?? truck?.payload_kg ?? '—'}</div>
-            </div>
+                    if (!truckClass || String(truckClass).toLowerCase() !== 'big') {
+                      return '—'
+                    }
 
-            <div>
-              <div className="text-xs text-slate-500">Tonnage in (t)</div>
-              <div className="text-sm font-medium text-slate-800">{modelInfo?.tonnage ?? truck?.model_tonnage ?? truck?.tonnage ?? truck?.gross_tonnage ?? '—'}</div>
-            </div>
+                    const raw =
+                      fetchedCgwNum ??
+                      (modelInfo as any)?.gcw ??
+                      (truck as any)?.gcw ??
+                      null
 
-            <div>
-              <div className="text-xs text-slate-500">Cargo type</div>
-              <div className="text-sm font-medium text-slate-800">
-                <div className="flex items-center gap-2">
-                  {(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) ? (
-                    <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                      {modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? '—'}
-                    </span>
-                  ) : null}
+                    const num = raw !== null && raw !== undefined && !Number.isNaN(Number(raw)) ? Number(raw) : null
 
-                  {(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? (
-                    <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                      {modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? '—'}
-                    </span>
-                  ) : null}
+                    const mapping: Record<number, string> = {
+                      1: 'A',
+                      2: 'B',
+                      3: 'C',
+                    }
 
-                  {!(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) && !(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? '—' : null}
+                    return num != null ? mapping[num] ?? '—' : '—'
+                  })()}
                 </div>
               </div>
-            </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Purchase date</div>
-              <div className="text-sm font-medium text-slate-800">{truck?.purchase_date ? new Date(truck.purchase_date).toLocaleString() : truck?.created_at ? new Date(truck.created_at).toLocaleString() : '—'}</div>
-            </div>
+              <div>
+                <div className="text-xs text-slate-500">Class</div>
+                <div className="text-sm font-medium text-slate-800">{modelInfo?.class ?? truck?.model_class ?? truck?.truck_class ?? truck?.class ?? '—'}</div>
+              </div>
 
-            {/* Acquisition type (new)
+              <div>
+                <div className="text-xs text-slate-500">Year</div>
+                {/* Prefer the denormalized year from user_trucks.model_year for active trucks,
+                  fall back to joined modelInfo.year or other year fields when absent. */}
+                <div className="text-sm font-medium text-slate-800">{(truck?.model_year ?? modelInfo?.year) ?? truck?.year ?? truck?.production_year ?? '—'}</div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Max payload</div>
+                <div className="text-sm font-medium text-slate-800">{(modelInfo as any)?.max_load_kg ?? truck?.model_max_load_kg ?? truck?.max_payload_kg ?? truck?.payload_kg ?? '—'}</div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Tonnage in (t)</div>
+                <div className="text-sm font-medium text-slate-800">{modelInfo?.tonnage ?? truck?.model_tonnage ?? truck?.tonnage ?? truck?.gross_tonnage ?? '—'}</div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Cargo type</div>
+                <div className="text-sm font-medium text-slate-800">
+                  <div className="flex items-center gap-2">
+                    {(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) ? (
+                      <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
+                        {modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? '—'}
+                      </span>
+                    ) : null}
+
+                    {(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? (
+                      <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
+                        {modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? '—'}
+                      </span>
+                    ) : null}
+
+                    {!(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) && !(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? '—' : null}
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Purchase date</div>
+                <div className="text-sm font-medium text-slate-800">{truck?.purchase_date ? new Date(truck.purchase_date).toLocaleString() : truck?.created_at ? new Date(truck.created_at).toLocaleString() : '—'}</div>
+              </div>
+
+              {/* Acquisition type (new)
               Map raw acquisition_type values to either "Purchased" or "Leased". */}
-            <div>
-              <div className="text-xs text-slate-500">Acquisition type</div>
-              <div className="text-sm font-medium text-slate-800">
-                {(() => {
-                  // Normalize and map a variety of possible raw values to two display values.
-                  const raw = acquisitionType ?? (truck?.acquisition_type ?? null)
-                  if (!raw) return 'Purchased'
-                  const v = String(raw).toLowerCase()
-                  if (v.includes('lease') || v.includes('leased') || v.includes('rental') || v.includes('rent')) return 'Leased'
-                  // Treat all other cases (starter, used, purchased, buy, etc.) as Purchased
-                  return 'Purchased'
-                })()}
+              <div>
+                <div className="text-xs text-slate-500">Acquisition type</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {(() => {
+                    // Normalize and map a variety of possible raw values to two display values.
+                    const raw = acquisitionType ?? (truck?.acquisition_type ?? null)
+                    if (!raw) return 'Purchased'
+                    const v = String(raw).toLowerCase()
+                    if (v.includes('lease') || v.includes('leased') || v.includes('rental') || v.includes('rent')) return 'Leased'
+                    // Treat all other cases (starter, used, purchased, buy, etc.) as Purchased
+                    return 'Purchased'
+                  })()}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-500">Mileage in (km)</div>
+                <div className="text-sm font-medium text-slate-800">{mileage != null ? `${mileage}` : '—'}</div>
+              </div>
+
+              {/* Last maintenance (date-only) */}
+              <div>
+                <div className="text-xs text-slate-500">Last maintenance</div>
+                <div className="text-sm font-medium text-slate-800">{lastMaintenanceAt ? new Date(lastMaintenanceAt).toLocaleDateString() : (truck?.created_at ? new Date(truck.created_at).toLocaleDateString() : '—')}</div>
+              </div>
+
+              {/* Next maintenance (remaining km) */}
+              <div>
+                <div className="text-xs text-slate-500">Next maintenance (km)</div>
+                <div className={`text-sm font-medium ${remainingKm === null ? 'text-slate-800' : remainingKm > 0 ? 'text-slate-800' : remainingKm > -3000 ? 'text-amber-700' : 'text-rose-700'}`}>
+                  {remainingKm === null ? (nextMaintenanceKm !== null ? `${Number(nextMaintenanceKm).toLocaleString()} km` : '—') : `${remainingKm.toLocaleString()} km`}
+                </div>
+              </div>
+
+              <TruckInsurance userTruckId={id} className="col-span-1 sm:col-span-1" />
+
+              <div>
+                <div className="text-xs text-slate-500">Hub</div>
+                <div className="text-sm text-slate-700">{hubCity ?? '—'}</div>
               </div>
             </div>
 
-            <div>
-              <div className="text-xs text-slate-500">Mileage in (km)</div>
-              <div className="text-sm font-medium text-slate-800">{mileage != null ? `${mileage}` : '—'}</div>
-            </div>
+            <div className="mt-3 flex items-center gap-3 justify-end">
+              {/* Hub selector + Registration input aligned on the same row */}
+              <div className="mr-auto flex items-center gap-2">
+                <div className="text-xs text-slate-500 hidden sm:block">Hub</div>
 
-            {/* Last maintenance (date-only) */}
-            <div>
-              <div className="text-xs text-slate-500">Last maintenance</div>
-              <div className="text-sm font-medium text-slate-800">{lastMaintenanceAt ? new Date(lastMaintenanceAt).toLocaleDateString() : (truck?.created_at ? new Date(truck.created_at).toLocaleDateString() : '—')}</div>
-            </div>
+                {isMarket ? (
+                  <div className="text-sm px-2 py-1 border border-slate-200 rounded bg-white text-slate-500">— Read-only —</div>
+                ) : loadingHubs ? (
+                  <div className="text-sm text-slate-500">Loading…</div>
+                ) : hubs.length === 0 ? (
+                  <div className="text-sm text-slate-500">No hubs</div>
+                ) : (
+                  <>
+                    <select
+                      aria-label="Select hub"
+                      value={selectedHubId}
+                      onChange={(e) => setSelectedHubId(e.target.value)}
+                      className="text-sm px-2 py-1 border border-slate-200 rounded bg-white"
+                      disabled={savingHub || isActionLocked}
+                    >
+                      <option value="">— Unassigned —</option>
+                      {hubs.map((h) => (
+                        <option key={h.id} value={h.id}>
+                          {h.city ?? '(unknown)'}
+                          {h.is_main ? ' — main' : ''}
+                        </option>
+                      ))}
+                    </select>
 
-            {/* Next maintenance (remaining km) */}
-            <div>
-              <div className="text-xs text-slate-500">Next maintenance (km)</div>
-              <div className={`text-sm font-medium ${remainingKm === null ? 'text-slate-800' : remainingKm > 0 ? 'text-slate-800' : remainingKm > -3000 ? 'text-amber-700' : 'text-rose-700'}`}>
-                {remainingKm === null ? (nextMaintenanceKm !== null ? `${Number(nextMaintenanceKm).toLocaleString()} km` : '—') : `${remainingKm.toLocaleString()} km`}
+                    <RegistrationInput
+                      value={registrationDigits}
+                      onChange={(d) => {
+                        setRegistrationDigits(d)
+                        const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
+                        setRegistration(`${prefix}${d}`)
+                      }}
+                      region={parseRegistration(registration ?? defaultRegistration ?? null)[0]}
+                      onSave={() => {
+                        const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
+                        handleSaveRegistration(`${prefix}${registrationDigits}`)
+                      }}
+                      disabled={savingRegistration || isMarket || isActionLocked}
+                      className="ml-3"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')) return
+                        handleChangeHub(selectedHubId)
+                      }}
+                      disabled={
+                        savingHub ||
+                        isActionLocked ||
+                        selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')
+                      }
+                      className={`text-sm px-3 py-1 rounded border ${savingHub || isActionLocked ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
+                      title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+                    >
+                      Apply
+                    </button>
+                  </>
+                )}
               </div>
+
+              {/* Buttons - disable non-maintenance actions when suspended/in transit */}
+              <button
+                type="button"
+                onClick={() => setShowComponents(true)}
+                className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+                disabled={isActionLocked}
+                title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+              >
+                Components
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowSpecs(true)}
+                className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+                disabled={isActionLocked}
+                title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+              >
+                Specifications
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowLogs(true)}
+                className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+                disabled={isActionLocked}
+                title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+              >
+                Logs
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (!insuranceDisabled && !isActionLocked)
+                    setShowInsurance(true)
+                }}
+                disabled={isActionLocked || insuranceDisabled}
+                className={`px-3 py-1 text-sm border border-slate-200 rounded flex items-center gap-2 ${isActionLocked || insuranceDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'}`}
+                title={
+                  inTransit
+                    ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}`
+                    : insuranceDisabled
+                      ? 'New insurance available 60 days before expiry'
+                      : 'Insurance'
+                }
+              >
+                Insurance
+              </button>
+
+              {/* Maintenance button active for suspended trucks, disabled for in-transit trucks */}
+              <button
+                type="button"
+                onClick={openMaintenance}
+                disabled={inTransit}
+                title={inTransit ? 'Truck is in transit and not yet available' : 'Maintenance'}
+                className={`px-3 py-1 text-sm border rounded text-white flex items-center gap-2 ${
+                  inTransit
+                    ? 'bg-slate-300 border-slate-300 cursor-not-allowed'
+                    : 'bg-amber-600 hover:bg-amber-700 border-amber-600'
+                }`}
+              >
+                Maintenance
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowSell(true)}
+                className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} border ${isActionLocked ? 'border-slate-200' : 'border-red-600'} rounded text-white flex items-center gap-2`}
+                disabled={isActionLocked}
+                title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+              >
+                Sell
+              </button>
             </div>
-
-            <TruckInsurance userTruckId={id} className="col-span-1 sm:col-span-1" />
-
-            <div>
-              <div className="text-xs text-slate-500">Hub</div>
-              <div className="text-sm text-slate-700">{hubCity ?? '—'}</div>
-            </div>
-          </div>
-
-          <div className="mt-3 flex items-center gap-3 justify-end">
-            {/* Hub selector + Registration input aligned on the same row */}
-            <div className="mr-auto flex items-center gap-2">
-              <div className="text-xs text-slate-500 hidden sm:block">Hub</div>
-
-              {isMarket ? (
-                <div className="text-sm px-2 py-1 border border-slate-200 rounded bg-white text-slate-500">— Read-only —</div>
-              ) : loadingHubs ? (
-                <div className="text-sm text-slate-500">Loading…</div>
-              ) : hubs.length === 0 ? (
-                <div className="text-sm text-slate-500">No hubs</div>
-              ) : (
-                <>
-                  <select
-                    aria-label="Select hub"
-                    value={selectedHubId}
-                    onChange={(e) => setSelectedHubId(e.target.value)}
-                    className="text-sm px-2 py-1 border border-slate-200 rounded bg-white"
-                    disabled={savingHub || isActionLocked}
-                  >
-                    <option value="">— Unassigned —</option>
-                    {hubs.map((h) => (
-                      <option key={h.id} value={h.id}>
-                        {h.city ?? '(unknown)'}
-                        {h.is_main ? ' — main' : ''}
-                      </option>
-                    ))}
-                  </select>
-
-                  <RegistrationInput
-                    value={registrationDigits}
-                    onChange={(d) => {
-                      setRegistrationDigits(d)
-                      const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
-                      setRegistration(`${prefix}${d}`)
-                    }}
-                    region={parseRegistration(registration ?? defaultRegistration ?? null)[0]}
-                    onSave={() => {
-                      const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
-                      handleSaveRegistration(`${prefix}${registrationDigits}`)
-                    }}
-                    disabled={savingRegistration || isMarket || isActionLocked}
-                    className="ml-3"
-                  />
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')) return
-                      handleChangeHub(selectedHubId)
-                    }}
-                    disabled={
-                      savingHub ||
-                      isActionLocked ||
-                      selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')
-                    }
-                    className={`text-sm px-3 py-1 rounded border ${savingHub || isActionLocked ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
-                    title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
-                  >
-                    Apply
-                  </button>
-                </>
-              )}
-            </div>
-
-            {/* Buttons - disable non-maintenance actions when suspended/in transit */}
-            <button
-              type="button"
-              onClick={() => setShowComponents(true)}
-              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
-              disabled={isActionLocked}
-              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
-            >
-              Components
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowSpecs(true)}
-              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
-              disabled={isActionLocked}
-              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
-            >
-              Specifications
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowLogs(true)}
-              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
-              disabled={isActionLocked}
-              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
-            >
-              Logs
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                if (!insuranceDisabled && !isActionLocked)
-                  setShowInsurance(true)
-              }}
-              disabled={isActionLocked || insuranceDisabled}
-              className={`px-3 py-1 text-sm border border-slate-200 rounded flex items-center gap-2 ${isActionLocked || insuranceDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'}`}
-              title={
-                inTransit
-                  ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}`
-                  : insuranceDisabled
-                    ? 'New insurance available 60 days before expiry'
-                    : 'Insurance'
-              }
-            >
-              Insurance
-            </button>
-
-            {/* Maintenance button active for suspended trucks, disabled for in-transit trucks */}
-            <button
-              type="button"
-              onClick={openMaintenance}
-              disabled={inTransit}
-              title={inTransit ? 'Truck is in transit and not yet available' : 'Maintenance'}
-              className={`px-3 py-1 text-sm border rounded text-white flex items-center gap-2 ${
-                inTransit
-                  ? 'bg-slate-300 border-slate-300 cursor-not-allowed'
-                  : 'bg-amber-600 hover:bg-amber-700 border-amber-600'
-              }`}
-            >
-              Maintenance
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowSell(true)}
-              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} border ${isActionLocked ? 'border-slate-200' : 'border-red-600'} rounded text-white flex items-center gap-2`}
-              disabled={isActionLocked}
-              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
-            >
-              Sell
-            </button>
           </div>
         </div>
       </div>
