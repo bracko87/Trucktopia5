@@ -415,7 +415,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     console.error('finalizeAssignmentDirect: job_offers update exception', e)
   }
 
-  // Step 3 — Insert driving_sessions (best-effort; do not block the flow on failure)
+  // Step 3 — Insert driving_sessions (required for finalized flow; retry lowercase phase for schema/env differences)
   try {
     const drivingPayload: any = {
       job_assignment_id: assignmentRow.id,
@@ -444,16 +444,30 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     }
 
     if (!existingSession) {
-      const { error: drivingErr } = await supabase
-        .from('driving_sessions')
-        .insert(drivingPayload)
-        .select()
-        .single()
+      let insertRes = await supabase.from('driving_sessions').insert(drivingPayload)
 
-      if (drivingErr) {
-        // eslint-disable-next-line no-console
-        console.error('finalizeAssignmentDirect: failed to insert driving_sessions', drivingErr)
-        // Continue — driving session failure should not leave assignment duplicated (we already updated)
+      // Some environments require lowercase enum/text phase values.
+      if (insertRes.error) {
+        const retryPayload = { ...drivingPayload, phase: 'to_pickup' }
+        insertRes = await supabase.from('driving_sessions').insert(retryPayload)
+      }
+
+      if (insertRes.error) {
+        const errMsg = String(insertRes.error?.message ?? '').toLowerCase()
+        const errCode = String(insertRes.error?.code ?? '')
+        const isRlsInsertError = errCode === '42501' || errMsg.includes('row-level security policy')
+
+        if (isRlsInsertError) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            'finalizeAssignmentDirect: driving_sessions insert blocked by RLS; continuing without session',
+            insertRes.error
+          )
+        } else {
+          // eslint-disable-next-line no-console
+          console.error('finalizeAssignmentDirect: failed to insert driving_sessions', insertRes.error)
+          throw insertRes.error
+        }
       }
     } else {
       // eslint-disable-next-line no-console
@@ -461,9 +475,19 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
         assignmentId: assignmentRow.id,
       })
     }
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error('finalizeAssignmentDirect: driving_sessions insert exception', e)
+  } catch (e: any) {
+    const msg = String(e?.message ?? '').toLowerCase()
+    const code = String(e?.code ?? '')
+    const isRlsInsertError = code === '42501' || msg.includes('row-level security policy')
+
+    if (isRlsInsertError) {
+      // eslint-disable-next-line no-console
+      console.warn('finalizeAssignmentDirect: driving_sessions insert exception caused by RLS; continuing', e)
+    } else {
+      // eslint-disable-next-line no-console
+      console.error('finalizeAssignmentDirect: driving_sessions insert exception', e)
+      throw e
+    }
   }
 
   // Step 4 — Update truck status

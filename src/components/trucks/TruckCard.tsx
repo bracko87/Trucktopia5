@@ -9,6 +9,10 @@
  * - Tracks currentCity separately from hubCity so real truck location (location_city_id)
  *   is displayed when available.
  * - Hub remains separate and is not allowed to overwrite the real location.
+ *
+ * UI enhancements:
+ * - Hover/focus "pop" effect (shadow + slight lift) similar to trailers/staff.
+ * - More granular status pill colors so statuses are easier to distinguish.
  */
 
 import React, { useEffect, useState } from 'react'
@@ -46,6 +50,7 @@ interface ModelInfo {
   fuel_tank_capacity_l?: number | null
   fuel_type?: string | null
   image_url?: string | null
+  gcw?: number | null
 }
 
 /**
@@ -116,19 +121,59 @@ function extractCityNameFromEmbeddedRelation(value: any): string | null {
   return null
 }
 
+/**
+ * extractEmbeddedTruckModel
+ *
+ * Normalizes PostgREST embed payload for `truck_models` so callers can consume
+ * a single object regardless of whether the relation is returned as object/array.
+ */
+function extractEmbeddedTruckModel(value: any): any | null {
+  if (!value) return null
+  if (Array.isArray(value)) return value[0] ?? null
+  if (typeof value === 'object') return value
+  return null
+}
+
 function statusClass(s: string) {
-  switch (s) {
+  switch ((s ?? '').toLowerCase()) {
+    // Idle / available
     case 'available':
       return 'bg-emerald-50 text-emerald-700 ring-emerald-100'
-    case 'in_use':
+    case 'idle':
+      return 'bg-sky-50 text-sky-700 ring-sky-100'
+    case 'parked':
+      return 'bg-slate-50 text-slate-700 ring-slate-200'
+
+    // Operational / assigned (separated visually)
     case 'assigned':
-    case 'in_transit':
       return 'bg-amber-50 text-amber-700 ring-amber-100'
+    case 'in_use':
+      return 'bg-orange-50 text-orange-700 ring-orange-100'
+    case 'reserved':
+      return 'bg-teal-50 text-teal-700 ring-teal-100'
+
+    // Job progress / transit
+    case 'picking_up':
+      return 'bg-indigo-50 text-indigo-700 ring-indigo-100'
+    case 'loading':
+      return 'bg-blue-50 text-blue-700 ring-blue-100'
+    case 'in_transit':
+      return 'bg-cyan-50 text-cyan-700 ring-cyan-100'
+    case 'delivering':
+      return 'bg-violet-50 text-violet-700 ring-violet-100'
+    case 'unloading':
+      return 'bg-fuchsia-50 text-fuchsia-700 ring-fuchsia-100'
+
+    // Maintenance / problem states
     case 'maintenance':
-    case 'in_repair':
       return 'bg-rose-50 text-rose-700 ring-rose-100'
+    case 'in_repair':
+      return 'bg-red-50 text-red-700 ring-red-100'
+    case 'damaged':
+      return 'bg-red-100 text-red-800 ring-red-200'
     case 'suspended':
       return 'bg-rose-600 text-white ring-rose-700'
+
     default:
       return 'bg-gray-50 text-gray-700 ring-gray-100'
   }
@@ -214,6 +259,57 @@ export default function TruckCard({
   const status = ((truck?.status as unknown as string) ?? 'unknown').toLowerCase()
   const mileage = (truck?.mileage_km as unknown as number) ?? (truck as any)?.mileage ?? 0
   const conditionScore = (truck?.condition_score as unknown as number) ?? 0
+
+  // Embedded truck_model relation from page-level joined fetch (object or array)
+  const embeddedTruckModel = React.useMemo(
+    () => extractEmbeddedTruckModel((truck as any)?.truck_models),
+    [truck]
+  )
+
+  // Prefer explicit modelInfo prop, then embedded relation, then denormalized truck fields
+  const resolvedModelInfo: ModelInfo = React.useMemo(
+    () => ({
+      make: modelInfo?.make ?? embeddedTruckModel?.make ?? truck?.model_make ?? null,
+      model: modelInfo?.model ?? embeddedTruckModel?.model ?? truck?.model_model ?? null,
+      country: modelInfo?.country ?? embeddedTruckModel?.country ?? truck?.model_country ?? null,
+      class: modelInfo?.class ?? embeddedTruckModel?.class ?? truck?.model_class ?? null,
+      max_payload: modelInfo?.max_payload ?? embeddedTruckModel?.max_payload ?? null,
+      tonnage: modelInfo?.tonnage ?? embeddedTruckModel?.tonnage ?? truck?.model_tonnage ?? null,
+      year: modelInfo?.year ?? embeddedTruckModel?.year ?? truck?.model_year ?? null,
+      cargo_type_id: modelInfo?.cargo_type_id ?? embeddedTruckModel?.cargo_type_id ?? truck?.cargo_type_id ?? null,
+      cargo_type_name: modelInfo?.cargo_type_name ?? embeddedTruckModel?.cargo_type_name ?? truck?.cargo_type_name ?? null,
+      cargo_type_id_secondary:
+        modelInfo?.cargo_type_id_secondary ??
+        embeddedTruckModel?.cargo_type_id_secondary ??
+        truck?.cargo_type_id_secondary ??
+        null,
+      cargo_type_secondary_name:
+        modelInfo?.cargo_type_secondary_name ??
+        embeddedTruckModel?.cargo_type_secondary_name ??
+        truck?.cargo_type_secondary_name ??
+        null,
+      max_load_kg:
+        modelInfo?.max_load_kg ??
+        embeddedTruckModel?.max_load_kg ??
+        truck?.model_max_load_kg ??
+        truck?.max_payload_kg ??
+        null,
+      fuel_tank_capacity_l:
+        modelInfo?.fuel_tank_capacity_l ??
+        embeddedTruckModel?.fuel_tank_capacity_l ??
+        truck?.model_fuel_tank_capacity_l ??
+        null,
+      fuel_type: modelInfo?.fuel_type ?? embeddedTruckModel?.fuel_type ?? truck?.model_fuel_type ?? null,
+      image_url: modelInfo?.image_url ?? embeddedTruckModel?.image_url ?? truck?.model_image_url ?? null,
+      gcw:
+        modelInfo?.gcw ??
+        (embeddedTruckModel?.gcw !== undefined && embeddedTruckModel?.gcw !== null
+          ? Number(embeddedTruckModel?.gcw)
+          : null) ??
+        ((truck as any)?.gcw !== undefined && (truck as any)?.gcw !== null ? Number((truck as any)?.gcw) : null),
+    }),
+    [modelInfo, embeddedTruckModel, truck]
+  )
 
   // Maintenance related state
   const [lastMaintenanceAt, setLastMaintenanceAt] = useState<string | null>((truck as any)?.last_maintenance_at ?? null)
@@ -306,20 +402,32 @@ export default function TruckCard({
       }
     }
 
-    if (id) checkInsurance()
+    if (id) void checkInsurance()
   }, [id])
 
   const rawModelId = (truck as any)?.master_truck_id ?? null
 
   /**
    * Fetch CGW/GCW numeric code from truck_models when not present in the
-   * passed modelInfo or truck row. The truck_models table stores numeric codes
-   * (1/2/3) which we map to labels A/B/C below.
+   * passed modelInfo / embedded model / truck row. The truck_models table stores
+   * numeric codes (1/2/3) which we map to labels A/B/C below.
    */
   React.useEffect(() => {
     let mounted = true
+
     async function loadCgwFromModel() {
+      // Prefer already-embedded or passed model data first
+      const preResolvedRaw = resolvedModelInfo?.gcw ?? (truck as any)?.gcw ?? null
+      if (preResolvedRaw !== null && preResolvedRaw !== undefined && !Number.isNaN(Number(preResolvedRaw))) {
+        if (mounted) {
+          setFetchedCgwNum(Number(preResolvedRaw))
+          setFetchedCgwLabel(null)
+        }
+        return
+      }
+
       if (!rawModelId) return
+
       try {
         const q = `?select=gcw&id=eq.${encodeURIComponent(String(rawModelId))}&limit=1`
         const res: any = await getTable('truck_models', q)
@@ -340,41 +448,28 @@ export default function TruckCard({
         setFetchedCgwLabel(null)
       }
     }
+
     void loadCgwFromModel()
     return () => {
       mounted = false
     }
-    // only depends on rawModelId
-  }, [rawModelId])
+  }, [rawModelId, resolvedModelInfo?.gcw, truck])
 
   // Model display
   const derivedModelName =
-    truck?.model_make ? `${truck.model_make} ${truck.model_model ?? ''}`.trim() : truck?.model_model ?? null
+    truck?.model_make
+      ? `${truck.model_make} ${truck.model_model ?? ''}`.trim()
+      : truck?.model_model ?? (embeddedTruckModel ? `${embeddedTruckModel?.make ?? ''} ${embeddedTruckModel?.model ?? ''}`.trim() : null)
 
   const modelDisplay = formatModelDisplay(
-    modelInfo ?? {
-      make: truck?.model_make ?? null,
-      model: truck?.model_model ?? null,
-      country: truck?.model_country ?? null,
-      class: truck?.model_class ?? null,
-      max_payload: truck?.model_max_load_kg ?? null,
-      tonnage: truck?.model_tonnage ?? null,
-      year: truck?.model_year ?? null,
-      cargo_type_id: truck?.cargo_type_id ?? null,
-      cargo_type_name: truck?.cargo_type_name ?? null,
-      cargo_type_id_secondary: truck?.cargo_type_id_secondary ?? null,
-      cargo_type_secondary_name: truck?.cargo_type_secondary_name ?? null,
-      fuel_tank_capacity_l: truck?.model_fuel_tank_capacity_l ?? null,
-      fuel_type: truck?.model_fuel_type ?? null,
-      image_url: truck?.model_image_url ?? null,
-    },
+    resolvedModelInfo,
     derivedModelName ?? rawModelId ?? 'Unknown model'
   )
 
   /**
    * loadCargoIconsFromModel
    *
-   * Resolve cargo_type_id(s) using modelInfo or master_truck_id then fetch icon_urls.
+   * Resolve cargo_type_id(s) using resolvedModelInfo or master_truck_id then fetch icon_urls.
    * Caches results on window.__cargoIconCache.
    */
   useEffect(() => {
@@ -399,9 +494,11 @@ export default function TruckCard({
     }
 
     async function resolveCargoTypeIdsFromModel() {
-      let primary: string | null | undefined = modelInfo?.cargo_type_id ?? null
-      let secondary: string | null | undefined = modelInfo?.cargo_type_id_secondary ?? null
+      let primary: string | null | undefined = resolvedModelInfo?.cargo_type_id ?? null
+      let secondary: string | null | undefined = resolvedModelInfo?.cargo_type_id_secondary ?? null
       const modelId = (truck as any)?.master_truck_id ?? null
+
+      // If page already embedded truck_models and resolvedModelInfo is populated, skip extra model fetch
       if ((!primary || !secondary) && modelId) {
         try {
           const res: any = await getTable(
@@ -422,14 +519,21 @@ export default function TruckCard({
 
     async function load() {
       if (!mounted) return
+
       const { primary, secondary } = await resolveCargoTypeIdsFromModel()
       let iconPrimary = null
       let iconSecondary = null
+
       if (primary) iconPrimary = await fetchCargoIconByCargoTypeId(String(primary))
       if (secondary) iconSecondary = await fetchCargoIconByCargoTypeId(String(secondary))
 
       if (!iconPrimary) {
-        const cargoTypeName = (truck as any)?.cargo_type_name ?? modelInfo?.cargo_type_name ?? (truck as any)?.cargo_type ?? null
+        const cargoTypeName =
+          (truck as any)?.cargo_type_name ??
+          resolvedModelInfo?.cargo_type_name ??
+          (truck as any)?.cargo_type ??
+          null
+
         if (cargoTypeName) {
           try {
             const res: any = await getTable('cargo_types', `?select=icon_url&name=eq.${encodeURIComponent(String(cargoTypeName))}&limit=1`)
@@ -450,14 +554,26 @@ export default function TruckCard({
       setCargoIconUrl(iconPrimary ?? null)
       setCargoIconUrlSecondary(iconSecondary ?? null)
       // eslint-disable-next-line no-console
-      console.debug('cargo icon lookup from model', { master_truck_id: (truck as any)?.master_truck_id, primary, secondary, iconPrimary, iconSecondary })
+      console.debug('cargo icon lookup from model', {
+        master_truck_id: (truck as any)?.master_truck_id,
+        primary,
+        secondary,
+        iconPrimary,
+        iconSecondary,
+      })
     }
 
     void load()
     return () => {
       mounted = false
     }
-  }, [truck?.master_truck_id, modelInfo?.cargo_type_id, modelInfo?.cargo_type_id_secondary, modelInfo?.cargo_type_name, truck?.cargo_type_name])
+  }, [
+    truck?.master_truck_id,
+    truck?.cargo_type_name,
+    resolvedModelInfo?.cargo_type_id,
+    resolvedModelInfo?.cargo_type_id_secondary,
+    resolvedModelInfo?.cargo_type_name,
+  ])
 
   // Initial seed for currentCity from prop (do not override if already set)
   useEffect(() => {
@@ -545,7 +661,7 @@ export default function TruckCard({
       }
     }
 
-    fetchLatestRow()
+    void fetchLatestRow()
     return () => {
       mounted = false
     }
@@ -576,7 +692,7 @@ export default function TruckCard({
         if (mounted) setLoadingHubs(false)
       }
     }
-    load()
+    void load()
     return () => {
       mounted = false
     }
@@ -678,7 +794,6 @@ export default function TruckCard({
     setHubCity(selectedCity)
     // Since this action also updates location_city_id, keep current location in sync optimistically
     setCurrentCity(selectedCity)
-    setNextMaintenanceKm(nextMaintenanceKm ?? nextMaintenanceKm)
     setRegistration(newRegistration)
 
     if (isMarket) {
@@ -762,7 +877,7 @@ export default function TruckCard({
           id,
           mileage_km: Number(truck?.mileage_km ?? mileage),
           purchase_date: truck?.purchase_date ?? truck?.created_at,
-          model: { class: truck?.model_class ?? modelInfo?.class },
+          model: { class: truck?.model_class ?? resolvedModelInfo?.class },
         } as any,
         'city'
       )
@@ -772,11 +887,11 @@ export default function TruckCard({
     }
   }
 
-  const cargoPrimaryName = modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? null
-  const cargoSecondaryName = modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? null
+  const cargoPrimaryName = resolvedModelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? null
+  const cargoSecondaryName = resolvedModelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? null
 
   const payloadValue =
-    (modelInfo as any)?.max_load_kg ??
+    resolvedModelInfo?.max_load_kg ??
     truck?.model_max_load_kg ??
     truck?.max_payload_kg ??
     truck?.payload_kg ??
@@ -788,7 +903,7 @@ export default function TruckCard({
       : '—'
 
   const truckClassForGcw =
-    (modelInfo?.class as string | undefined) ??
+    (resolvedModelInfo?.class as string | undefined) ??
     (truck?.model_class as string | undefined) ??
     (truck?.truck_class as string | undefined) ??
     (truck?.class as string | undefined) ??
@@ -796,7 +911,7 @@ export default function TruckCard({
 
   const collapsedGcwLabel = (() => {
     if (!truckClassForGcw || String(truckClassForGcw).toLowerCase() !== 'big') return '—'
-    const raw = fetchedCgwNum ?? (modelInfo as any)?.gcw ?? (truck as any)?.gcw ?? null
+    const raw = fetchedCgwNum ?? resolvedModelInfo?.gcw ?? (truck as any)?.gcw ?? null
     const num = raw !== null && raw !== undefined && !Number.isNaN(Number(raw)) ? Number(raw) : null
     const mapping: Record<number, string> = { 1: 'A', 2: 'B', 3: 'C' }
     return num != null ? mapping[num] ?? '—' : '—'
@@ -804,9 +919,14 @@ export default function TruckCard({
 
   return (
     <div
-      className={`modern-card relative w-full rounded-xl bg-white overflow-hidden border border-gray-100 shadow ${
-        isSuspended ? 'opacity-70 grayscale' : ''
-      } ${inTransit ? 'opacity-70' : ''}`}
+      className={[
+        'modern-card group relative w-full rounded-xl bg-white overflow-hidden border border-gray-100',
+        'shadow-sm transform-gpu transition-all duration-200 ease-out',
+        'hover:-translate-y-0.5 hover:shadow-lg hover:border-slate-200',
+        'focus-within:-translate-y-0.5 focus-within:shadow-lg focus-within:border-slate-200',
+        isSuspended ? 'opacity-70 grayscale' : '',
+        inTransit ? 'opacity-70' : '',
+      ].join(' ')}
       role="article"
       aria-label={`Truck ${id || 'unknown'}`}
     >
@@ -838,7 +958,7 @@ export default function TruckCard({
             {/* Truck image slot (small preview + edit) */}
             <TruckImageField
               truckId={id}
-              initialUrl={modelInfo?.image_url ?? (truck as any)?.image_url ?? (truck as any)?.photo_url ?? null}
+              initialUrl={resolvedModelInfo?.image_url ?? (truck as any)?.image_url ?? (truck as any)?.photo_url ?? null}
               className="w-12 h-12 rounded-full border border-slate-100 bg-white object-cover"
             />
 
@@ -1038,7 +1158,9 @@ export default function TruckCard({
 
               <div>
                 <div className="text-xs text-slate-500">Producer</div>
-                <div className="text-sm font-medium text-slate-800">{modelInfo?.make ?? truck?.model_make ?? truck?.make ?? truck?.producer ?? '—'}</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {resolvedModelInfo?.make ?? truck?.model_make ?? truck?.make ?? truck?.producer ?? '—'}
+                </div>
               </div>
 
               <div>
@@ -1048,11 +1170,11 @@ export default function TruckCard({
                     /**
                      * New GCW rendering:
                      * - Only display GCW mapped label (A/B/C) for trucks of class "big"
-                     * - Prefer fetchedCgwNum (numeric 1/2/3) from the backend, then model/truck gcw
+                     * - Prefer fetchedCgwNum (numeric 1/2/3) from the backend, then resolvedModelInfo.gcw, then truck.gcw
                      * - If not applicable or missing, display '—'
                      */
                     const truckClass =
-                      (modelInfo?.class as string | undefined) ??
+                      (resolvedModelInfo?.class as string | undefined) ??
                       (truck?.model_class as string | undefined) ??
                       (truck?.truck_class as string | undefined) ??
                       (truck?.class as string | undefined) ??
@@ -1064,7 +1186,7 @@ export default function TruckCard({
 
                     const raw =
                       fetchedCgwNum ??
-                      (modelInfo as any)?.gcw ??
+                      resolvedModelInfo?.gcw ??
                       (truck as any)?.gcw ??
                       null
 
@@ -1083,43 +1205,51 @@ export default function TruckCard({
 
               <div>
                 <div className="text-xs text-slate-500">Class</div>
-                <div className="text-sm font-medium text-slate-800">{modelInfo?.class ?? truck?.model_class ?? truck?.truck_class ?? truck?.class ?? '—'}</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {resolvedModelInfo?.class ?? truck?.model_class ?? truck?.truck_class ?? truck?.class ?? '—'}
+                </div>
               </div>
 
               <div>
                 <div className="text-xs text-slate-500">Year</div>
                 {/* Prefer the denormalized year from user_trucks.model_year for active trucks,
                   fall back to joined modelInfo.year or other year fields when absent. */}
-                <div className="text-sm font-medium text-slate-800">{(truck?.model_year ?? modelInfo?.year) ?? truck?.year ?? truck?.production_year ?? '—'}</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {(truck?.model_year ?? resolvedModelInfo?.year) ?? truck?.year ?? truck?.production_year ?? '—'}
+                </div>
               </div>
 
               <div>
                 <div className="text-xs text-slate-500">Max payload</div>
-                <div className="text-sm font-medium text-slate-800">{(modelInfo as any)?.max_load_kg ?? truck?.model_max_load_kg ?? truck?.max_payload_kg ?? truck?.payload_kg ?? '—'}</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {resolvedModelInfo?.max_load_kg ?? truck?.model_max_load_kg ?? truck?.max_payload_kg ?? truck?.payload_kg ?? '—'}
+                </div>
               </div>
 
               <div>
                 <div className="text-xs text-slate-500">Tonnage in (t)</div>
-                <div className="text-sm font-medium text-slate-800">{modelInfo?.tonnage ?? truck?.model_tonnage ?? truck?.tonnage ?? truck?.gross_tonnage ?? '—'}</div>
+                <div className="text-sm font-medium text-slate-800">
+                  {resolvedModelInfo?.tonnage ?? truck?.model_tonnage ?? truck?.tonnage ?? truck?.gross_tonnage ?? '—'}
+                </div>
               </div>
 
               <div>
                 <div className="text-xs text-slate-500">Cargo type</div>
                 <div className="text-sm font-medium text-slate-800">
                   <div className="flex items-center gap-2">
-                    {(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) ? (
+                    {(resolvedModelInfo?.cargo_type_id ?? truck?.cargo_type_id) ? (
                       <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                        {modelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? '—'}
+                        {resolvedModelInfo?.cargo_type_name ?? truck?.cargo_type_name ?? '—'}
                       </span>
                     ) : null}
 
-                    {(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? (
+                    {(resolvedModelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? (
                       <span className="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200">
-                        {modelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? '—'}
+                        {resolvedModelInfo?.cargo_type_secondary_name ?? truck?.cargo_type_secondary_name ?? '—'}
                       </span>
                     ) : null}
 
-                    {!(modelInfo?.cargo_type_id ?? truck?.cargo_type_id) && !(modelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? '—' : null}
+                    {!(resolvedModelInfo?.cargo_type_id ?? truck?.cargo_type_id) && !(resolvedModelInfo?.cargo_type_id_secondary ?? truck?.cargo_type_id_secondary) ? '—' : null}
                   </div>
                 </div>
               </div>

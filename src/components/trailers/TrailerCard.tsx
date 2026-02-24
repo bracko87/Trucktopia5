@@ -10,6 +10,10 @@
  * - Adds inline Image URL field (Save / Copy / Preview) for user_trailers.image_url
  *   similar to the hired staff card.
  * - Preview opens in-page modal popup (not new tab/window).
+ *
+ * UX upgrades:
+ * - Adds hover/focus "pop" card effect similar to trucks page cards.
+ * - Adds more granular status colors so different statuses are visually distinct.
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -53,21 +57,67 @@ function resolveImageUrl(trailer: any): string | undefined {
 }
 
 /**
+ * formatStatusLabel
+ *
+ * Converts raw status values (e.g. "picking_up") into UI-friendly labels.
+ */
+function formatStatusLabel(s?: string | null) {
+  const raw = String(s ?? 'unknown').trim()
+  if (!raw) return 'unknown'
+  return raw.replace(/_/g, ' ')
+}
+
+/**
  * statusClass
  *
  * Returns Tailwind classes for status badge visuals.
+ * Expanded so common trailer statuses have distinct colors.
  *
  * @param s - optional status string
  * @returns tailwind classes
  */
 function statusClass(s?: string | null) {
   switch ((s ?? '').toLowerCase()) {
+    // Idle / available
     case 'available':
       return 'bg-emerald-50 text-emerald-700 ring-emerald-100'
+    case 'idle':
+      return 'bg-sky-50 text-sky-700 ring-sky-100'
+
+    // Assigned / planned / attached
     case 'assigned':
       return 'bg-amber-50 text-amber-700 ring-amber-100'
+    case 'planned':
+      return 'bg-yellow-50 text-yellow-700 ring-yellow-100'
+    case 'attached':
+      return 'bg-teal-50 text-teal-700 ring-teal-100'
+    case 'detached':
+      return 'bg-slate-50 text-slate-700 ring-slate-200'
+
+    // Job progress (make these visually different from each other)
+    case 'picking_up':
+      return 'bg-indigo-50 text-indigo-700 ring-indigo-100'
+    case 'loading':
+      return 'bg-blue-50 text-blue-700 ring-blue-100'
+    case 'in_transit':
+      return 'bg-cyan-50 text-cyan-700 ring-cyan-100'
+    case 'delivering':
+      return 'bg-violet-50 text-violet-700 ring-violet-100'
+    case 'unloading':
+      return 'bg-orange-50 text-orange-700 ring-orange-100'
+
+    // Maintenance / blocked / problem states
     case 'maintenance':
       return 'bg-rose-50 text-rose-700 ring-rose-100'
+    case 'in_repair':
+      return 'bg-red-50 text-red-700 ring-red-100'
+    case 'damaged':
+      return 'bg-red-100 text-red-800 ring-red-200'
+    case 'suspended':
+      return 'bg-rose-600 text-white ring-rose-700'
+    case 'inactive':
+      return 'bg-gray-100 text-gray-700 ring-gray-200'
+
     default:
       return 'bg-gray-50 text-gray-700 ring-gray-100'
   }
@@ -381,12 +431,20 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
   }
 
   return (
-    <article className="bg-white rounded-xl shadow w-full border border-gray-100 overflow-hidden" role="article">
+    <article
+      className={[
+        'modern-card group relative w-full rounded-xl bg-white border border-gray-100 overflow-hidden',
+        'shadow-sm transform-gpu transition-all duration-200 ease-out',
+        'hover:-translate-y-0.5 hover:shadow-lg hover:border-slate-200',
+        'focus-within:-translate-y-0.5 focus-within:shadow-lg focus-within:border-slate-200',
+      ].join(' ')}
+      role="article"
+    >
       {/* Top row converted to 3-column grid to match HiredStaff visual */}
       <div className="grid grid-cols-1 md:grid-cols-3 w-full divide-y md:divide-y-0 md:divide-x divide-slate-100">
         {/* Column 1 - Identity */}
         <div className="p-4 flex items-center">
-          <div className="flex items-center gap-3 w-full">
+          <div className="flex items-center gap-3 w-full min-w-0">
             <Avatar image={imageToShow} onError={() => setImageError(true)} />
 
             <div className="min-w-0">
@@ -398,7 +456,7 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
               </div>
 
               {/* MOVED: Cargo type under the editable name (Column 1) */}
-              <div className="text-xs text-slate-500 mt-1">
+              <div className="text-xs text-slate-500 mt-1 truncate">
                 <span className="font-medium">Cargo type:</span> {cargoTypeDisplay}
               </div>
             </div>
@@ -432,8 +490,8 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
                 {model?.max_load_kg
                   ? `${Number(model.max_load_kg).toLocaleString()} kg`
                   : trailer.payloadKg
-                  ? `${trailer.payloadKg.toLocaleString()} kg`
-                  : '—'}
+                    ? `${trailer.payloadKg.toLocaleString()} kg`
+                    : '—'}
               </div>
 
               {/* MOVED: Show GCW in Column 2 where Cargo Type used to be */}
@@ -451,7 +509,9 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
             <div className="text-sm text-slate-700">
               <div className="mb-2">
                 <span className="font-semibold">Status:</span>{' '}
-                <StatPill className={statusClass(trailer.status)}>{trailer.status ?? 'unknown'}</StatPill>
+                <StatPill className={statusClass(trailer.status)}>
+                  <span className="capitalize">{formatStatusLabel(trailer.status)}</span>
+                </StatPill>
               </div>
 
               <div>
@@ -472,6 +532,7 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
                 className="inline-flex items-center justify-center w-9 h-9 rounded border border-slate-100 bg-slate-50 text-slate-600 hover:bg-slate-100"
                 aria-expanded={expanded}
                 aria-label={expanded ? 'Collapse trailer details' : 'Expand trailer details'}
+                type="button"
               >
                 {expanded ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
               </button>
@@ -519,8 +580,8 @@ export default function TrailerCard({ trailer }: TrailerCardProps): JSX.Element 
                   {model?.max_load_kg
                     ? `${Number(model.max_load_kg).toLocaleString()} kg`
                     : trailer.payloadKg
-                    ? `${trailer.payloadKg.toLocaleString()} kg`
-                    : '—'}
+                      ? `${trailer.payloadKg.toLocaleString()} kg`
+                      : '—'}
                 </div>
               </div>
 

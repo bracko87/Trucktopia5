@@ -200,6 +200,8 @@ export default function MyJobs(): JSX.Element {
         'accepted_at',
         'pickup_started_at',
         'assignment_preview_id',
+        'assigned_payload_kg',
+        'payload_remaining_kg',
         'job_offer:job_offer_id(' +
           [
             'id',
@@ -299,6 +301,21 @@ export default function MyJobs(): JSX.Element {
 
         const authoritativePhase = ds?.phase ?? row.status ?? null
         const normalizedStatus = normalizePhase(authoritativePhase)
+        const rowStatus = String(row.status ?? '').toLowerCase()
+
+        const rowRemainingPayload = Number(row?.payload_remaining_kg ?? NaN)
+        const rowAssignedPayload = Number(row?.assigned_payload_kg ?? NaN)
+
+        let displayPayload = j.remaining_payload ?? j.weight_kg ?? null
+        if (rowStatus === 'assigned' && Number.isFinite(rowRemainingPayload) && rowRemainingPayload >= 0) {
+          displayPayload = rowRemainingPayload
+        } else if (
+          ['picking_load', 'to_pickup', 'in_progress', 'delivering', 'in_transit'].includes(rowStatus) &&
+          Number.isFinite(rowAssignedPayload) &&
+          rowAssignedPayload > 0
+        ) {
+          displayPayload = rowAssignedPayload
+        }
 
         const deliveryDeadline = j.delivery_deadline ?? null
         const isDeadlineExpired =
@@ -313,7 +330,7 @@ export default function MyJobs(): JSX.Element {
           delivery_deadline: j.delivery_deadline ?? null,
           transport_mode: j.transport_mode ?? null,
           weight_kg: j.weight_kg ?? null,
-          remaining_payload: j.remaining_payload ?? j.weight_kg ?? null,
+          remaining_payload: displayPayload,
           volume_m3: j.volume_m3 ?? null,
           pallets: j.pallets ?? null,
           reward_trailer_cargo: j.reward_trailer_cargo ?? null,

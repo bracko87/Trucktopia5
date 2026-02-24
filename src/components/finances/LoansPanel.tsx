@@ -90,8 +90,6 @@ type EnrichedLoanOffer = LoanOffer & {
 type CompanyContextState = 'ready' | 'loading' | 'missing'
 
 const COMPANY_CONTEXT_GRACE_MS = 1200
-const LOAN_DISBURSEMENT_TYPE_CODE_CANDIDATES = ['LOAN_DISBURSEMENT', 'LOAN_PROCEEDS']
-const LOAN_REPAYMENT_TYPE_CODE_CANDIDATES = ['LOAN_REPAYMENT']
 
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -127,6 +125,14 @@ function toFriendlyLoanCreateError(message?: string): string {
     return 'You do not have permission to create a loan for this company.'
   }
 
+  if (
+    raw.includes('pgrst202') ||
+    (raw.includes('could not find the function') &&
+      raw.includes('rpc_create_company_loan_with_disbursement'))
+  ) {
+    return 'Loan creation is not configured on the backend yet (missing RPC: rpc_create_company_loan_with_disbursement).'
+  }
+
   return 'We could not create the loan right now. Please try again.'
 }
 
@@ -138,12 +144,28 @@ function toFriendlyLoanRepayError(message?: string): string {
   }
 
   if (
+    raw.includes('pgrst202') ||
+    (raw.includes('could not find the function') &&
+      raw.includes('rpc_repay_company_loan_with_transaction'))
+  ) {
+    return 'Loan repayment is not configured on the backend yet (missing RPC: rpc_repay_company_loan_with_transaction).'
+  }
+
+  if (raw.includes('42703') || (raw.includes('column') && raw.includes('does not exist'))) {
+    return 'Loan repayment failed because the server loan function references a missing database column. Please update the RPC SQL function to match your current schema.'
+  }
+
+  if (
     raw.includes('pgrst205') ||
     raw.includes('pgrst204') ||
     (raw.includes('relation') && raw.includes('does not exist')) ||
     (raw.includes('could not find the') && raw.includes('column'))
   ) {
     return 'We could not finalize the repayment right now because the finance activity log is not configured correctly yet.'
+  }
+
+  if (raw.includes('insufficient') || raw.includes('enforce_sufficient_balance')) {
+    return 'The company does not have enough balance to complete this loan repayment.'
   }
 
   return 'We could not complete the loan repayment right now. Please try again.'
@@ -640,207 +662,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     setLoading(false)
   }
 
-  async function getCompanyFinancialAccountId(
-    companyId: string
-  ): Promise<{ ok: true; accountId: string } | { ok: false; errorMessage: string }> {
-    // Adjust the column name here if your financial_accounts table uses something else.
-    // Most likely it's `company_id`.
-    const { data, error } = await supabase
-      .from('financial_accounts')
-      .select('id')
-      .eq('company_id', companyId)
-      .limit(1)
-
-    if (error) {
-      console.error('[LoansPanel] Failed to load financial account for company', { companyId, error })
-      return {
-        ok: false,
-        errorMessage:
-          'Could not find the company financial account needed to record this transaction.',
-      }
-    }
-
-    const accountId =
-      Array.isArray(data) && data.length > 0 && data[0] && typeof data[0].id === 'string'
-        ? data[0].id
-        : ''
-
-    if (!accountId) {
-      return {
-        ok: false,
-        errorMessage:
-          'No financial account exists for this company yet, so the transaction could not be recorded.',
-      }
-    }
-
-    return { ok: true, accountId }
-  }
-
-  async function resolveExistingTransactionTypeCode(
-    candidates: string[]
-  ): Promise<{ ok: true; typeCode: string } | { ok: false; errorMessage: string }> {
-    const { data, error } = await supabase
-      .from('transaction_types')
-      .select('code')
-      .in('code', candidates)
-
-    if (error) {
-      console.error('[LoansPanel] Failed to query transaction_types', { candidates, error })
-      return {
-        ok: false,
-        errorMessage:
-          'Could not validate loan transaction types. Please check the transaction_types table configuration.',
-      }
-    }
-
-    const foundCodes = new Set(
-      (data ?? []).map((row) => String((row as { code?: string }).code ?? ''))
-    )
-    const chosen = candidates.find((c) => foundCodes.has(c))
-
-    if (!chosen) {
-      return {
-        ok: false,
-        errorMessage: `Missing transaction type code(s): ${candidates.join(', ')}. Please add them to transaction_types.`,
-      }
-    }
-
-    return { ok: true, typeCode: chosen }
-  }
-
-  async function insertLoanFinancialTransaction(params: {
-    companyId: string
-    loanId: string
-    amount: number
-    kind: 'income' | 'expense'
-    typeCodeCandidates: string[]
-    note: string
-    metadata?: Record<string, unknown>
-  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
-    const amount = round2(Number(params.amount ?? 0))
-
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, errorMessage: 'Invalid transaction amount for loan financial transaction.' }
-    }
-
-    const accountResult = await getCompanyFinancialAccountId(params.companyId)
-    if (!accountResult.ok) return accountResult
-
-    const typeCodeResult = await resolveExistingTransactionTypeCode(params.typeCodeCandidates)
-    if (!typeCodeResult.ok) return typeCodeResult
-
-    const payload = {
-      account_id: accountResult.accountId,
-      type_code: typeCodeResult.typeCode,
-      kind: params.kind,
-      amount,
-      currency: 'USD',
-      note: params.note,
-      metadata: {
-        loan_id: params.loanId,
-        company_id: params.companyId,
-        source: 'LoansPanel',
-        ...params.metadata,
-      },
-    }
-
-    const { error } = await supabase.from('financial_transactions').insert(payload)
-
-    if (error) {
-      console.error('[LoansPanel] Failed to insert financial_transactions row', { payload, error })
-
-      const raw = String(error.message ?? '').toLowerCase()
-
-      if (raw.includes('violates row-level security') || raw.includes('permission denied')) {
-        return {
-          ok: false,
-          errorMessage:
-            'Transaction could not be recorded because you do not have permission to write financial activity for this company.',
-        }
-      }
-
-      if (raw.includes('financial_transactions_type_code_fkey')) {
-        return {
-          ok: false,
-          errorMessage:
-            'Transaction type is not configured in transaction_types. Please add LOAN_DISBURSEMENT / LOAN_REPAYMENT codes.',
-        }
-      }
-
-      if (raw.includes('financial_transactions_account_id_fkey')) {
-        return {
-          ok: false,
-          errorMessage:
-            'The company financial account is invalid or missing. Please create/fix the company financial account first.',
-        }
-      }
-
-      if (raw.includes('enforce_sufficient_balance') || raw.includes('insufficient')) {
-        return {
-          ok: false,
-          errorMessage:
-            'The company does not have enough balance to complete this loan repayment.',
-        }
-      }
-
-      if (raw.includes('kind') && raw.includes('check')) {
-        return {
-          ok: false,
-          errorMessage:
-            'Loan transaction kind is not accepted by the financial_transactions table rules.',
-        }
-      }
-
-      return {
-        ok: false,
-        errorMessage: error.message || 'Failed to record loan transaction in financial history.',
-      }
-    }
-
-    return { ok: true }
-  }
-
-  async function recordLoanDisbursementTransaction(params: {
-    companyId: string
-    loanId: string
-    amount: number
-    lenderName: string
-    requestedWeeks: number
-    totalOwed: number
-  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
-    return insertLoanFinancialTransaction({
-      companyId: params.companyId,
-      loanId: params.loanId,
-      amount: params.amount,
-      kind: 'income',
-      typeCodeCandidates: LOAN_DISBURSEMENT_TYPE_CODE_CANDIDATES,
-      note: 'Emergency loan disbursement',
-      metadata: {
-        lender_name: params.lenderName,
-        term_weeks: params.requestedWeeks,
-        total_owed: round2(params.totalOwed),
-      },
-    })
-  }
-
-  async function recordLoanRepaymentTransaction(params: {
-    companyId: string
-    loanId: string
-    amount: number
-  }): Promise<{ ok: true } | { ok: false; errorMessage: string }> {
-    return insertLoanFinancialTransaction({
-      companyId: params.companyId,
-      loanId: params.loanId,
-      amount: params.amount,
-      kind: 'expense',
-      typeCodeCandidates: LOAN_REPAYMENT_TYPE_CODE_CANDIDATES,
-      note: 'Emergency loan repayment',
-      metadata: {
-        repayment_mode: 'manual_full_repayment',
-      },
-    })
-  }
-
   function closeRepayConfirmModal(): void {
     if (repayingLoanId) return
     setIsRepayConfirmModalOpen(false)
@@ -910,56 +731,44 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     try {
       const targetCompanyId = effectiveCompanyId.trim()
 
-      const { error: updateError } = await supabase
-        .from('company_loans')
-        .update({
-          remaining_owed: 0,
-          active: false,
-        })
-        .eq('id', loan.id)
-        .eq('company_id', targetCompanyId)
-
-      if (updateError) {
-        const msg = toFriendlyLoanRepayError(updateError.message)
-        setRepayConfirmModalError(msg)
-        setPageActionError(msg)
-        return
-      }
-
-      const txResult = await recordLoanRepaymentTransaction({
-        companyId: targetCompanyId,
-        loanId: loan.id,
-        amount: repaymentAmount,
+      const { data, error } = await supabase.rpc('rpc_repay_company_loan_with_transaction', {
+        p_company_id: targetCompanyId,
+        p_loan_id: loan.id,
+        p_repayment_amount: repaymentAmount, // <-- exact RPC param name
+        p_note: 'Loan repayment',
       })
 
-      if (!txResult.ok) {
-        // Best-effort rollback so backend stays consistent if financial transaction insert fails.
-        console.error('[LoansPanel] Repayment transaction logging failed, attempting rollback', txResult)
+      if (error) {
+        const fullMsg = [
+          (error as any).code ? `code=${(error as any).code}` : null,
+          error.message,
+          (error as any).details ? `details=${(error as any).details}` : null,
+          (error as any).hint ? `hint=${(error as any).hint}` : null,
+        ]
+          .filter(Boolean)
+          .join(' | ')
 
-        const { error: rollbackError } = await supabase
-          .from('company_loans')
-          .update({
-            remaining_owed: loan.remaining_owed,
-            active: loan.active,
-          })
-          .eq('id', loan.id)
-          .eq('company_id', targetCompanyId)
+        console.error('[LoansPanel] repay RPC failed:', {
+          error,
+          fullMsg,
+          payload: {
+            p_company_id: targetCompanyId,
+            p_loan_id: loan.id,
+            p_repayment_amount: repaymentAmount,
+          },
+        })
 
-        const userMsg = rollbackError
-          ? `Loan repayment could not be finalized and rollback also failed. Please refresh and check both loan status and financial activity. Root issue: ${txResult.errorMessage}`
-          : txResult.errorMessage
-
-        if (rollbackError) {
-          console.error('[LoansPanel] Rollback also failed after repayment logging failure', {
-            rollbackError,
-            txResult,
-          })
-        }
-
-        setRepayConfirmModalError(userMsg)
-        setPageActionError(userMsg)
+        const friendly = toFriendlyLoanRepayError(fullMsg)
+        setRepayConfirmModalError(friendly)
+        setPageActionError(friendly)
         return
       }
+
+      console.info('[LoansPanel] RPC repay loan success', {
+        loanId: loan.id,
+        companyId: targetCompanyId,
+        repayRpcResult: data,
+      })
 
       await refreshLoansForCompany(targetCompanyId)
 
@@ -1399,89 +1208,50 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
         (confirmOffer.estimate.originationFee + confirmOffer.estimate.adminFee).toFixed(2)
       )
       const totalOwed = Number(confirmOffer.estimate.totalRepayment.toFixed(2))
-      const remainingOwed = totalOwed
 
-      const payload = {
-        company_id: targetCompanyId,
-        principal,
-        fee,
-        total_owed: totalOwed,
-        remaining_owed: remainingOwed,
-        expires_at: expiresAt.toISOString(),
-        active: true,
-      }
-
-      console.info('[LoansPanel] Creating loan payload', {
-        payload,
+      console.info('[LoansPanel] Calling rpc_create_company_loan_with_disbursement', {
         companyContextState,
         incomingCompanyId: companyId ?? null,
         resolvedCompanyId: resolvedCompanyId || null,
         isResolvingCompanyId,
         effectiveCompanyId: targetCompanyId,
         companyProfileId: companyProfile?.id ?? null,
-      })
-
-      const { data: createdLoanRow, error: insertError } = await supabase
-        .from('company_loans')
-        .insert(payload)
-        .select('id')
-        .single()
-
-      if (insertError) {
-        console.error('Failed to create loan row:', {
-          payload,
-          supabaseError: insertError,
-          diagnostics: {
-            incomingCompanyId: companyId ?? null,
-            resolvedCompanyId: resolvedCompanyId || null,
-            isResolvingCompanyId,
-            effectiveCompanyId: targetCompanyId,
-            companyContextState,
-            companyProfileId: companyProfile?.id ?? null,
-            companyProfileError,
-          },
-        })
-        setConfirmModalError(toFriendlyLoanCreateError(insertError.message))
-        return
-      }
-
-      const createdLoanId = String((createdLoanRow as { id?: string } | null)?.id ?? '')
-
-      if (!createdLoanId) {
-        setConfirmModalError('Loan was created, but the new loan ID could not be read back.')
-        return
-      }
-
-      const loanDisbursementTx = await recordLoanDisbursementTransaction({
-        companyId: targetCompanyId,
-        loanId: createdLoanId,
-        amount: principal, // disbursement = principal credited to company account
-        lenderName: confirmOffer.bankName,
-        requestedWeeks,
+        principal,
+        fee,
         totalOwed,
+        expiresAt: expiresAt.toISOString(),
+        requestedWeeks,
+        scheduledWeeklyPayment: Number(confirmOffer.estimate.weeklyPayment.toFixed(2)),
+        lenderName: confirmOffer.bankName,
+        repaymentMode,
       })
 
-      if (!loanDisbursementTx.ok) {
-        // Best-effort rollback of loan row because financial ledger row is required
-        const { error: rollbackCreateError } = await supabase
-          .from('company_loans')
-          .delete()
-          .eq('id', createdLoanId)
-          .eq('company_id', targetCompanyId)
+      const { data: rpcResult, error: rpcError } = await supabase.rpc(
+        'rpc_create_company_loan_with_disbursement',
+        {
+          p_company_id: targetCompanyId,
+          p_principal: principal,
+          p_fee: fee,
+          p_total_owed: totalOwed,
+          p_expires_at: expiresAt.toISOString(),
+          p_repayment_term_weeks: requestedWeeks,
+          p_scheduled_weekly_payment: Number(confirmOffer.estimate.weeklyPayment.toFixed(2)),
+          p_lender_name: confirmOffer.bankName,
+          p_repayment_mode: repaymentMode,
+          p_note: `Loan disbursement (${confirmOffer.bankName})`,
+        }
+      )
 
-        console.error('[LoansPanel] Loan created but disbursement transaction failed', {
-          createdLoanId,
-          loanDisbursementTx,
-          rollbackCreateError,
-        })
-
-        const msg = rollbackCreateError
-          ? `Loan row was created but financial transaction logging failed (${loanDisbursementTx.errorMessage}). Please refresh and verify the loan list.`
-          : loanDisbursementTx.errorMessage
-
-        setConfirmModalError(msg)
+      if (rpcError) {
+        console.error('RPC create loan failed:', rpcError)
+        setConfirmModalError(toFriendlyLoanCreateError(rpcError.message))
         return
       }
+
+      console.info('[LoansPanel] RPC create loan success', {
+        companyId: targetCompanyId,
+        rpcResult,
+      })
 
       await refreshLoansForCompany(targetCompanyId)
 
