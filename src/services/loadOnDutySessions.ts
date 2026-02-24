@@ -11,6 +11,88 @@
 import { supabase } from '../lib/supabase'
 
 /**
+ * loadActiveAssignmentsFallback
+ *
+ * Fallback loader for environments where driving_sessions INSERT/SELECT is blocked by RLS.
+ * Builds session-shaped rows from active job_assignments so Staging Active stays functional.
+ */
+async function loadActiveAssignmentsFallback(companyId: string) {
+  const activeStatuses = [
+    'assigned',
+    'picking_load',
+    'PICKING_LOAD',
+    'to_pickup',
+    'TO_PICKUP',
+    'in_progress',
+    'IN_PROGRESS',
+    'delivering',
+    'DELIVERING',
+    'waiting_driver',
+    'WAITING_DRIVER',
+  ]
+
+  const { data: rows, error } = await supabase
+    .from('job_assignments')
+    .select(
+      [
+        'id',
+        'status',
+        'carrier_company_id',
+        'user_truck_id',
+        'user_trailer_id',
+        'user_id',
+        'final_reward',
+        'accepted_at',
+        'assigned_payload_kg',
+        'payload_remaining_kg',
+        'job_offer:job_offer_id(' +
+          'id,' +
+          'transport_mode,' +
+          'reward_load_cargo,' +
+          'reward_trailer_cargo,' +
+          'distance_km,' +
+          'origin_city:origin_city_id(city_name),' +
+          'destination_city:destination_city_id(city_name),' +
+          'pickup_time,' +
+          'delivery_deadline' +
+          ')',
+      ].join(',')
+    )
+    .eq('carrier_company_id', companyId)
+    .in('status', activeStatuses)
+    .order('accepted_at', { ascending: false })
+    .limit(200)
+
+  if (error || !Array.isArray(rows)) {
+    console.warn('loadOnDutySessions: fallback active assignments load failed', error)
+    return []
+  }
+
+  return rows.map((a: any) => ({
+    id: `fallback-${a.id}`,
+    job_assignment_id: a.id,
+    phase: a.status,
+    distance_completed_km: 0,
+    total_distance_km: Number(a?.job_offer?.distance_km ?? 0) || 0,
+    phase_started_at: a.accepted_at ?? null,
+    created_at: a.accepted_at ?? null,
+    user_truck_id: a.user_truck_id ?? null,
+    driver_id: a.user_id ?? null,
+    relocation_ready_at: null,
+    user_truck: null,
+    job_assignment: {
+      ...a,
+      resolved_reward:
+        a.final_reward ??
+        (a?.job_offer?.transport_mode === 'trailer_cargo'
+          ? a?.job_offer?.reward_trailer_cargo
+          : a?.job_offer?.reward_load_cargo) ??
+        null,
+    },
+  }))
+}
+
+/**
  * loadOnDutySessions
  *
  * Load driving sessions for the app's "On Duty" panel in a safe, three-step manner
@@ -60,6 +142,13 @@ export async function loadOnDutySessions(companyId?: string | null) {
     if (sessErr) {
       // Log full error and return empty so UI does not break.
       console.error('loadOnDutySessions: sessions load error', sessErr)
+
+      const msg = String(sessErr?.message ?? '').toLowerCase()
+      const code = String(sessErr?.code ?? '')
+      if (code === '42501' || msg.includes('row-level security policy')) {
+        return await loadActiveAssignmentsFallback(String(companyId))
+      }
+
       return []
     }
 
@@ -77,8 +166,8 @@ export async function loadOnDutySessions(companyId?: string | null) {
     console.debug(`loadOnDutySessions: derived assignmentIds = ${assignmentIds.length}`)
 
     if (assignmentIds.length === 0) {
-      console.debug('loadOnDutySessions: no assignmentIds found — returning empty list')
-      return []
+      console.debug('loadOnDutySessions: no assignmentIds found — using assignments fallback')
+      return await loadActiveAssignmentsFallback(String(companyId))
     }
 
     // STEP 2: load assignments with a safe embedded job_offer (minimal)

@@ -19,6 +19,7 @@ import { abortAssignment } from '../../services/jobsService'
 import { useAuth } from '../../context/AuthContext'
 import { formatPhase } from '../../lib/formatPhase'
 import { getTimeStatus } from '../../lib/timeStatus'
+import { supabase } from '../../lib/supabase'
 
 /**
  * DrivingSessionRow
@@ -174,6 +175,9 @@ function shallowEqualSerialized(a: any, b: any): boolean {
 export default function StagingAssignmentsPanel({ companyId }: StagingAssignmentsPanelProps) {
   const { user } = useAuth()
   const resolvedCompanyId = companyId ?? (user as any)?.company_id ?? null
+  const [effectiveCompanyId, setEffectiveCompanyId] = useState<string | null>(
+    resolvedCompanyId ? String(resolvedCompanyId) : null
+  )
 
   const [tab, setTab] = useState<'active'>('active')
   const [activeSessions, setActiveSessions] = useState<DrivingSessionRow[]>([])
@@ -195,6 +199,47 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
   const [abortTarget, setAbortTarget] = useState<string | null>(null)
   const [aborting, setAborting] = useState(false)
 
+  useEffect(() => {
+    let cancelled = false
+
+    if (resolvedCompanyId) {
+      setEffectiveCompanyId(String(resolvedCompanyId))
+      return () => {
+        cancelled = true
+      }
+    }
+
+    ;(async () => {
+      try {
+        const session = await supabase.auth.getSession()
+        const authUserId = session.data.session?.user?.id
+        if (!authUserId) {
+          if (!cancelled) setEffectiveCompanyId(null)
+          return
+        }
+
+        const lookupBy = async (field: 'auth_user_id' | 'id') => {
+          const { data } = await supabase
+            .from('users')
+            .select('company_id')
+            .eq(field, authUserId)
+            .limit(1)
+            .maybeSingle()
+          return data?.company_id ? String(data.company_id) : null
+        }
+
+        const companyFromUser = (await lookupBy('auth_user_id')) ?? (await lookupBy('id'))
+        if (!cancelled) setEffectiveCompanyId(companyFromUser)
+      } catch {
+        if (!cancelled) setEffectiveCompanyId(null)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [resolvedCompanyId, user?.id])
+
   /**
    * toggleExpanded
    *
@@ -210,10 +255,13 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
   }
 
   const fetchAll = useCallback(async () => {
-    if (!resolvedCompanyId) return
+    if (!effectiveCompanyId) {
+      setActiveSessions([])
+      return
+    }
     setLoading(true)
     try {
-      const sessions = await loadOnDutySessions(resolvedCompanyId)
+      const sessions = await loadOnDutySessions(effectiveCompanyId)
       setActiveSessions((prev) => {
         const next = (sessions as DrivingSessionRow[]) ?? []
         if (shallowEqualSerialized(prev, next)) return prev
@@ -222,7 +270,7 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
     } finally {
       setLoading(false)
     }
-  }, [resolvedCompanyId])
+  }, [effectiveCompanyId])
 
   useEffect(() => {
     void fetchAll()

@@ -58,7 +58,7 @@ interface HiredDriverRow {
   source?: 'hired' | 'profile'
   location?: string | null
   location_city_id?: string | null
-  /** 
+  /**
    * Added alias for clarity: current_location_id (mapped from staff current_location_id).
    * Keeps compatibility with existing code while making intent explicit.
    */
@@ -812,7 +812,7 @@ export default function StagingTabs(): JSX.Element {
             location_city_id: locId,
             // explicit alias: current_location_id for clarity (mapped from stats.current_location_id)
             current_location_id: locId,
-          }
+            }
         })
 
       // Merge: profile drivers first (owner/CEO visible on top), then hired drivers
@@ -854,6 +854,8 @@ export default function StagingTabs(): JSX.Element {
           id,
           status,
           accepted_at,
+          assigned_payload_kg,
+          payload_remaining_kg,
           job_offer:job_offer_id(
             id,
             remaining_payload,
@@ -1389,7 +1391,28 @@ export default function StagingTabs(): JSX.Element {
                     const pickup = job.pickup_time ?? null
                     const deadline = job.delivery_deadline ?? null
                     const transportMode = job.transport_mode ?? null
-                    const weight = job.weight_kg ?? null
+
+                    const rowStatus = String(assignment?.status ?? '').toLowerCase()
+                    const rowAssignedPayload = Number(assignment?.assigned_payload_kg ?? NaN)
+                    const rowRemainingPayload = Number(assignment?.payload_remaining_kg ?? NaN)
+                    const offerRemainingPayload = Number(job?.remaining_payload ?? NaN)
+                    const offerWeight = Number(job?.weight_kg ?? NaN)
+
+                    const weight =
+                      rowStatus === 'assigned'
+                        ? (Number.isFinite(rowRemainingPayload)
+                            ? rowRemainingPayload
+                            : Number.isFinite(offerRemainingPayload)
+                              ? offerRemainingPayload
+                              : Number.isFinite(offerWeight)
+                                ? offerWeight
+                                : null)
+                        : (Number.isFinite(rowAssignedPayload)
+                            ? rowAssignedPayload
+                            : Number.isFinite(offerWeight)
+                              ? offerWeight
+                              : null)
+
                     const reward = transportMode === 'trailer_cargo' ? job.reward_trailer_cargo : job.reward_load_cargo
 
                     // Determine if pickup time has arrived. If pickup_time is missing, consider it ready.

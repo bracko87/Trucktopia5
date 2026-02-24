@@ -285,7 +285,7 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
     id: 'offer-northbridge',
     bankName: 'NorthBridge Capital',
     logoText: 'NB',
-    logoUrl: 'https://i.ibb.co/xSvfwCZK/north-bridge-logo.jpg',
+    logoUrl: 'https://i.ibb.co/5ggyrNty/Chat-GPT-Image-Feb-24-2026-09-07-32-AM.png',
     aprMin: 8.9,
     aprMax: 14.5,
     factorRateMin: 1.08,
@@ -401,7 +401,7 @@ function LenderLogo({
   bankName,
   logoText,
   logoUrl,
-  sizeClass = 'h-44 w-44',
+  sizeClass = 'h-88 w-44',
 }: {
   bankName: string
   logoText: string
@@ -420,7 +420,7 @@ function LenderLogo({
         <img
           src={logoUrl}
           alt={`${bankName} logo`}
-          className="h-full w-full object-contain p-1"
+          className="h-full w-full object-contain p-0"
           loading="lazy"
           onError={() => setImageFailed(true)}
         />
@@ -1635,8 +1635,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
             aria-label="Close loan offers modal"
           />
 
-          <div className="relative w-full md:max-w-6xl bg-white rounded-t-2xl md:rounded-2xl shadow-2xl max-h-[90vh] overflow-hidden">
-            <div className="border-b border-slate-200 px-4 md:px-6 py-4 flex items-start justify-between gap-4">
+          <div className="relative w-full md:max-w-6xl bg-white rounded-t-2xl md:rounded-2xl shadow-2xl max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="shrink-0 border-b border-slate-200 px-4 md:px-6 py-4 flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-lg font-semibold">Apply for Loan</h3>
                 <p className="text-sm text-slate-500 mt-1">
@@ -1686,7 +1686,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
               </button>
             </div>
 
-            <div className="overflow-y-auto max-h-[calc(90vh-72px)] p-4 md:p-6 space-y-5">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 md:p-6 pb-8 md:pb-10 space-y-5">
               {/* Company capacity panel */}
               <section className="rounded-xl border border-slate-200 p-4">
                 <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
@@ -1955,16 +1955,20 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                         key={offer.id}
                         className="rounded-xl border border-slate-200 p-4 md:p-5 hover:shadow-sm transition-shadow"
                       >
-                        <div className="flex flex-col xl:flex-row gap-4 xl:items-start xl:justify-between">
-                          <div className="flex gap-4 min-w-0">
-                            <LenderLogo
-                              bankName={offer.bankName}
-                              logoText={offer.logoText}
-                              logoUrl={offer.logoUrl}
-                              sizeClass="h-14 w-14"
-                            />
-
+                        <div className="flex flex-col xl:flex-row gap-4 xl:items-stretch xl:justify-between">
+                          {/* LEFT SIDE: lender details */}
+                          <div className="flex-1 min-w-0 flex flex-col">
                             <div className="min-w-0">
+                              {/* Keep logo visible on smaller screens (compact) */}
+                              <div className="xl:hidden mb-3">
+                                <LenderLogo
+                                  bankName={offer.bankName}
+                                  logoText={offer.logoText}
+                                  logoUrl={offer.logoUrl}
+                                  sizeClass="h-14 w-14"
+                                />
+                              </div>
+
                               <div className="flex items-center flex-wrap gap-2">
                                 <h5 className="font-semibold">{offer.bankName}</h5>
                                 <span className="text-xs rounded-full bg-slate-100 text-slate-700 px-2 py-0.5">
@@ -2015,8 +2019,19 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                                 </div>
                               </div>
                             </div>
+
+                            {/* Desktop: move logo to lower-left empty area and make it bigger */}
+                            <div className="hidden xl:flex items-start mt-4 xl:mt-auto">
+                              <LenderLogo
+                                bankName={offer.bankName}
+                                logoText={offer.logoText}
+                                logoUrl={offer.logoUrl}
+                                sizeClass="h-100 w-60"
+                              />
+                            </div>
                           </div>
 
+                          {/* RIGHT SIDE: repayment box (unchanged functionality) */}
                           <div className="xl:min-w-[360px] rounded-lg border border-slate-200 p-4">
                             <div className="flex items-center justify-between gap-2">
                               <div className="text-sm font-medium">Estimated repayment</div>
