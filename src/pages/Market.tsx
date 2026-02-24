@@ -21,6 +21,13 @@
  * - Inserts job assignment with nullable user_truck_id and patches job offer accordingly.
  * - Adds backend policy error mapping for job_assignments_truck_required.
  * - AcceptModal binding updated to call confirmAccept with no arguments.
+ *
+ * Mandatory Sider.ai alignment (2026-02-23 20:50 UTC):
+ * - resolveAcceptTruckId keeps ownership buckets:
+ *   owner_user_auth_id, owner_user_id (auth/public), owner_company_id
+ * - adds fallback ranking strategy:
+ *   prefer active-ish trucks by capacity + newest, but if all are inactive/maintenance/disabled,
+ *   still return the best truck to satisfy backend job_assignments_truck_required.
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -680,17 +687,16 @@ export default function MarketPage(): JSX.Element {
       const authUserId = session.data.session?.user?.id ?? null
       const authHeader = accessToken ? `Bearer ${accessToken}` : `Bearer ${MARKET_SUPABASE_ANON_KEY}`
 
-      // Resolve truck id (nullable path allowed)
+      // Keep accept insert path using resolver output
       const truckId = await resolveAcceptTruckId(user, authHeader, authUserId)
 
-      // Resolve carrier company id (may use truck fallback)
       const carrierCompanyId = await resolveCarrierCompanyId(user, truckId, authHeader)
       if (!carrierCompanyId) {
         throw new Error('No carrier company linked to your account. Please create or join a company before accepting jobs.')
       }
 
-      const currentJob = jobs.find((j) => String(j.id) === String(jobId)) ?? null
-      const remainingBeforeRaw = Number(currentJob?.remaining_payload ?? currentJob?.weight_kg ?? 0)
+      const selectedJob = jobs.find((j) => j.id === jobId) ?? null
+      const remainingBeforeRaw = Number(selectedJob?.remaining_payload ?? selectedJob?.weight_kg ?? 0)
       const remainingBefore = Number.isFinite(remainingBeforeRaw) && remainingBeforeRaw > 0 ? remainingBeforeRaw : 0
 
       const truckCapacity = await resolveTruckPayloadCapacity(truckId, authHeader)
@@ -708,8 +714,8 @@ export default function MarketPage(): JSX.Element {
         Prefer: 'return=representation',
       }
 
-      // 1) Insert assignment (nullable truck supported)
-      const insertAssignmentRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
+      // 1) Create assignment
+      const assignRes = await fetch(`${MARKET_API_BASE}/rest/v1/job_assignments`, {
         method: 'POST',
         headers: commonHeaders,
         body: JSON.stringify({
@@ -724,9 +730,9 @@ export default function MarketPage(): JSX.Element {
         }),
       })
 
-      if (!insertAssignmentRes.ok) {
-        const txt = await insertAssignmentRes.text().catch(() => '')
-        throw new Error(txt || `Assignment insert failed (${insertAssignmentRes.status})`)
+      if (!assignRes.ok) {
+        const txt = await assignRes.text().catch(() => '')
+        throw new Error(txt || `Assignment insert failed (${assignRes.status})`)
       }
 
       // 2) Patch job offer
@@ -1045,72 +1051,93 @@ async function resolveCarrierCompanyId(
  * resolveAcceptTruckId
  *
  * Try to pick a sensible user_truck id to use when accepting a job.
- * Tries multiple ownership buckets in order:
+ * Ownership buckets (kept for Sider alignment):
  *  - owner_user_auth_id = authUserId
  *  - owner_user_id = authUserId
  *  - owner_user_id = publicUserId (user.id)
  *  - owner_company_id = companyId
  *
- * The function prefers available trucks, highest numeric model_max_load_kg,
- * falling back to the newest created_at when capacity is equal.
- *
- * @param user Public user object (may contain id/company_id)
- * @param authorization Authorization header to use for REST calls
- * @param authUserId Auth user id from session (may be null)
- * @returns user_truck id or null when none found
+ * Ranking:
+ *  - Prefer non-inactive/maintenance/disabled trucks
+ *  - Sort by capacity desc, then newest created_at desc
+ *  - If all trucks are invalid-status, still return best fallback truck
+ *    (backend currently enforces job_assignments_truck_required)
  */
 async function resolveAcceptTruckId(
   user: { id?: string | null; company_id?: string | null } | null,
   authorization: string,
   authUserId: string | null
 ): Promise<string | null> {
+  type Row = {
+    id?: string | null
+    status?: string | null
+    created_at?: string | null
+    model_max_load_kg?: number | string | null
+  }
+
   try {
     const headers = {
       apikey: MARKET_SUPABASE_ANON_KEY,
       Authorization: authorization,
     }
 
-    const buildUrl = (filter: string) =>
-      `${MARKET_API_BASE}/rest/v1/user_trucks?${filter}&status=eq.available&select=id,model_max_load_kg,created_at&order=model_max_load_kg.desc.nullslast,created_at.desc&limit=1`
-
-    // 1) Try owner_user_auth_id = authUserId (best)
-    if (authUserId) {
-      const url1 = buildUrl(`owner_user_auth_id=eq.${encodeURIComponent(authUserId)}`)
-      const res1 = await fetch(url1, { headers })
-      if (res1.ok) {
-        const rows = await res1.json().catch(() => [])
-        if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
-      }
-
-      // 2) Try owner_user_id = authUserId
-      const url2 = buildUrl(`owner_user_id=eq.${encodeURIComponent(authUserId)}`)
-      const res2 = await fetch(url2, { headers })
-      if (res2.ok) {
-        const rows = await res2.json().catch(() => [])
-        if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
-      }
-    }
-
-    // 3) Try owner_user_id = public user id (user.id)
     const publicUserId = user?.id ?? null
-    if (publicUserId) {
-      const url3 = buildUrl(`owner_user_id=eq.${encodeURIComponent(publicUserId)}`)
-      const res3 = await fetch(url3, { headers })
-      if (res3.ok) {
-        const rows = await res3.json().catch(() => [])
-        if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
+    const resolvedCompanyId = user?.company_id ?? null
+
+    const fetchRows = async (query: string): Promise<Row[]> => {
+      const url = `${MARKET_API_BASE}/rest/v1/user_trucks?${query}`
+      const res = await fetch(url, { headers })
+      if (!res.ok) return []
+      const rows = await res.json().catch(() => [])
+      return Array.isArray(rows) ? (rows as Row[]) : []
+    }
+
+    // Keep ownership fetch buckets
+    const select = 'select=id,status,created_at,model_max_load_kg&order=created_at.desc'
+    const buckets = await Promise.all([
+      authUserId ? fetchRows(`owner_user_auth_id=eq.${encodeURIComponent(authUserId)}&${select}`) : Promise.resolve([]),
+      // owner_user_id can store either auth user id or public users.id in historical rows
+      authUserId ? fetchRows(`owner_user_id=eq.${encodeURIComponent(authUserId)}&${select}`) : Promise.resolve([]),
+      publicUserId ? fetchRows(`owner_user_id=eq.${encodeURIComponent(publicUserId)}&${select}`) : Promise.resolve([]),
+      resolvedCompanyId ? fetchRows(`owner_company_id=eq.${encodeURIComponent(resolvedCompanyId)}&${select}`) : Promise.resolve([]),
+    ])
+
+    // Deduplicate by truck id across ownership buckets
+    const map = new Map<string, Row>()
+    for (const rows of buckets) {
+      for (const row of rows) {
+        const id = row?.id ? String(row.id) : ''
+        if (!id) continue
+        if (!map.has(id)) map.set(id, row)
       }
     }
 
-    // 4) Try owner_company_id
-    const companyId = user?.company_id ?? null
-    if (companyId) {
-      const url4 = buildUrl(`owner_company_id=eq.${encodeURIComponent(companyId)}`)
-      const res4 = await fetch(url4, { headers })
-      if (res4.ok) {
-        const rows = await res4.json().catch(() => [])
-        if (Array.isArray(rows) && rows.length > 0) return rows[0].id ?? null
-      }
+    // Add fallback ranking strategy
+    const byCapacityThenNewest = (a: Row, b: Row) => {
+      const capA = Number(a?.model_max_load_kg ?? 0)
+      const capB = Number(b?.model_max_load_kg ?? 0)
+      if (capA !== capB) return capB - capA
+
+      const timeA = a?.created_at ? Date.parse(a.created_at) : 0
+      const timeB = b?.created_at ? Date.parse(b.created_at) : 0
+      return timeB - timeA
+    }
+
+    const allRows = Array.from(map.values())
+    const invalidStatuses = new Set(['inactive', 'maintenance', 'disabled'])
+    const candidates = allRows.filter((r) => !invalidStatuses.has(String(r?.status ?? '').toLowerCase()))
+    candidates.sort(byCapacityThenNewest)
+
+    if (candidates.length > 0) {
+      return candidates[0]?.id ? String(candidates[0].id) : null
+    }
+
+    // Backend currently enforces job_assignments_truck_required.
+    // If all trucks are flagged inactive/maintenance/disabled, still pick one best-effort
+    // so accept can proceed and the assignment can be reworked in staging afterwards.
+    if (candidates.length === 0) {
+      allRows.sort(byCapacityThenNewest)
+      return allRows[0]?.id ? String(allRows[0].id) : null
     }
   } catch {
     // ignore and fall through to null

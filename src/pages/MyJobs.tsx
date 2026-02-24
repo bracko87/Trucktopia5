@@ -8,6 +8,9 @@
  * - Resolve carrier company id from public.users / trucks / companies.
  * - Use the authenticated session access_token (RLS-safe) instead of anon bearer.
  * - URL-encode PostgREST select strings to avoid subtle parsing issues.
+ * - Fetch + map origin/destination client companies so JobCard shows company blocks.
+ * - Fetch + map origin_city_id/destination_city_id so WeatherBadge can resolve weather.
+ * - Retry without pickup_ready if backend schema doesn't yet have that column (42703).
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -53,6 +56,31 @@ function SectionBox({ title, subtitle, children, count }: SectionBoxProps) {
 function normalizePhase(phaseRaw: any): string {
   if (!phaseRaw && phaseRaw !== 0) return ''
   return String(phaseRaw).toLowerCase().replace(/_/g, ' ')
+}
+
+function pickLogo(obj: any): string | null {
+  if (!obj) return null
+  return obj.logo ?? obj.logo_url ?? obj.image_url ?? obj.icon_url ?? null
+}
+
+/**
+ * Detect schema drift error when pickup_ready is selected but column does not exist.
+ */
+function shouldRetryWithoutPickupReady(status: number, bodyText: string): boolean {
+  if (status !== 400) return false
+  const t = String(bodyText ?? '').toLowerCase()
+  return t.includes('42703') && t.includes('pickup_ready')
+}
+
+/**
+ * Remove pickup_ready from encoded PostgREST select.
+ */
+function stripPickupReadyFromEncodedSelect(encodedSelect: string): string {
+  const decoded = decodeURIComponent(encodedSelect)
+  const cleaned = decoded
+    .replace(/,pickup_ready(?=,|\))/g, '')
+    .replace(/pickup_ready,(?=[^)]*\))/g, '')
+  return encodeURIComponent(cleaned)
 }
 
 /**
@@ -164,7 +192,8 @@ export default function MyJobs(): JSX.Element {
         return
       }
 
-      // Select assignments and embed job offer
+      // Select assignments and embed job offer.
+      // Include company + city ids for JobCard company block and WeatherBadge.
       const select = [
         'id',
         'status',
@@ -182,24 +211,52 @@ export default function MyJobs(): JSX.Element {
             'remaining_payload',
             'volume_m3',
             'pallets',
+            'currency',
+            'temperature_control',
+            'hazardous',
+            'requires_customs',
+            'special_requirements',
+            'job_offer_type_code',
+            // Optional in some envs -> retry without it if 42703
+            'pickup_ready',
             'reward_load_cargo',
             'reward_trailer_cargo',
+
+            'origin_city_id',
+            'destination_city_id',
+
             'origin_city:origin_city_id(city_name,country_code)',
             'destination_city:destination_city_id(city_name,country_code)',
+
+            'origin_company:origin_client_company_id(id,name,logo)',
+            'destination_company:destination_client_company_id(id,name,logo)',
+
             'cargo_type_obj:cargo_type_id(name)',
             'cargo_item_obj:cargo_item_id(name)',
           ].join(',') +
           ')',
       ].join(',')
 
-      const jaUrl =
+      let encodedSelect = encodeURIComponent(select)
+
+      const buildAssignmentsUrl = (encoded: string) =>
         `${API_BASE}/rest/v1/job_assignments` +
         `?carrier_company_id=eq.${encodeURIComponent(String(carrierCompanyId))}` +
-        `&select=${encodeURIComponent(select)}` +
+        `&select=${encoded}` +
         `&order=accepted_at.desc` +
         `&limit=500`
 
-      const jaRes = await fetch(jaUrl, { headers: buildHeaders(accessToken) })
+      let jaRes = await fetch(buildAssignmentsUrl(encodedSelect), { headers: buildHeaders(accessToken) })
+      if (!jaRes.ok) {
+        const txt = await jaRes.text().catch(() => '')
+        if (shouldRetryWithoutPickupReady(jaRes.status, txt)) {
+          encodedSelect = stripPickupReadyFromEncodedSelect(encodedSelect)
+          jaRes = await fetch(buildAssignmentsUrl(encodedSelect), { headers: buildHeaders(accessToken) })
+        } else {
+          throw new Error(`Failed to load jobs: ${jaRes.status} ${txt}`)
+        }
+      }
+
       if (!jaRes.ok) {
         const txt = await jaRes.text().catch(() => '')
         throw new Error(`Failed to load jobs: ${jaRes.status} ${txt}`)
@@ -237,6 +294,9 @@ export default function MyJobs(): JSX.Element {
         const j = row.job_offer ?? {}
         const ds = dsByAssignment[String(row.id)] ?? null
 
+        const originCompany = j.origin_company ?? null
+        const destinationCompany = j.destination_company ?? null
+
         const authoritativePhase = ds?.phase ?? row.status ?? null
         const normalizedStatus = normalizePhase(authoritativePhase)
 
@@ -259,6 +319,20 @@ export default function MyJobs(): JSX.Element {
           reward_trailer_cargo: j.reward_trailer_cargo ?? null,
           reward_load_cargo: j.reward_load_cargo ?? null,
           distance_km: j.distance_km ?? null,
+
+          currency: j.currency ?? null,
+          temperature_control: j.temperature_control ?? null,
+          hazardous: j.hazardous ?? null,
+          requires_customs: j.requires_customs ?? null,
+          special_requirements: j.special_requirements ?? null,
+          job_offer_type_code: j.job_offer_type_code ?? null,
+          pickup_ready:
+            typeof j.pickup_ready === 'boolean'
+              ? j.pickup_ready
+              : null,
+
+          origin_city_id: j.origin_city_id ?? null,
+          destination_city_id: j.destination_city_id ?? null,
 
           origin_city_name: j.origin_city?.city_name ?? null,
           destination_city_name: j.destination_city?.city_name ?? null,
@@ -291,13 +365,14 @@ export default function MyJobs(): JSX.Element {
           // optional UI helper
           is_deadline_expired: isDeadlineExpired,
 
-          // company fields (safe to leave null)
-          origin_client_company_id: null,
-          origin_client_company_name: null,
-          origin_client_company_logo: null,
-          destination_client_company_id: null,
-          destination_client_company_name: null,
-          destination_client_company_logo: null,
+          // company fields (used by JobCard company block)
+          origin_client_company_id: originCompany?.id ?? null,
+          origin_client_company_name: originCompany?.name ?? null,
+          origin_client_company_logo: pickLogo(originCompany),
+
+          destination_client_company_id: destinationCompany?.id ?? null,
+          destination_client_company_name: destinationCompany?.name ?? null,
+          destination_client_company_logo: pickLogo(destinationCompany),
         } as JobRow
       })
 
@@ -348,6 +423,7 @@ export default function MyJobs(): JSX.Element {
 
   async function handleConfirmAccept(truckId: string) {
     if (!selectedJob) return
+    void truckId // reserved for future server patch flow
     setJobs((s) => s.filter((j) => j.id !== selectedJob.id))
 
     setSuccessMessage(

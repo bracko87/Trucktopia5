@@ -100,6 +100,38 @@ function statusClass(s: string) {
   }
 }
 
+function isTruckInTransit(truck: any): boolean {
+  const rawStatus = String(truck?.status ?? '').toUpperCase()
+  if (rawStatus === 'IN_TRANSIT') return true
+
+  const availableFrom = truck?.available_from_at
+  if (!availableFrom) return false
+
+  const t = new Date(availableFrom).getTime()
+  if (Number.isNaN(t)) return false
+
+  return Date.now() < t
+}
+
+function formatTimeLeftShort(availableFromAt?: string | null): string {
+  if (!availableFromAt) return 'Pending delivery'
+
+  const target = new Date(availableFromAt).getTime()
+  if (Number.isNaN(target)) return 'Pending delivery'
+
+  const ms = target - Date.now()
+  if (ms <= 0) return 'Available now'
+
+  const totalMinutes = Math.ceil(ms / 60000)
+  const days = Math.floor(totalMinutes / (60 * 24))
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60)
+  const minutes = totalMinutes % 60
+
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
+
 /**
  * parseRegistration
  *
@@ -655,6 +687,10 @@ export default function TruckCard({
   const isSuspended = remainingKm !== null && remainingKm <= -3000
   const isInRepair = (truck?.status ?? '').toLowerCase() === 'in_repair' || (truck?.status ?? '').toLowerCase() === 'maintenance'
 
+  const inTransit = !isMarket && isTruckInTransit(truck)
+  const availableFromAt = (truck as any)?.available_from_at ?? null
+  const isActionLocked = isSuspended || inTransit
+
   /**
    * openMaintenance
    *
@@ -679,11 +715,30 @@ export default function TruckCard({
   }
 
   return (
-    <div className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200 ${isSuspended ? 'opacity-70 grayscale' : ''}`} role="article" aria-label={`Truck ${id || 'unknown'}`}>
+    <div
+      className={`modern-card relative w-full rounded-lg bg-white overflow-visible border border-gray-200 ${
+        isSuspended ? 'opacity-70 grayscale' : ''
+      } ${inTransit ? 'opacity-70' : ''}`}
+      role="article"
+      aria-label={`Truck ${id || 'unknown'}`}
+    >
       {/* Suspended overlay when truck is blocked - visually dim card but keep maintenance button accessible */}
       {isSuspended && (
         <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
           <div className="text-rose-700 bg-white/40 px-3 py-1 rounded-md font-semibold">Suspended — maintenance required</div>
+        </div>
+      )}
+
+      {inTransit && (
+        <div className="absolute inset-0 z-10 flex items-start justify-end p-3 pointer-events-none">
+          <div className="rounded-md border border-amber-200 bg-amber-50/95 px-3 py-2 text-xs font-medium text-amber-800 shadow-sm">
+            <div>In transit</div>
+            <div className="font-normal">
+              {availableFromAt
+                ? `Available in ${formatTimeLeftShort(availableFromAt)}`
+                : 'Pending delivery'}
+            </div>
+          </div>
         </div>
       )}
 
@@ -710,7 +765,7 @@ export default function TruckCard({
                   {!editingName ? (
                     <>
                       <div className="text-sm font-medium truncate min-w-0">{name ?? defaultName ?? '—'}</div>
-                      {!isMarket && !isSuspended && (
+                      {!isMarket && !isActionLocked && (
                         <button
                           type="button"
                           onClick={() => {
@@ -1010,7 +1065,13 @@ export default function TruckCard({
                 <div className="text-sm text-slate-500">No hubs</div>
               ) : (
                 <>
-                  <select aria-label="Select hub" value={selectedHubId} onChange={(e) => setSelectedHubId(e.target.value)} className="text-sm px-2 py-1 border border-slate-200 rounded bg-white" disabled={savingHub}>
+                  <select
+                    aria-label="Select hub"
+                    value={selectedHubId}
+                    onChange={(e) => setSelectedHubId(e.target.value)}
+                    className="text-sm px-2 py-1 border border-slate-200 rounded bg-white"
+                    disabled={savingHub || isActionLocked}
+                  >
                     <option value="">— Unassigned —</option>
                     {hubs.map((h) => (
                       <option key={h.id} value={h.id}>
@@ -1032,7 +1093,7 @@ export default function TruckCard({
                       const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
                       handleSaveRegistration(`${prefix}${registrationDigits}`)
                     }}
-                    disabled={savingRegistration || isMarket}
+                    disabled={savingRegistration || isMarket || isActionLocked}
                     className="ml-3"
                   />
 
@@ -1042,8 +1103,13 @@ export default function TruckCard({
                       if (selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')) return
                       handleChangeHub(selectedHubId)
                     }}
-                    disabled={savingHub || selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')}
-                    className={`text-sm px-3 py-1 rounded border ${savingHub ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
+                    disabled={
+                      savingHub ||
+                      isActionLocked ||
+                      selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')
+                    }
+                    className={`text-sm px-3 py-1 rounded border ${savingHub || isActionLocked ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
+                    title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
                   >
                     Apply
                   </button>
@@ -1051,38 +1117,78 @@ export default function TruckCard({
               )}
             </div>
 
-            {/* Buttons - disable non-maintenance actions when suspended */}
-            <button type="button" onClick={() => setShowComponents(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+            {/* Buttons - disable non-maintenance actions when suspended/in transit */}
+            <button
+              type="button"
+              onClick={() => setShowComponents(true)}
+              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+              disabled={isActionLocked}
+              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+            >
               Components
             </button>
 
-            <button type="button" onClick={() => setShowSpecs(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+            <button
+              type="button"
+              onClick={() => setShowSpecs(true)}
+              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+              disabled={isActionLocked}
+              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+            >
               Specifications
             </button>
 
-            <button type="button" onClick={() => setShowLogs(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`} disabled={isSuspended}>
+            <button
+              type="button"
+              onClick={() => setShowLogs(true)}
+              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'} border border-slate-200 rounded flex items-center gap-2`}
+              disabled={isActionLocked}
+              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+            >
               Logs
             </button>
 
             <button
               type="button"
               onClick={() => {
-                if (!insuranceDisabled && !isSuspended)
+                if (!insuranceDisabled && !isActionLocked)
                   setShowInsurance(true)
               }}
-              disabled={isSuspended || insuranceDisabled}
-              className={`px-3 py-1 text-sm border border-slate-200 rounded flex items-center gap-2 ${isSuspended || insuranceDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'}`}
-              title={insuranceDisabled ? 'New insurance available 60 days before expiry' : 'Insurance'}
+              disabled={isActionLocked || insuranceDisabled}
+              className={`px-3 py-1 text-sm border border-slate-200 rounded flex items-center gap-2 ${isActionLocked || insuranceDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white hover:bg-slate-100'}`}
+              title={
+                inTransit
+                  ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}`
+                  : insuranceDisabled
+                    ? 'New insurance available 60 days before expiry'
+                    : 'Insurance'
+              }
             >
               Insurance
             </button>
 
-            {/* Maintenance button always active (even for suspended trucks) */}
-            <button type="button" onClick={openMaintenance} className="px-3 py-1 text-sm bg-amber-600 hover:bg-amber-700 border border-amber-600 rounded text-white flex items-center gap-2">
+            {/* Maintenance button active for suspended trucks, disabled for in-transit trucks */}
+            <button
+              type="button"
+              onClick={openMaintenance}
+              disabled={inTransit}
+              title={inTransit ? 'Truck is in transit and not yet available' : 'Maintenance'}
+              className={`px-3 py-1 text-sm border rounded text-white flex items-center gap-2 ${
+                inTransit
+                  ? 'bg-slate-300 border-slate-300 cursor-not-allowed'
+                  : 'bg-amber-600 hover:bg-amber-700 border-amber-600'
+              }`}
+            >
               Maintenance
             </button>
 
-            <button type="button" onClick={() => setShowSell(true)} className={`px-3 py-1 text-sm ${isSuspended ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} border ${isSuspended ? 'border-slate-200' : 'border-red-600'} rounded text-white flex items-center gap-2`} disabled={isSuspended}>
+            <button
+              type="button"
+              onClick={() => setShowSell(true)}
+              className={`px-3 py-1 text-sm ${isActionLocked ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} border ${isActionLocked ? 'border-slate-200' : 'border-red-600'} rounded text-white flex items-center gap-2`}
+              disabled={isActionLocked}
+              title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
+            >
               Sell
             </button>
           </div>
@@ -1096,7 +1202,7 @@ export default function TruckCard({
       <SellTruckModal truckId={id} condition={conditionScore} open={showSell} onClose={() => setShowSell(false)} />
       <MaintenanceModal truckId={id} open={maintenanceModalOpen} onClose={() => setMaintenanceModalOpen(false)} onDone={() => {
         // Refresh minimal fields after maintenance
-        (async () => {
+        ;(async () => {
           try {
             const res = await supabaseFetch(`/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}&select=last_maintenance_at,next_maintenance_km,mileage_km`)
             if (res && Array.isArray(res.data) && res.data.length > 0) {

@@ -5,7 +5,7 @@
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
-import { supabase } from '@/lib/supabaseClient' // <- adjust to your project path
+import { supabase } from '@/lib/supabaseClient'
 
 type CompanyLoan = {
   id: string
@@ -27,7 +27,8 @@ type CompanyProfile = {
 }
 
 type Props = {
-  companyId: string
+  // allow undefined while parent page is still resolving selected company
+  companyId?: string | null
 }
 
 type StatusFilter = 'all' | 'active' | 'inactive'
@@ -63,14 +64,14 @@ type EstimateResult = {
 type LoanOffer = {
   id: string
   bankName: string
-  logoText: string // placeholder for future logo image
-  aprMin: number // annual %
-  aprMax: number // annual %
+  logoText: string
+  aprMin: number
+  aprMax: number
   factorRateMin: number
   factorRateMax: number
-  originationFeePct: number // one-time fee %
-  adminFeeFixed: number // fixed admin fee
-  latePenaltyPct: number // preview only
+  originationFeePct: number
+  adminFeeFixed: number
+  latePenaltyPct: number
   minAmount: number
   maxAmount: number
   minWeeks: number
@@ -79,9 +80,16 @@ type LoanOffer = {
   notes: string
 }
 
-/**
- * Format currency safely
- */
+type EnrichedLoanOffer = LoanOffer & {
+  selectedApr: number
+  selectedFactorRate: number
+  estimate: EstimateResult
+}
+
+type CompanyContextState = 'ready' | 'loading' | 'missing'
+
+const COMPANY_CONTEXT_GRACE_MS = 1200
+
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -90,9 +98,6 @@ function formatCurrency(value: number): string {
   }).format(Number(value || 0))
 }
 
-/**
- * Format date safely
- */
 function formatDate(value: string): string {
   if (!value) return '—'
   const d = new Date(value)
@@ -104,9 +109,24 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
 
-/**
- * APR simple estimate (flat/simple interest)
- */
+function toFriendlyLoanCreateError(message?: string): string {
+  const raw = (message ?? '').toLowerCase()
+
+  if (raw.includes('null value in column "company_id"')) {
+    return 'We could not create the loan because the company is not loaded yet. Please close this window and try again in a moment.'
+  }
+
+  if (raw.includes('duplicate key value') || raw.includes('uniq_active_loan_per_company')) {
+    return 'This company already has the maximum allowed active loan(s) for the current database rules. Please repay/close an active loan and try again.'
+  }
+
+  if (raw.includes('violates row-level security') || raw.includes('permission denied')) {
+    return 'You do not have permission to create a loan for this company.'
+  }
+
+  return 'We could not create the loan right now. Please try again.'
+}
+
 function calculateSimpleAprLoan(
   principal: number,
   weeks: number,
@@ -131,9 +151,6 @@ function calculateSimpleAprLoan(
   }
 }
 
-/**
- * APR amortized estimate (weekly compounding/payments approximation)
- */
 function calculateAmortizedAprLoan(
   principal: number,
   weeks: number,
@@ -144,8 +161,6 @@ function calculateAmortizedAprLoan(
   const weeklyRate = aprPercent / 100 / 52
   const originationFee = principal * (originationFeePct / 100)
   const adminFee = adminFeeFixed
-
-  // For UI estimate we add fees to financed amount
   const financedPrincipal = principal + originationFee + adminFee
 
   let weeklyPayment = 0
@@ -169,9 +184,6 @@ function calculateAmortizedAprLoan(
   }
 }
 
-/**
- * Factor rate estimate (common in short-term business financing)
- */
 function calculateFactorRateLoan(
   principal: number,
   weeks: number,
@@ -196,27 +208,22 @@ function calculateFactorRateLoan(
   }
 }
 
-/**
- * Reputation-based loan capacity system
- */
 function getLoanCapacityByReputation(reputation: number | null | undefined) {
   const rep = Math.max(0, Number(reputation ?? 0))
   const tier = Math.floor(rep / 10)
 
-  // +1 active loan every 10 rep, capped
   const maxActiveLoans = Math.min(8, 1 + tier)
 
-  // Stepwise per-loan cap (tune as needed)
   const maxSingleLoanByTier = [
-    50000, // 0-9
-    75000, // 10-19
-    100000, // 20-29
-    150000, // 30-39
-    200000, // 40-49
-    275000, // 50-59
-    350000, // 60-69
-    425000, // 70-79
-    500000, // 80+
+    50000,
+    75000,
+    100000,
+    150000,
+    200000,
+    275000,
+    350000,
+    425000,
+    500000,
   ]
   const maxSingleLoanAmount =
     maxSingleLoanByTier[Math.min(tier, maxSingleLoanByTier.length - 1)]
@@ -229,10 +236,6 @@ function getLoanCapacityByReputation(reputation: number | null | undefined) {
   }
 }
 
-/**
- * Static mock loan marketplace offers (fictional banks/lenders).
- * APRs/factor rates are in realistic SMB-loan style ranges (varies by risk/profile).
- */
 const MOCK_LOAN_OFFERS: LoanOffer[] = [
   {
     id: 'offer-northbridge',
@@ -344,13 +347,6 @@ const MOCK_LOAN_OFFERS: LoanOffer[] = [
   },
 ]
 
-/**
- * LoansPanel
- *
- * Shows loans overview, summary stats and a filterable list of loans.
- *
- * @returns JSX.Element
- */
 export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [loans, setLoans] = useState<CompanyLoan[]>([])
   const [companyProfile, setCompanyProfile] = useState<CompanyProfile | null>(null)
@@ -358,7 +354,11 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [loading, setLoading] = useState<boolean>(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Existing loans table filters
+  const [companyProfileLoading, setCompanyProfileLoading] = useState<boolean>(false)
+  const [companyProfileLoadAttempted, setCompanyProfileLoadAttempted] = useState<boolean>(false)
+  const [companyProfileError, setCompanyProfileError] = useState<string | null>(null)
+  const [companyContextGraceElapsed, setCompanyContextGraceElapsed] = useState<boolean>(false)
+
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [searchTerm, setSearchTerm] = useState<string>('')
   const [minRemaining, setMinRemaining] = useState<string>('')
@@ -367,22 +367,114 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [expiresTo, setExpiresTo] = useState<string>('')
   const [sortKey, setSortKey] = useState<SortKey>('created_at_desc')
 
-  // Apply-for-loan modal state
   const [isOffersOpen, setIsOffersOpen] = useState<boolean>(false)
   const [requestedAmount, setRequestedAmount] = useState<number>(50000)
   const [requestedWeeks, setRequestedWeeks] = useState<number>(24)
 
-  // Advanced repayment mode
   const [repaymentMode, setRepaymentMode] = useState<RepaymentMode>('apr_amortized')
 
-  // Offer filters/sorting
   const [offerSortKey, setOfferSortKey] = useState<OfferSortKey>('apr_asc')
-  const [offerAprCap, setOfferAprCap] = useState<string>('') // max APR filter
+  const [offerAprCap, setOfferAprCap] = useState<string>('')
   const [onlyExactTermSupport, setOnlyExactTermSupport] = useState<boolean>(true)
-  const [minOfferLimit, setMinOfferLimit] = useState<string>('') // filter by lender max amount >= X
+  const [minOfferLimit, setMinOfferLimit] = useState<string>('')
 
-  // Reusable refresh loader
+  const [confirmOffer, setConfirmOffer] = useState<EnrichedLoanOffer | null>(null)
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState<boolean>(false)
+  const [isSubmittingLoan, setIsSubmittingLoan] = useState<boolean>(false)
+  const [confirmModalError, setConfirmModalError] = useState<string | null>(null)
+
+  const [pageSuccessMessage, setPageSuccessMessage] = useState<string | null>(null)
+
+  // robust company id (prevents null company_id insert)
+  const effectiveCompanyId = useMemo(() => {
+    const trimmedPropId = String(companyId ?? '').trim()
+    if (trimmedPropId) return trimmedPropId
+    if (companyProfile?.id) return companyProfile.id
+    return ''
+  }, [companyId, companyProfile?.id])
+
+  const hasIncomingCompanyId = useMemo(
+    () => String(companyId ?? '').trim().length > 0,
+    [companyId]
+  )
+
+  // Grace period: if parent hasn't provided companyId immediately, show loading briefly, then "missing"
+  useEffect(() => {
+    if (hasIncomingCompanyId || effectiveCompanyId) {
+      setCompanyContextGraceElapsed(false)
+      return
+    }
+
+    const t = window.setTimeout(() => {
+      setCompanyContextGraceElapsed(true)
+    }, COMPANY_CONTEXT_GRACE_MS)
+
+    return () => window.clearTimeout(t)
+  }, [hasIncomingCompanyId, effectiveCompanyId])
+
+  const companyContextState = useMemo<CompanyContextState>(() => {
+    if (effectiveCompanyId) return 'ready'
+
+    if (!hasIncomingCompanyId) {
+      return companyContextGraceElapsed ? 'missing' : 'loading'
+    }
+
+    if (companyProfileLoading) return 'loading'
+    if (companyProfileLoadAttempted && !companyProfile && companyProfileError) return 'missing'
+
+    return 'loading'
+  }, [
+    effectiveCompanyId,
+    hasIncomingCompanyId,
+    companyContextGraceElapsed,
+    companyProfileLoading,
+    companyProfileLoadAttempted,
+    companyProfile,
+    companyProfileError,
+  ])
+
+  useEffect(() => {
+    console.info('[LoansPanel] company context', {
+      incomingCompanyId: companyId ?? null,
+      effectiveCompanyId: effectiveCompanyId || null,
+      companyContextState,
+      companyProfileLoading,
+      companyProfileLoadAttempted,
+      companyProfileId: companyProfile?.id ?? null,
+      companyProfileError,
+      companyContextGraceElapsed,
+    })
+  }, [
+    companyId,
+    effectiveCompanyId,
+    companyContextState,
+    companyProfileLoading,
+    companyProfileLoadAttempted,
+    companyProfile?.id,
+    companyProfileError,
+    companyContextGraceElapsed,
+  ])
+
+  // If company context disappears while modals are open, close them safely
+  useEffect(() => {
+    if (companyContextState !== 'missing') return
+
+    setIsConfirmModalOpen(false)
+    setConfirmOffer(null)
+    setIsSubmittingLoan(false)
+
+    // leave the offers modal closed if the panel becomes invalid
+    setIsOffersOpen(false)
+  }, [companyContextState])
+
   async function refreshLoansForCompany(targetCompanyId: string) {
+    if (!targetCompanyId) {
+      setLoans([])
+      setLoading(false)
+      setError(null)
+      return
+    }
+
     setLoading(true)
     setError(null)
 
@@ -414,10 +506,21 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     setLoading(false)
   }
 
+  // Fetch loans (based on incoming companyId)
   useEffect(() => {
-    let mounted = true
+    let cancelled = false
 
     async function fetchLoans() {
+      const targetCompanyId = String(companyId ?? '').trim()
+
+      if (!targetCompanyId) {
+        if (cancelled) return
+        setLoans([])
+        setError(null)
+        setLoading(false)
+        return
+      }
+
       setLoading(true)
       setError(null)
 
@@ -436,60 +539,81 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
           active
         `
         )
-        .eq('company_id', companyId)
+        .eq('company_id', targetCompanyId)
 
-      if (!mounted) return
+      if (cancelled) return
 
       if (error) {
         setError(error.message)
         setLoans([])
       } else {
+        setError(null)
         setLoans((data ?? []) as CompanyLoan[])
       }
 
       setLoading(false)
     }
 
-    if (companyId) {
-      fetchLoans()
-    } else {
-      setLoans([])
-      setLoading(false)
-    }
+    fetchLoans()
 
     return () => {
-      mounted = false
+      cancelled = true
     }
   }, [companyId])
 
+  // Fetch company profile (based on incoming companyId)
   useEffect(() => {
-    let mounted = true
+    let cancelled = false
 
     async function fetchCompanyProfile() {
-      if (!companyId) return
+      const targetCompanyId = String(companyId ?? '').trim()
+
+      if (!targetCompanyId) {
+        if (cancelled) return
+        setCompanyProfile(null)
+        setCompanyProfileError(null)
+        setCompanyProfileLoading(false)
+        setCompanyProfileLoadAttempted(false)
+        return
+      }
+
+      setCompanyProfileLoading(true)
+      setCompanyProfileLoadAttempted(true)
+      setCompanyProfileError(null)
 
       const { data, error } = await supabase
         .from('companies')
         .select('id, reputation, level, is_bankrupt')
-        .eq('id', companyId)
-        .single()
+        .eq('id', targetCompanyId)
+        .maybeSingle()
 
-      if (!mounted) return
+      if (cancelled) return
 
       if (error) {
-        // keep UI working even if profile fetch fails
         console.error('Failed to fetch company profile:', error.message)
         setCompanyProfile(null)
+        setCompanyProfileError(error.message)
+        setCompanyProfileLoading(false)
+        return
+      }
+
+      if (!data) {
+        console.warn('[LoansPanel] No company profile found for companyId:', targetCompanyId)
+        setCompanyProfile(null)
+        setCompanyProfileError('Company record not found.')
+        setCompanyProfileLoading(false)
         return
       }
 
       setCompanyProfile(data as CompanyProfile)
+      setCompanyProfileError(null)
+      setCompanyProfileLoading(false)
     }
 
     fetchCompanyProfile()
 
     return () => {
-      mounted = false
+      cancelled = true
     }
   }, [companyId])
 
@@ -505,10 +629,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     const q = searchTerm.trim().toLowerCase()
     if (q) {
       result = result.filter((loan) => {
-        return (
-          loan.id.toLowerCase().includes(q) ||
-          loan.company_id.toLowerCase().includes(q)
-        )
+        return loan.id.toLowerCase().includes(q) || loan.company_id.toLowerCase().includes(q)
       })
     }
 
@@ -582,10 +703,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     }
   }, [loans])
 
-  const activeLoansCount = useMemo(
-    () => loans.filter((loan) => loan.active).length,
-    [loans]
-  )
+  const activeLoansCount = useMemo(() => loans.filter((loan) => loan.active).length, [loans])
 
   const companyCapacity = useMemo(
     () => getLoanCapacityByReputation(companyProfile?.reputation),
@@ -596,41 +714,33 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const requestedAmountWithinCompanyLimit =
     requestedAmount <= companyCapacity.maxSingleLoanAmount
 
-  const offerResults = useMemo(() => {
+  const offerResults = useMemo<EnrichedLoanOffer[]>(() => {
     let result = [...MOCK_LOAN_OFFERS]
 
     const aprCapNum = offerAprCap !== '' ? Number(offerAprCap) : null
     const minOfferLimitNum = minOfferLimit !== '' ? Number(minOfferLimit) : null
 
-    // Company reputation global amount cap
+    result = result.filter(() => requestedAmount <= companyCapacity.maxSingleLoanAmount)
+
     result = result.filter(
-      () => requestedAmount <= companyCapacity.maxSingleLoanAmount
+      (offer) => requestedAmount >= offer.minAmount && requestedAmount <= offer.maxAmount
     )
 
-    // Lender amount eligibility
-    result = result.filter(
-      (offer) =>
-        requestedAmount >= offer.minAmount && requestedAmount <= offer.maxAmount
-    )
-
-    // Term eligibility
     if (onlyExactTermSupport) {
       result = result.filter(
         (offer) => requestedWeeks >= offer.minWeeks && requestedWeeks <= offer.maxWeeks
       )
     }
 
-    // Max APR cap (uses worst-case APR max)
     if (aprCapNum !== null && !Number.isNaN(aprCapNum)) {
       result = result.filter((offer) => offer.aprMax <= aprCapNum)
     }
 
-    // Filter by lender capacity / limit
     if (minOfferLimitNum !== null && !Number.isNaN(minOfferLimitNum)) {
       result = result.filter((offer) => offer.maxAmount >= minOfferLimitNum)
     }
 
-    const enriched = result.map((offer) => {
+    const enriched: EnrichedLoanOffer[] = result.map((offer) => {
       const selectedApr = (offer.aprMin + offer.aprMax) / 2
       const selectedFactorRate = (offer.factorRateMin + offer.factorRateMax) / 2
 
@@ -716,18 +826,33 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     setRepaymentMode('apr_amortized')
   }
 
-  const handleAcceptOffer = async (
-    offer: (typeof offerResults)[number]
-  ): Promise<void> => {
+  const canOpenOffersModal = companyContextState !== 'missing'
+
+  const handleAcceptOffer = (offer: EnrichedLoanOffer): void => {
+    setPageSuccessMessage(null)
+    setConfirmModalError(null)
+
+    if (companyContextState === 'loading') {
+      setConfirmModalError('Company details are still loading. Please wait a moment and try again.')
+      return
+    }
+
+    if (companyContextState === 'missing' || !effectiveCompanyId) {
+      setConfirmModalError(
+        'This loan cannot be created because no company is selected. Please close this window and reopen it from a company page.'
+      )
+      return
+    }
+
     if (!canOpenAnotherLoan) {
-      window.alert(
+      setConfirmModalError(
         `Loan limit reached. Company reputation (${companyCapacity.reputation}) allows up to ${companyCapacity.maxActiveLoans} active loan(s).`
       )
       return
     }
 
     if (!requestedAmountWithinCompanyLimit) {
-      window.alert(
+      setConfirmModalError(
         `Requested amount exceeds your current company limit. Reputation (${companyCapacity.reputation}) allows up to ${formatCurrency(
           companyCapacity.maxSingleLoanAmount
         )} per loan.`
@@ -736,72 +861,125 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     }
 
     if (companyProfile?.is_bankrupt) {
-      window.alert('Bankrupt companies cannot accept new loans.')
+      setConfirmModalError('Bankrupt companies cannot accept new loans.')
       return
     }
 
-    const pricingLine =
-      repaymentMode === 'factor_rate'
-        ? `Factor rate (midpoint): ${offer.selectedFactorRate.toFixed(2)}x`
-        : `APR (midpoint): ${offer.selectedApr.toFixed(2)}% (${
-            repaymentMode === 'apr_amortized' ? 'amortized weekly' : 'simple'
-          })`
+    setConfirmOffer(offer)
+    setIsConfirmModalOpen(true)
+  }
 
-    const summary = [
-      `Bank: ${offer.bankName}`,
-      `Amount: ${formatCurrency(requestedAmount)}`,
-      `Term: ${requestedWeeks} weeks`,
-      pricingLine,
-      `Origination fee: ${offer.originationFeePct.toFixed(2)}% (${formatCurrency(
-        offer.estimate.originationFee
-      )})`,
-      `Admin fee: ${formatCurrency(offer.estimate.adminFee)}`,
-      `Estimated interest/finance charge: ${formatCurrency(offer.estimate.interest)}`,
-      `Estimated total repayment: ${formatCurrency(offer.estimate.totalRepayment)}`,
-      `Estimated weekly payment: ${formatCurrency(offer.estimate.weeklyPayment)}`,
-      `Late penalty preview: ${offer.latePenaltyPct.toFixed(2)}% of missed payment`,
-      '',
-      'Do you want to accept this loan offer?',
-    ].join('\n')
+  const confirmAndCreateLoan = async (): Promise<void> => {
+    if (!confirmOffer) return
 
-    const confirmed = window.confirm(summary)
-    if (!confirmed) return
+    setIsSubmittingLoan(true)
+    setConfirmModalError(null)
 
-    const now = new Date()
-    const expiresAt = new Date(now)
-    expiresAt.setDate(expiresAt.getDate() + requestedWeeks * 7)
+    try {
+      const targetCompanyId = effectiveCompanyId?.trim()
 
-    const principal = requestedAmount
-    const fee = Number(
-      (offer.estimate.originationFee + offer.estimate.adminFee).toFixed(2)
-    )
-    const totalOwed = Number(offer.estimate.totalRepayment.toFixed(2))
-    const remainingOwed = totalOwed
+      if (companyContextState === 'loading') {
+        setConfirmModalError('Company details are still loading. Please wait a moment and try again.')
+        return
+      }
 
-    const { error: insertError } = await supabase.from('company_loans').insert({
-      company_id: companyId,
-      principal,
-      fee,
-      total_owed: totalOwed,
-      remaining_owed: remainingOwed,
-      expires_at: expiresAt.toISOString(),
-      active: true,
-    })
+      if (!targetCompanyId) {
+        setConfirmModalError(
+          companyContextState === 'missing'
+            ? 'No company is selected for this loan. Please close this window and reopen it from the correct company.'
+            : 'Company details are not available yet. Please close this window and try again.'
+        )
+        return
+      }
 
-    if (insertError) {
-      window.alert(`Failed to accept loan: ${insertError.message}`)
-      return
+      if (!canOpenAnotherLoan) {
+        setConfirmModalError(
+          `Loan limit reached. Company reputation (${companyCapacity.reputation}) allows up to ${companyCapacity.maxActiveLoans} active loan(s).`
+        )
+        return
+      }
+
+      if (!requestedAmountWithinCompanyLimit) {
+        setConfirmModalError(
+          `Requested amount exceeds your current company limit (${formatCurrency(
+            companyCapacity.maxSingleLoanAmount
+          )}).`
+        )
+        return
+      }
+
+      if (companyProfile?.is_bankrupt) {
+        setConfirmModalError('Bankrupt companies cannot accept new loans.')
+        return
+      }
+
+      const now = new Date()
+      const expiresAt = new Date(now)
+      expiresAt.setDate(expiresAt.getDate() + requestedWeeks * 7)
+
+      const principal = requestedAmount
+      const fee = Number(
+        (confirmOffer.estimate.originationFee + confirmOffer.estimate.adminFee).toFixed(2)
+      )
+      const totalOwed = Number(confirmOffer.estimate.totalRepayment.toFixed(2))
+      const remainingOwed = totalOwed
+
+      const payload = {
+        company_id: targetCompanyId,
+        principal,
+        fee,
+        total_owed: totalOwed,
+        remaining_owed: remainingOwed,
+        expires_at: expiresAt.toISOString(),
+        active: true,
+      }
+
+      console.info('[LoansPanel] Creating loan payload', {
+        payload,
+        companyContextState,
+        incomingCompanyId: companyId ?? null,
+        effectiveCompanyId: targetCompanyId,
+        companyProfileId: companyProfile?.id ?? null,
+      })
+
+      const { error: insertError } = await supabase.from('company_loans').insert(payload)
+
+      if (insertError) {
+        console.error('Failed to create loan row:', {
+          payload,
+          supabaseError: insertError,
+          diagnostics: {
+            incomingCompanyId: companyId ?? null,
+            effectiveCompanyId: targetCompanyId,
+            companyContextState,
+            companyProfileId: companyProfile?.id ?? null,
+            companyProfileError,
+          },
+        })
+        setConfirmModalError(toFriendlyLoanCreateError(insertError.message))
+        return
+      }
+
+      await refreshLoansForCompany(targetCompanyId)
+
+      setPageSuccessMessage(
+        `Loan accepted successfully from ${confirmOffer.bankName} (${formatCurrency(
+          requestedAmount
+        )}, ${requestedWeeks} weeks).`
+      )
+
+      setIsConfirmModalOpen(false)
+      setConfirmOffer(null)
+      setIsOffersOpen(false)
+      setConfirmModalError(null)
+    } finally {
+      setIsSubmittingLoan(false)
     }
-
-    window.alert('Loan accepted successfully.')
-
-    setIsOffersOpen(false)
-    await refreshLoansForCompany(companyId)
   }
 
   return (
     <div className="space-y-4">
-      {/* Header/intro with CTA in green-circled area */}
+      {/* Header/intro with CTA */}
       <section className="bg-white p-6 rounded-xl shadow">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
@@ -809,14 +987,37 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
             <p className="text-sm text-black/70">
               Active loans, repayment overview and loan details for this company.
             </p>
+
+            {pageSuccessMessage && (
+              <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 px-3 py-2 text-sm">
+                {pageSuccessMessage}
+              </div>
+            )}
+
+            {confirmModalError && !isConfirmModalOpen && (
+              <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 text-amber-700 px-3 py-2 text-sm">
+                {confirmModalError}
+              </div>
+            )}
+
+            {companyContextState === 'missing' && (
+              <div className="mt-3 rounded-md border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+                No company is selected for this panel yet. Loan actions are disabled until a company is loaded.
+              </div>
+            )}
           </div>
 
           <div className="w-full md:w-auto md:min-w-[260px] flex justify-start md:justify-end">
             <button
               type="button"
               onClick={() => setIsOffersOpen(true)}
-              className="inline-flex items-center justify-center rounded-lg bg-slate-900 text-white px-4 py-2.5 text-sm font-medium hover:bg-slate-800 w-full md:w-auto"
-              title="Open loan offers marketplace"
+              disabled={!canOpenOffersModal}
+              className="inline-flex items-center justify-center rounded-lg bg-slate-900 text-white px-4 py-2.5 text-sm font-medium hover:bg-slate-800 w-full md:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+              title={
+                canOpenOffersModal
+                  ? 'Open loan offers marketplace'
+                  : 'No company selected. Open this page from a company first.'
+              }
             >
               Apply for Loan
             </button>
@@ -1083,7 +1284,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
           aria-modal="true"
           role="dialog"
         >
-          {/* Backdrop */}
           <button
             type="button"
             className="absolute inset-0 bg-black/40 backdrop-blur-sm"
@@ -1091,9 +1291,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
             aria-label="Close loan offers modal"
           />
 
-          {/* Panel */}
           <div className="relative w-full md:max-w-6xl bg-white rounded-t-2xl md:rounded-2xl shadow-2xl max-h-[90vh] overflow-hidden">
-            {/* Modal header */}
             <div className="border-b border-slate-200 px-4 md:px-6 py-4 flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-lg font-semibold">Apply for Loan</h3>
@@ -1110,6 +1308,26 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                 {!canOpenAnotherLoan && !companyProfile?.is_bankrupt && (
                   <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1 mt-2 inline-block">
                     Active loan limit reached for current reputation.
+                  </p>
+                )}
+
+                {companyContextState === 'loading' && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1 mt-2 inline-block">
+                    Company details are loading. You can review offers now, but confirmation is temporarily disabled.
+                  </p>
+                )}
+
+                {companyContextState === 'missing' && (
+                  <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1 mt-2 inline-block">
+                    No company is selected for this panel, so loans cannot be created yet.
+                  </p>
+                )}
+
+                {(companyContextState !== 'ready' || companyProfileError) && (
+                  <p className="text-[11px] text-slate-500 mt-2">
+                    Debug: incoming companyId={String(companyId ?? 'null')} · effectiveCompanyId=
+                    {effectiveCompanyId || 'none'}
+                    {companyProfileError ? ` · profileError=${companyProfileError}` : ''}
                   </p>
                 )}
               </div>
@@ -1153,7 +1371,13 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                     <div className="rounded-md bg-slate-50 p-2">
                       <div className="text-xs text-slate-500">Status</div>
                       <div className="font-semibold">
-                        {companyProfile?.is_bankrupt ? 'Bankrupt' : 'Eligible'}
+                        {companyContextState === 'missing'
+                          ? 'No company selected'
+                          : companyContextState === 'loading'
+                          ? 'Loading company'
+                          : companyProfile?.is_bankrupt
+                          ? 'Bankrupt'
+                          : 'Eligible'}
                       </div>
                     </div>
                   </div>
@@ -1182,7 +1406,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                   )}
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    {/* Amount */}
                     <div className="rounded-lg border border-slate-200 p-3">
                       <div className="flex items-center justify-between text-sm mb-2">
                         <label className="text-slate-600">Amount</label>
@@ -1226,7 +1449,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                       </div>
                     </div>
 
-                    {/* Term */}
                     <div className="rounded-lg border border-slate-200 p-3">
                       <div className="flex items-center justify-between text-sm mb-2">
                         <label className="text-slate-600">Repayment term</label>
@@ -1378,7 +1600,9 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                       termSupported &&
                       canOpenAnotherLoan &&
                       requestedAmountWithinCompanyLimit &&
-                      !companyProfile?.is_bankrupt
+                      !companyProfile?.is_bankrupt &&
+                      companyContextState === 'ready' &&
+                      !!effectiveCompanyId
 
                     return (
                       <div
@@ -1386,9 +1610,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                         className="rounded-xl border border-slate-200 p-4 md:p-5 hover:shadow-sm transition-shadow"
                       >
                         <div className="flex flex-col xl:flex-row gap-4 xl:items-start xl:justify-between">
-                          {/* Left: brand + offer basics */}
                           <div className="flex gap-4 min-w-0">
-                            {/* Logo placeholder */}
                             <div className="h-14 w-14 rounded-lg border border-slate-200 bg-slate-50 flex items-center justify-center text-sm font-semibold text-slate-700 shrink-0">
                               {offer.logoText}
                             </div>
@@ -1420,16 +1642,13 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                                 <div className="rounded-md bg-slate-50 p-2">
                                   <div className="text-xs text-slate-500">Fees</div>
                                   <div className="font-medium">
-                                    {offer.originationFeePct.toFixed(2)}% +{' '}
-                                    {formatCurrency(offer.adminFeeFixed)}
+                                    {offer.originationFeePct.toFixed(2)}% + {formatCurrency(offer.adminFeeFixed)}
                                   </div>
                                 </div>
 
                                 <div className="rounded-md bg-slate-50 p-2">
                                   <div className="text-xs text-slate-500">Late penalty (preview)</div>
-                                  <div className="font-medium">
-                                    {offer.latePenaltyPct.toFixed(2)}%
-                                  </div>
+                                  <div className="font-medium">{offer.latePenaltyPct.toFixed(2)}%</div>
                                 </div>
 
                                 <div className="rounded-md bg-slate-50 p-2">
@@ -1449,7 +1668,6 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                             </div>
                           </div>
 
-                          {/* Right: estimate & action */}
                           <div className="xl:min-w-[360px] rounded-lg border border-slate-200 p-4">
                             <div className="flex items-center justify-between gap-2">
                               <div className="text-sm font-medium">Estimated repayment</div>
@@ -1457,9 +1675,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                                 {repaymentMode === 'factor_rate'
                                   ? `Factor rate used: ${offer.selectedFactorRate.toFixed(2)}x`
                                   : `APR used: ${offer.selectedApr.toFixed(2)}% (${
-                                      repaymentMode === 'apr_amortized'
-                                        ? 'amortized'
-                                        : 'simple'
+                                      repaymentMode === 'apr_amortized' ? 'amortized' : 'simple'
                                     })`}
                               </span>
                             </div>
@@ -1475,25 +1691,17 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                               </div>
                               <div>
                                 <div className="text-xs text-slate-500">Origination fee</div>
-                                <div className="font-medium">
-                                  {formatCurrency(offer.estimate.originationFee)}
-                                </div>
+                                <div className="font-medium">{formatCurrency(offer.estimate.originationFee)}</div>
                               </div>
                               <div>
                                 <div className="text-xs text-slate-500">Admin fee</div>
-                                <div className="font-medium">
-                                  {formatCurrency(offer.estimate.adminFee)}
-                                </div>
+                                <div className="font-medium">{formatCurrency(offer.estimate.adminFee)}</div>
                               </div>
                               <div>
                                 <div className="text-xs text-slate-500">
-                                  {repaymentMode === 'factor_rate'
-                                    ? 'Finance charge'
-                                    : 'Estimated interest'}
+                                  {repaymentMode === 'factor_rate' ? 'Finance charge' : 'Estimated interest'}
                                 </div>
-                                <div className="font-medium">
-                                  {formatCurrency(offer.estimate.interest)}
-                                </div>
+                                <div className="font-medium">{formatCurrency(offer.estimate.interest)}</div>
                               </div>
                               <div>
                                 <div className="text-xs text-slate-500">Weekly payment</div>
@@ -1535,6 +1743,16 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
                               {!canOpenAnotherLoan && (
                                 <div className="rounded-md border border-amber-200 bg-amber-50 text-amber-700 px-2 py-1">
                                   Acceptance is blocked because active loan limit for current reputation is reached.
+                                </div>
+                              )}
+                              {companyContextState === 'loading' && (
+                                <div className="rounded-md border border-amber-200 bg-amber-50 text-amber-700 px-2 py-1">
+                                  Company details are loading. Please wait before accepting an offer.
+                                </div>
+                              )}
+                              {companyContextState === 'missing' && (
+                                <div className="rounded-md border border-red-200 bg-red-50 text-red-700 px-2 py-1">
+                                  No company is selected. Please reopen this panel from a company page.
                                 </div>
                               )}
                               {companyProfile?.is_bankrupt && (
@@ -1585,6 +1803,180 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
               </section>
             </div>
           </div>
+
+          {/* SECOND POP-UP (custom confirmation modal) */}
+          {isConfirmModalOpen && confirmOffer && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center p-4">
+              <button
+                type="button"
+                aria-label="Close confirmation modal"
+                className="absolute inset-0 bg-black/30 backdrop-blur-[1px]"
+                onClick={() => {
+                  if (isSubmittingLoan) return
+                  setIsConfirmModalOpen(false)
+                  setConfirmOffer(null)
+                  setConfirmModalError(null)
+                }}
+              />
+
+              <div className="relative w-full max-w-2xl rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden">
+                <div className="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-4">
+                  <div>
+                    <h4 className="text-lg font-semibold">Confirm Loan Acceptance</h4>
+                    <p className="text-sm text-slate-500 mt-1">
+                      Please review the summary below before confirming.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isSubmittingLoan) return
+                      setIsConfirmModalOpen(false)
+                      setConfirmOffer(null)
+                      setConfirmModalError(null)
+                    }}
+                    className="rounded-md border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                    disabled={isSubmittingLoan}
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <div className="p-5 space-y-4">
+                  {confirmModalError && (
+                    <div className="rounded-md border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-sm">
+                      {confirmModalError}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="rounded-lg border border-slate-200 p-4">
+                      <div className="flex items-center gap-3 mb-3">
+                        <div className="h-12 w-12 rounded-lg border border-slate-200 bg-slate-50 flex items-center justify-center text-sm font-semibold text-slate-700">
+                          {confirmOffer.logoText}
+                        </div>
+                        <div>
+                          <div className="font-semibold">{confirmOffer.bankName}</div>
+                          <div className="text-xs text-slate-500">{confirmOffer.approvalSpeed}</div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 text-sm">
+                        <div>
+                          <div className="text-xs text-slate-500">Amount</div>
+                          <div className="font-medium">{formatCurrency(requestedAmount)}</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-slate-500">Term</div>
+                          <div className="font-medium">{requestedWeeks} weeks</div>
+                        </div>
+
+                        <div>
+                          <div className="text-xs text-slate-500">Pricing model</div>
+                          <div className="font-medium">
+                            {repaymentMode === 'factor_rate'
+                              ? 'Factor rate'
+                              : repaymentMode === 'apr_amortized'
+                              ? 'APR (amortized)'
+                              : 'APR (simple)'}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-slate-500">
+                            {repaymentMode === 'factor_rate' ? 'Factor rate used' : 'APR used'}
+                          </div>
+                          <div className="font-medium">
+                            {repaymentMode === 'factor_rate'
+                              ? `${confirmOffer.selectedFactorRate.toFixed(2)}x`
+                              : `${confirmOffer.selectedApr.toFixed(2)}%`}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-slate-200 p-4">
+                      <div className="text-sm font-medium mb-3">Repayment summary</div>
+
+                      <div className="space-y-2 text-sm">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-slate-500">Origination fee</span>
+                          <span className="font-medium">
+                            {formatCurrency(confirmOffer.estimate.originationFee)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-slate-500">Admin fee</span>
+                          <span className="font-medium">
+                            {formatCurrency(confirmOffer.estimate.adminFee)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-slate-500">
+                            {repaymentMode === 'factor_rate'
+                              ? 'Finance charge'
+                              : 'Estimated interest'}
+                          </span>
+                          <span className="font-medium">
+                            {formatCurrency(confirmOffer.estimate.interest)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-slate-500">Weekly payment</span>
+                          <span className="font-semibold">
+                            {formatCurrency(confirmOffer.estimate.weeklyPayment)}
+                          </span>
+                        </div>
+                        <div className="border-t border-slate-200 pt-2 flex items-center justify-between gap-3">
+                          <span className="text-slate-700 font-medium">Total repayment</span>
+                          <span className="text-base font-semibold">
+                            {formatCurrency(confirmOffer.estimate.totalRepayment)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 text-xs text-slate-500">
+                        Late penalty preview: {confirmOffer.latePenaltyPct.toFixed(2)}% of missed
+                        installment (
+                        {formatCurrency(
+                          confirmOffer.estimate.weeklyPayment *
+                            (confirmOffer.latePenaltyPct / 100)
+                        )}
+                        )
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-md border border-amber-200 bg-amber-50 text-amber-700 px-3 py-2 text-sm">
+                    By confirming, this loan will be added to your company finances and the page will update immediately.
+                  </div>
+                </div>
+
+                <div className="px-5 py-4 border-t border-slate-200 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isSubmittingLoan) return
+                      setIsConfirmModalOpen(false)
+                      setConfirmOffer(null)
+                      setConfirmModalError(null)
+                    }}
+                    disabled={isSubmittingLoan}
+                    className="rounded-md border border-slate-200 px-4 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={confirmAndCreateLoan}
+                    disabled={isSubmittingLoan}
+                    className="rounded-md bg-slate-900 text-white px-4 py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {isSubmittingLoan ? 'Creating loan…' : 'Confirm & add loan'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

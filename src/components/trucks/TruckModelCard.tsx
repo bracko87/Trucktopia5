@@ -22,13 +22,8 @@ import SellTruckModal from './SellTruckModal'
 import InsuranceModal from './InsuranceModal'
 import MaintenanceModal from './MaintenanceModal'
 import TruckCompareModal from './TruckCompareModal'
-import LeaseConfirmModal from '../leases/LeaseConfirmModal' // added lease modal import
+import LeaseConfirmModal from '../leases/LeaseConfirmModal'
 
-/**
- * ModelInfo
- *
- * Partial strongly-typed shape for commonly used truck_models columns.
- */
 interface ModelInfo {
   id?: string
   make?: string | null
@@ -54,6 +49,18 @@ interface ModelInfo {
   [k: string]: any
 }
 
+interface PurchaseClickPayload {
+  id?: string
+  master_truck_id?: string | null
+  name?: string | null
+  make?: string | null
+  model?: string | null
+  list_price?: number | null
+  price?: number | null
+  availability_days?: number | null
+  [k: string]: any
+}
+
 /**
  * Props for TruckModelCard
  */
@@ -62,16 +69,9 @@ interface TruckModelCardProps {
   modelInfo?: ModelInfo | null
   defaultRegistration?: string
   isMarket?: boolean
+  onPurchaseClick?: (payload: PurchaseClickPayload) => void
 }
 
-/**
- * fetchModelById
- *
- * Fetch a single truck_models row by id.
- *
- * @param id - truck_models.id
- * @returns ModelInfo | null
- */
 async function fetchModelById(id?: string | null): Promise<ModelInfo | null> {
   if (!id) return null
   try {
@@ -81,32 +81,17 @@ async function fetchModelById(id?: string | null): Promise<ModelInfo | null> {
     if (rows.length === 0) return null
     return rows[0] as ModelInfo
   } catch (err) {
-    // eslint-disable-next-line no-console
     console.debug('TruckModelCard: fetchModelById error', err)
     return null
   }
 }
 
-/**
- * prettyValue
- *
- * Render a DB value into a friendly string.
- *
- * @param value - field value
- */
 function prettyValue(value: any): React.ReactNode {
   if (value == null || value === '') return <span className="text-slate-500">Not specified</span>
   if (typeof value === 'boolean') return value ? 'Yes' : 'No'
   return String(value)
 }
 
-/**
- * formatCurrency
- *
- * Format a numeric value into USD currency with a leading $ sign.
- *
- * @param value - numeric value
- */
 function formatCurrency(value?: number | null): string | null {
   if (value == null || Number.isNaN(Number(value))) return null
   const n = Number(value)
@@ -117,16 +102,10 @@ function formatCurrency(value?: number | null): string | null {
   try {
     return new Intl.NumberFormat('en-US', opts as Intl.NumberFormatOptions).format(n)
   } catch {
-    // fallback simple formatting
     return `$${n.toLocaleString()}`
   }
 }
 
-/**
- * PricePill
- *
- * Small reusable UI element for showing a numeric value with color styling.
- */
 function PricePill({ label, value, color }: { label: string; value?: number | string | null; color?: 'green' | 'sky' | 'amber' }) {
   const classes =
     color === 'green'
@@ -152,18 +131,13 @@ function PricePill({ label, value, color }: { label: string; value?: number | st
   )
 }
 
-/**
- * TruckModelCard
- *
- * Render a compact truck model card showing only the requested fields:
- * Brand, Model, Country, Class, Year, Cargo Type Name, Cargo Type Secondary Name,
- * Availability Days, Condition, GCW, Lease, Price.
- *
- * Lease Rate and List Price are shown in the header with different colors.
- * A cargo type icon (when available) is shown next to the model title, falling
- * back to a truck icon when no icon_url is available.
- */
-export default function TruckModelCard({ truck, modelInfo, defaultRegistration, isMarket = false }: TruckModelCardProps) {
+export default function TruckModelCard({
+  truck,
+  modelInfo,
+  defaultRegistration,
+  isMarket = false,
+  onPurchaseClick,
+}: TruckModelCardProps) {
   const id = truck?.id ?? ''
   const rawModelId = (truck as any)?.master_truck_id ?? null
 
@@ -171,7 +145,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
   const [cargoName, setCargoName] = useState<string | null>(modelInfo?.cargo_type_name ?? null)
   const [cargoNameSecondary, setCargoNameSecondary] = useState<string | null>(modelInfo?.cargo_type_secondary_name ?? null)
 
-  // Icon url for primary cargo type
   const [cargoIconUrl, setCargoIconUrl] = useState<string | null>(null)
 
   const [expanded, setExpanded] = useState<boolean>(false)
@@ -183,14 +156,9 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
   const [maintenanceModalOpen, setMaintenanceModalOpen] = useState(false)
   const [showCompare, setShowCompare] = useState<boolean>(false)
 
-  // New: lease modal visibility state
   const [showLeaseModal, setShowLeaseModal] = useState<boolean>(false)
   const { company } = useCompany()
 
-  /**
-   * Resolve model information.
-   * Only queries truck_models. If modelInfo prop is provided, it is used.
-   */
   useEffect(() => {
     let mounted = true
 
@@ -216,9 +184,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawModelId, modelInfo])
 
-  /**
-   * Resolve cargo type icon for the primary cargo_type_id when available.
-   */
   useEffect(() => {
     let mounted = true
 
@@ -240,7 +205,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
           setCargoIconUrl(null)
         }
       } catch (err) {
-        // eslint-disable-next-line no-console
         console.debug('TruckModelCard: cargo type icon fetch failed', err)
         setCargoIconUrl(null)
       }
@@ -252,46 +216,32 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
     return () => {
       mounted = false
     }
-    // only when resolvedModel changes
   }, [resolvedModel]) // eslint-disable-line
 
   const modelMake = resolvedModel?.make ?? (truck?.make ?? '')
   const modelName = resolvedModel?.model ?? (truck?.model ?? '')
   const primaryTitle = [modelMake, modelName].filter(Boolean).join(' ') || 'Unnamed model'
 
-  // Use list item condition if present (market items set this to 100 by default)
   const conditionScore = (truck?.condition_score as unknown as number) ?? resolvedModel?.condition_score ?? 0
 
   function handleToggleExpand() {
     setExpanded((s) => !s)
   }
 
-  /**
-   * buildFields
-   *
-   * Return only the requested set of fields and map them to labels.
-   * All values are sourced from resolvedModel where possible.
-   */
   function buildFields(): Array<{ label: string; key: string; value: any }> {
     const out: Array<{ label: string; key: string; value: any }> = []
     const row: Record<string, any> = { ...(resolvedModel ?? {}) }
 
-    // Attach resolved cargo names
     if (cargoName) row.cargo_type_name = cargoName
     if (cargoNameSecondary) row.cargo_type_secondary_name = cargoNameSecondary
-
-    // Condition comes from the list item (truck) when available
     row.condition_score = conditionScore
 
-    // Map numeric gcw/cgw to labels A/B/C (truck_models stores numeric codes).
-    // Mapping per request: 1 -> A, 2 -> B, 3 -> C
     if (row.gcw !== undefined && row.gcw !== null) {
       const num = Number(row.gcw)
       const map: Record<number, string> = { 1: 'A', 2: 'B', 3: 'C' }
       if (!Number.isNaN(num) && map[num]) {
         row.gcw = map[num]
       } else {
-        // fall back to any cgw-like field if present
         const alt = (resolvedModel as any)?.cgw ?? null
         if (alt != null && !Number.isNaN(Number(alt)) && map[Number(alt)]) {
           row.gcw = map[Number(alt)]
@@ -305,7 +255,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
       }
     }
 
-    // Lease rate and price fallbacks
     row.lease_rate = row.lease_rate ?? (truck?.lease_rate ?? null)
     row.list_price = row.list_price ?? row.price ?? (truck?.list_price ?? truck?.price ?? null)
 
@@ -348,7 +297,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
 
   const fields = buildFields()
 
-  // Lease and Price values for header display (numbers preferred)
   const leaseValue =
     typeof resolvedModel?.lease_rate === 'number'
       ? resolvedModel.lease_rate
@@ -357,6 +305,7 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
       : resolvedModel?.lease_rate
       ? Number(resolvedModel.lease_rate)
       : null
+
   const listPriceValue =
     typeof resolvedModel?.list_price === 'number'
       ? resolvedModel.list_price
@@ -368,19 +317,10 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
       ? Number(resolvedModel.list_price)
       : null
 
-  // Mileage: default to 0 for new trucks
   const mileage = typeof truck?.mileage_km === 'number' ? truck.mileage_km : 0
 
-  /**
-   * Determine if the "Truck Components" action should be disabled.
-   *
-   * New market items or trucks without an owner (not purchased/leased yet)
-   * should have components disabled (they are assigned only after purchase/lease).
-   */
   const isUnowned = !truck?.owner_user_id && !truck?.owner_company_id
   const componentsDisabled = Boolean(isMarket || (isUnowned && mileage === 0))
-
-  // Actions like logs, insurance, maintenance and selling should be hidden for new/unowned trucks
   const showLifecycleActions = !componentsDisabled
 
   return (
@@ -398,20 +338,17 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
             <div className="text-xs text-slate-500">Truck model:</div>
             <div className="text-sm font-medium truncate flex items-center gap-2">
               <span className="truncate">{primaryTitle}</span>
-              {/* Secondary cargo type badge displayed inline when available */}
               {cargoNameSecondary ? (
                 <span className="inline-block text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded">{cargoNameSecondary}</span>
               ) : null}
             </div>
           </div>
 
-          {/* Move cargo icon all the way right inside this area so it sits before the stats block */}
           <div className="ml-auto flex-shrink-0">
             {cargoIconUrl ? <img src={cargoIconUrl} alt={cargoName ?? 'Cargo type'} className="h-6 w-6 rounded-md object-cover" /> : <Truck className="w-6 h-6 text-slate-400" />}
           </div>
         </div>
 
-        {/* Header stats: Condition, Class, Year, Availability days, Lease & Price (colored) */}
         <div className="flex items-center gap-4 ml-6 flex-shrink-0">
           <StatChip icon={<Gauge className="w-4 h-4 text-slate-400" />} label="Condition" value={`${conditionScore}`} className="min-w-[88px]" />
 
@@ -430,7 +367,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
             <div className="text-sm font-medium text-slate-800 truncate">{resolvedModel?.availability_days != null ? `${resolvedModel.availability_days}` : <span className="text-slate-500">Not specified</span>}</div>
           </div>
 
-          {/* Lease Rate (green) and List Price (blue) */}
           <div className="flex items-center gap-3">
             <PricePill label="Lease Rate" value={leaseValue ?? null} color="green" />
             <PricePill label="List Price" value={listPriceValue ?? null} color="sky" />
@@ -450,12 +386,17 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
         <div className="bg-slate-50 border border-slate-100 rounded-md p-3 shadow-sm">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {fields.map((f) => {
-              // Render condition as number, others via prettyValue
               return (
                 <div key={f.key}>
                   <div className="text-xs text-slate-500">{f.label}</div>
                   <div className="text-sm font-medium text-slate-800">
-                    {f.key === 'condition_score' ? String(f.value ?? '0') : f.key === 'lease_rate' || f.key === 'list_price' ? (formatCurrency(typeof f.value === 'number' ? f.value : Number(f.value)) ?? <span className="text-slate-500">Not specified</span>) : prettyValue(f.value)}
+                    {f.key === 'condition_score'
+                      ? String(f.value ?? '0')
+                      : f.key === 'lease_rate' || f.key === 'list_price'
+                      ? (formatCurrency(typeof f.value === 'number' ? f.value : Number(f.value)) ?? (
+                          <span className="text-slate-500">Not specified</span>
+                        ))
+                      : prettyValue(f.value)}
                   </div>
                 </div>
               )
@@ -463,17 +404,14 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
           </div>
 
           <div className="mt-3 flex items-center gap-3 justify-end">
-            {/* Mileage display (default 0 km for new trucks) */}
             <div className="mr-auto flex items-center gap-2">
               <div className="text-xs text-slate-500 hidden sm:block">Mileage in (km)</div>
               <div className="text-sm text-slate-500">{`${mileage ?? 0} km`}</div>
             </div>
 
-            {/* New action buttons for market/new trucks */}
             <button
               type="button"
               onClick={() => {
-                // open compare modal
                 setShowCompare(true)
               }}
               aria-label="Compare Trucks"
@@ -487,7 +425,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
               <span>Compare Trucks</span>
             </button>
 
-            {/* Truck Components: disabled for new/unowned or market items */}
             <button
               type="button"
               onClick={() => {
@@ -505,7 +442,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
               Specifications
             </button>
 
-            {/* Updated Lease button: opens the LeaseConfirmModal */}
             <button
               type="button"
               onClick={() => setShowLeaseModal(true)}
@@ -518,9 +454,36 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
             <button
               type="button"
               onClick={() => {
-                // Placeholder: implement purchase flow/modal
-                // eslint-disable-next-line no-console
-                console.debug('Purchase Truck clicked', id)
+                const payload: PurchaseClickPayload = {
+                  ...truck,
+                  id,
+                  master_truck_id: rawModelId ?? resolvedModel?.id ?? truck?.id ?? null,
+                  name: primaryTitle,
+                  make: resolvedModel?.make ?? truck?.make ?? null,
+                  model: resolvedModel?.model ?? truck?.model ?? null,
+                  list_price:
+                    typeof listPriceValue === 'number'
+                      ? listPriceValue
+                      : listPriceValue != null
+                      ? Number(listPriceValue)
+                      : null,
+                  price:
+                    typeof listPriceValue === 'number'
+                      ? listPriceValue
+                      : listPriceValue != null
+                      ? Number(listPriceValue)
+                      : null,
+                  availability_days:
+                    resolvedModel?.availability_days != null
+                      ? Number(resolvedModel.availability_days)
+                      : (truck?.availability_days != null ? Number(truck.availability_days) : 0),
+                }
+
+                if (onPurchaseClick) {
+                  onPurchaseClick(payload)
+                } else {
+                  console.debug('Purchase Truck clicked (no handler provided)', payload)
+                }
               }}
               className="px-3 py-1 text-sm bg-sky-600 hover:bg-sky-700 border border-sky-600 rounded text-white"
               aria-label="Purchase Truck"
@@ -528,7 +491,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
               Purchase Truck
             </button>
 
-            {/* Lifecycle actions hidden for new/unowned trucks (will activate after purchase/lease) */}
             {showLifecycleActions && (
               <>
                 <button type="button" onClick={() => setShowLogs(true)} className="px-3 py-1 text-sm bg-white hover:bg-slate-100 border border-slate-200 rounded">
@@ -559,7 +521,6 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
       <SellTruckModal truckId={id} condition={(truck?.condition_score as number) ?? 0} open={showSell} onClose={() => setShowSell(false)} />
       <MaintenanceModal truckId={id} open={maintenanceModalOpen} onClose={() => setMaintenanceModalOpen(false)} onDone={() => {}} />
 
-      {/* Lease modal mounted here so Lease Truck opens it */}
       <LeaseConfirmModal
         open={showLeaseModal}
         onClose={() => setShowLeaseModal(false)}
@@ -567,11 +528,9 @@ export default function TruckModelCard({ truck, modelInfo, defaultRegistration, 
         companyId={company?.id ?? null}
         onSuccess={() => {
           setShowLeaseModal(false)
-          // optional: emit event or trigger refresh if needed
         }}
       />
 
-      {/* Compare modal (opened by Compare Trucks button) */}
       <TruckCompareModal id={`truck-compare-${id}`} open={showCompare} onClose={() => setShowCompare(false)} currentModel={resolvedModel} currentTruck={truck} />
     </div>
   )

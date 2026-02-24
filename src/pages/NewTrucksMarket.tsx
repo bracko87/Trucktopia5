@@ -16,6 +16,7 @@ import Layout from '../components/Layout'
 import TruckModelCard from '../components/trucks/TruckModelCard'
 import TrucksFilter from '../components/trucks/TrucksFilter'
 import CargoTypesLegend from '../components/trucks/CargoTypesLegend'
+import PurchaseConfirmModal from '../components/trucks/PurchaseConfirmModal'
 import { supabaseFetch } from '../lib/supabase'
 
 interface TruckModelRow {
@@ -69,6 +70,11 @@ export default function NewTrucksMarketPage(): JSX.Element {
 
   const ITEMS_PER_PAGE = 10
   const [currentPage, setCurrentPage] = useState<number>(1)
+
+  // Purchase modal state
+  const [purchaseOpen, setPurchaseOpen] = useState<boolean>(false)
+  const [selectedPurchaseTruck, setSelectedPurchaseTruck] =
+    useState<MarketListRow | null>(null)
 
   async function loadModels() {
     setLoading(true)
@@ -210,6 +216,11 @@ export default function NewTrucksMarketPage(): JSX.Element {
     }
   }
 
+  function openPurchaseModal(truck: MarketListRow) {
+    setSelectedPurchaseTruck(truck)
+    setPurchaseOpen(true)
+  }
+
   return (
     <Layout fullWidth>
       <div className="space-y-6">
@@ -262,13 +273,18 @@ export default function NewTrucksMarketPage(): JSX.Element {
                   <div key={t.id} className="w-full">
                     <TruckModelCard
                       truck={t}
-                      defaultName={
-                        t.name ?? undefined
-                      }
                       defaultRegistration={
                         t.registration ?? undefined
                       }
                       isMarket
+                      onPurchaseClick={(payload) => {
+                        // Prefer payload from TruckModelCard if provided
+                        const merged: MarketListRow = {
+                          ...t,
+                          ...(payload ?? {}),
+                        }
+                        openPurchaseModal(merged)
+                      }}
                     />
                   </div>
                 ))}
@@ -332,6 +348,41 @@ export default function NewTrucksMarketPage(): JSX.Element {
           </div>
         </section>
       </div>
+
+      <PurchaseConfirmModal
+        open={purchaseOpen}
+        onClose={() => setPurchaseOpen(false)}
+        assetModelId={
+          selectedPurchaseTruck?.master_truck_id ??
+          null
+        }
+        displayNameOverride={
+          selectedPurchaseTruck?.name ?? null
+        }
+        listPriceOverride={
+          selectedPurchaseTruck
+            ? Number(
+                (selectedPurchaseTruck as any).list_price ??
+                  (selectedPurchaseTruck as any).price ??
+                  0
+              )
+            : null
+        }
+        availableDaysOverride={
+          selectedPurchaseTruck
+            ? Number(
+                (selectedPurchaseTruck as any)
+                  .availability_days ?? 0
+              )
+            : 0
+        }
+        onSuccess={() => {
+          setPurchaseOpen(false)
+          void loadModels()
+          // Optional: toast if you have one
+          // Optional: window.dispatchEvent(new CustomEvent('trucks:refresh'))
+        }}
+      />
     </Layout>
   )
 }

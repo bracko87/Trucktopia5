@@ -9,6 +9,8 @@
  * - Uses computeInstallment(...) to compute and display installment = lease_rate / term
  * - Ensures inserted user_trucks and user_leases include owner_user_auth_id,
  *   owner_user_id and owner_company_id so DB triggers and UI work correctly.
+ * - Applies delivery/transit timing using truck_models.availability_days:
+ *   leased trucks can be created as IN_TRANSIT and become usable only after available_from_at.
  */
 
 import React from 'react'
@@ -48,6 +50,19 @@ function addWeeks(d: Date, weeks: number): Date {
 }
 
 /**
+ * addDays
+ *
+ * Add days to a date and return a new Date.
+ *
+ * @param d base date
+ * @param days number of days to add
+ * @returns Date
+ */
+function addDays(d: Date, days: number): Date {
+  return new Date(d.getTime() + days * 24 * 60 * 60 * 1000)
+}
+
+/**
  * LeaseConfirmModal
  *
  * Renders the page-styled confirmation modal and performs two inserts when confirmed:
@@ -75,6 +90,9 @@ export default function LeaseConfirmModal({
   const [modelName, setModelName] = React.useState<string | null>(null)
   const [resolvedModelId, setResolvedModelId] = React.useState<string | null>(null)
 
+  // NEW: delivery/transit timing from truck_models.availability_days
+  const [availabilityDays, setAvailabilityDays] = React.useState<number>(0)
+
   // Forced, unchangeable terms
   const FIXED_FREQUENCY: 'weekly' = 'weekly'
   const FIXED_INSTALLMENTS = 60 // 60 weeks -> 420 days
@@ -92,6 +110,7 @@ export default function LeaseConfirmModal({
     setLoading(true)
     setModelName(null)
     setLeaseRate(null)
+    setAvailabilityDays(0)
 
     let mounted = true
 
@@ -109,20 +128,12 @@ export default function LeaseConfirmModal({
           return
         }
 
-        // honor caller override first
-        if (leaseRateOverride !== null && leaseRateOverride !== undefined) {
-          if (mounted) {
-            setLeaseRate(Number(leaseRateOverride))
-            setModelName(null)
-            setLoading(false)
-          }
-          return
-        }
-
-        // Fetch truck model row using official client
+        // Fetch truck model row using official client.
+        // We still fetch even if leaseRateOverride exists, because we need
+        // model name and availability_days for transit/delivery behavior.
         const { data, error: fetchErr } = await supabase
           .from('truck_models')
-          .select('id, make, model, lease_rate, list_price')
+          .select('id, make, model, lease_rate, list_price, availability_days')
           .eq('id', resolved)
           .maybeSingle()
 
@@ -131,17 +142,24 @@ export default function LeaseConfirmModal({
         if (fetchErr) {
           setError('Failed to load model info')
           setLeaseRate(null)
+          setAvailabilityDays(0)
         } else if (data) {
           setModelName([data.make, data.model].filter(Boolean).join(' '))
-          const r = (data as any).lease_rate
+
+          const r = leaseRateOverride ?? (data as any).lease_rate
           setLeaseRate(r !== null && r !== undefined ? Number(r) : null)
+
+          const avDays = Number((data as any).availability_days ?? 0)
+          setAvailabilityDays(Number.isFinite(avDays) ? Math.max(0, avDays) : 0)
         } else {
           setError('Truck model not found')
           setLeaseRate(null)
+          setAvailabilityDays(0)
         }
       } catch (e: any) {
         setError(e?.message ?? 'Unknown load error')
         setLeaseRate(null)
+        setAvailabilityDays(0)
       } finally {
         if (mounted) setLoading(false)
       }
@@ -153,10 +171,16 @@ export default function LeaseConfirmModal({
     }
   }, [open, assetModelId, leaseRateOverride])
 
-  if (!open) return null
-
   // Use canonical helper: installment = lease_rate / FIXED_INSTALLMENTS
   const installmentAmount = computeInstallment(leaseRate, FIXED_INSTALLMENTS)
+
+  const estimatedDeliveryAt = React.useMemo(() => {
+    const now = new Date()
+    return addDays(now, Math.max(0, Number(availabilityDays ?? 0)))
+  }, [availabilityDays])
+
+  // Ensure hooks order is stable by performing all hooks above, then early-return.
+  if (!open) return null
 
   /**
    * handleConfirm
@@ -194,10 +218,19 @@ export default function LeaseConfirmModal({
         .maybeSingle()
 
       const ownerUserId = (localUser as any)?.id ?? null
-      const ownerCompanyId = (localUser as any)?.company_id ?? null
+      const ownerCompanyId = companyId ?? (localUser as any)?.company_id ?? null
 
       const start = new Date()
       const end = addWeeks(start, FIXED_INSTALLMENTS)
+
+      // NEW: apply same transit logic as purchases
+      const deliveryDays = Math.max(0, Number(availabilityDays ?? 0))
+      const availableFromAt =
+        deliveryDays > 0
+          ? new Date(Date.now() + deliveryDays * 24 * 60 * 60 * 1000).toISOString()
+          : null
+
+      const initialTruckStatus = deliveryDays > 0 ? 'IN_TRANSIT' : 'IDLE'
 
       /* --------------------------------------------------
          1. CREATE TRUCK (physical object, no lease dates/rates)
@@ -211,7 +244,9 @@ export default function LeaseConfirmModal({
           owner_company_id: ownerCompanyId,
           acquisition_type: 'leased',
           mileage_km: 0,
-          availability_days: 1,
+          availability_days: deliveryDays,
+          available_from_at: availableFromAt,
+          status: initialTruckStatus,
           condition_score: 100,
           is_active: true,
         })
@@ -287,19 +322,18 @@ export default function LeaseConfirmModal({
 
             <div className="text-xs text-slate-500">Lease rate</div>
             <div className="text-2xl font-semibold mb-4">
-              {loading
-                ? '—'
-                : leaseRate !== null && leaseRate !== undefined
-                ? formatUSD(Number(leaseRate))
-                : '—'}
+              {loading ? '—' : leaseRate !== null && leaseRate !== undefined ? formatUSD(Number(leaseRate)) : '—'}
             </div>
 
             <div className="text-xs text-slate-500">Estimated installment</div>
-            <div className="text-sm font-medium">
-              {loading
-                ? '—'
-                : `${FIXED_INSTALLMENTS} installments left · ${formatUSD(installmentAmount)} each`}
-            </div>
+            <div className="text-sm font-medium mb-4">{loading ? '—' : `${FIXED_INSTALLMENTS} installments left · ${formatUSD(installmentAmount)} each`}</div>
+
+            {/* NEW: Delivery / transit info */}
+            <div className="text-xs text-slate-500">Available in (days)</div>
+            <div className="text-sm font-medium mb-2">{loading ? '—' : `${Math.max(0, Number(availabilityDays ?? 0))}`}</div>
+
+            <div className="text-xs text-slate-500">Expected delivery</div>
+            <div className="text-sm font-medium">{loading ? '—' : estimatedDeliveryAt.toLocaleString()}</div>
 
             {!loading && !leaseRate && !modelName && <div className="text-xs text-rose-600 mt-3">If this remains blank, ensure the caller passes a valid assetModelId prop.</div>}
           </div>
@@ -352,6 +386,13 @@ export default function LeaseConfirmModal({
                 })()}
               </div>
             </div>
+
+            {/* NEW: Transit notice */}
+            {!loading && availabilityDays > 0 && (
+              <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                This leased truck will appear in your fleet immediately, but it will be unavailable and shown as in transit until delivery is complete.
+              </div>
+            )}
 
             {error && <div className="text-xs text-rose-600 mb-4">{error}</div>}
 

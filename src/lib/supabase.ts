@@ -23,12 +23,14 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 /* ---------------------------------- */
 
 const SUPABASE_URL =
-  (typeof process !== 'undefined' && (process.env?.REACT_APP_SUPABASE_URL as string)) ||
+  (typeof process !== 'undefined' &&
+    (process.env?.REACT_APP_SUPABASE_URL as string)) ||
   (globalThis as any)?.SUPABASE_URL ||
   'https://iiunrkztuhhbdgxzqqgq.supabase.co'
 
 const SUPABASE_ANON_KEY =
-  (typeof process !== 'undefined' && (process.env?.REACT_APP_SUPABASE_ANON_KEY as string)) ||
+  (typeof process !== 'undefined' &&
+    (process.env?.REACT_APP_SUPABASE_ANON_KEY as string)) ||
   (globalThis as any)?.SUPABASE_ANON_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
 
@@ -80,17 +82,25 @@ const memoryStorage = createMemoryStorage()
 /* Client (SINGLETON)                  */
 /* ---------------------------------- */
 
-export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: {
-    // If localStorage is blocked, do NOT attempt to persist at all.
-    // This prevents the "login works then disappears" behavior in iframes.
-    persistSession: LOCAL_OK,
-    storage: LOCAL_OK ? (typeof window !== 'undefined' ? window.localStorage : memoryStorage) : memoryStorage,
+export const supabase: SupabaseClient = createClient(
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  {
+    auth: {
+      // If localStorage is blocked, do NOT attempt to persist at all.
+      // This prevents the "login works then disappears" behavior in iframes.
+      persistSession: LOCAL_OK,
+      storage: LOCAL_OK
+        ? typeof window !== 'undefined'
+          ? window.localStorage
+          : memoryStorage
+        : memoryStorage,
 
-    autoRefreshToken: true,
-    detectSessionInUrl: false,
-  },
-})
+      autoRefreshToken: true,
+      detectSessionInUrl: false,
+    },
+  }
+)
 
 /* ---------------------------------- */
 /* Helpers                             */
@@ -171,7 +181,9 @@ export async function supabaseFetch(path: string, opts: RequestInit = {}) {
   }
 
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`
-  if (opts.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json'
+  if (opts.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json'
+  }
 
   const res = await fetch(url, { ...opts, headers })
   const text = await res.text()
@@ -200,11 +212,50 @@ export async function insertRow(table: string, row: object) {
   })
 }
 
+/* ---------------------------------- */
+/* RPC helpers                         */
+/* ---------------------------------- */
+
+export interface PurchaseMarketTruckParams {
+  masterTruckId: string
+  ownerCompanyId: string
+  ownerUserId?: string | null
+  ownerUserAuthId: string
+  purchasePrice: number
+  availableDays?: number
+  name?: string | null
+}
+
+export async function purchaseMarketTruckRpc(
+  params: PurchaseMarketTruckParams
+) {
+  const {
+    masterTruckId,
+    ownerCompanyId,
+    ownerUserId = null,
+    ownerUserAuthId,
+    purchasePrice,
+    availableDays = 0,
+    name = null,
+  } = params
+
+  const { data, error } = await supabase.rpc('purchase_market_truck', {
+    p_master_truck_id: masterTruckId,
+    p_owner_company_id: ownerCompanyId,
+    p_owner_user_id: ownerUserId,
+    p_owner_user_auth_id: ownerUserAuthId,
+    p_purchase_price: purchasePrice,
+    p_available_days: availableDays,
+    p_name: name,
+  })
+
+  if (error) throw error
+  return data
+}
+
 export async function getHiredStaffDirect() {
-  const { data, error } = await supabase
-    .from('hired_staff')
-    .select(
-      `
+  const { data, error } = await supabase.from('hired_staff').select(
+    `
       id,
       first_name,
       last_name,
@@ -218,7 +269,7 @@ export async function getHiredStaffDirect() {
       skill2:skills_master!hired_staff_skill2_id_fkey ( name, description ),
       skill3:skills_master!hired_staff_skill3_id_fkey ( name, description )
     `
-    )
+  )
 
   if (error) {
     // eslint-disable-next-line no-console

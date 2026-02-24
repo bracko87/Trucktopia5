@@ -32,8 +32,7 @@ import WeatherBadge from './WeatherBadge'
  */
 export interface JobRow {
   id: string
-  remaining_payload?: number | null
-  remaining_payload?: number | null
+
   /** Prefer this for multi-run offers (remaining payload left on offer). */
   remaining_payload?: number | null
 
@@ -530,6 +529,8 @@ function MetaBox({
   hazardous?: boolean | null
   special_requirements?: any | null
 }) {
+  void item
+
   const isExpired = (() => {
     if (!deadline) return false
     const d = new Date(String(deadline))
@@ -872,10 +873,12 @@ export default function JobCard({
 
   const disabled = pickupReady === false && (effectiveMode === 'staging' || effectiveMode === 'my-jobs')
 
+  const hasCompanyInfo = Boolean(job.origin_client_company_name || job.destination_client_company_name)
+
   return (
     <article
       aria-labelledby={`job-${job.id}-title`}
-      data-jobcard-version="v3-cargo-payload-company-v3"
+      data-jobcard-version="v3-cargo-payload-company-v4"
       className={`group rounded-xl border border-slate-100 shadow-sm hover:shadow-lg transition-shadow duration-150 p-3 bg-white ${
         disabled ? 'opacity-75 filter grayscale' : ''
       }`}
@@ -933,53 +936,55 @@ export default function JobCard({
               </div>
             </div>
 
-            <div className="mt-4 border-t pt-3 space-y-2">
-              {job.origin_client_company_name && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    openCompanyModal(
-                      job.origin_client_company_id,
-                      job.origin_client_company_name,
-                      job.origin_client_company_logo ?? undefined
-                    )
-                  }
-                  className="flex items-center gap-3 w-full text-left p-0"
-                  aria-label={`Open profile for ${job.origin_client_company_name}`}
-                >
-                  <CompanyAvatar name={job.origin_client_company_name} logoUrl={job.origin_client_company_logo} size={56} />
-                  <div className="min-w-0">
-                    <div className="text-xs text-slate-500">Origin client</div>
-                    <div className="text-sm font-medium truncate">{job.origin_client_company_name}</div>
-                  </div>
-                </button>
-              )}
+            {hasCompanyInfo && (
+              <div className="mt-4 border-t pt-3 space-y-2">
+                {job.origin_client_company_name && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openCompanyModal(
+                        job.origin_client_company_id,
+                        job.origin_client_company_name,
+                        job.origin_client_company_logo ?? undefined
+                      )
+                    }
+                    className="flex items-center gap-3 w-full text-left p-0"
+                    aria-label={`Open profile for ${job.origin_client_company_name}`}
+                  >
+                    <CompanyAvatar name={job.origin_client_company_name} logoUrl={job.origin_client_company_logo} size={56} />
+                    <div className="min-w-0">
+                      <div className="text-xs text-slate-500">Origin client</div>
+                      <div className="text-sm font-medium truncate">{job.origin_client_company_name}</div>
+                    </div>
+                  </button>
+                )}
 
-              {job.destination_client_company_name && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    openCompanyModal(
-                      job.destination_client_company_id,
-                      job.destination_client_company_name,
-                      job.destination_client_company_logo ?? undefined
-                    )
-                  }
-                  className="flex items-center gap-3 w-full text-left p-0"
-                  aria-label={`Open profile for ${job.destination_client_company_name}`}
-                >
-                  <CompanyAvatar
-                    name={job.destination_client_company_name}
-                    logoUrl={job.destination_client_company_logo}
-                    size={56}
-                  />
-                  <div className="min-w-0">
-                    <div className="text-xs text-slate-500">Destination client</div>
-                    <div className="text-sm font-medium truncate">{job.destination_client_company_name}</div>
-                  </div>
-                </button>
-              )}
-            </div>
+                {job.destination_client_company_name && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      openCompanyModal(
+                        job.destination_client_company_id,
+                        job.destination_client_company_name,
+                        job.destination_client_company_logo ?? undefined
+                      )
+                    }
+                    className="flex items-center gap-3 w-full text-left p-0"
+                    aria-label={`Open profile for ${job.destination_client_company_name}`}
+                  >
+                    <CompanyAvatar
+                      name={job.destination_client_company_name}
+                      logoUrl={job.destination_client_company_logo}
+                      size={56}
+                    />
+                    <div className="min-w-0">
+                      <div className="text-xs text-slate-500">Destination client</div>
+                      <div className="text-sm font-medium truncate">{job.destination_client_company_name}</div>
+                    </div>
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="md:col-span-1">
@@ -987,7 +992,7 @@ export default function JobCard({
               pickup={job.pickup_time}
               deadline={job.delivery_deadline}
               item={job.cargo_item}
-              // ✅ key fix: use remaining payload for weight display
+              // ✅ use remaining payload for weight display when available
               weight_kg={displayPayloadKg}
               volume_m3={job.volume_m3}
               pallets={job.pallets}
