@@ -359,6 +359,10 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const [companyProfileError, setCompanyProfileError] = useState<string | null>(null)
   const [companyContextGraceElapsed, setCompanyContextGraceElapsed] = useState<boolean>(false)
 
+  // Fallback resolution for pages that do not pass companyId
+  const [resolvedCompanyId, setResolvedCompanyId] = useState<string>('')
+  const [isResolvingCompanyId, setIsResolvingCompanyId] = useState<boolean>(false)
+
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [searchTerm, setSearchTerm] = useState<string>('')
   const [minRemaining, setMinRemaining] = useState<string>('')
@@ -389,18 +393,67 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   const effectiveCompanyId = useMemo(() => {
     const trimmedPropId = String(companyId ?? '').trim()
     if (trimmedPropId) return trimmedPropId
+    if (resolvedCompanyId) return resolvedCompanyId
     if (companyProfile?.id) return companyProfile.id
     return ''
-  }, [companyId, companyProfile?.id])
+  }, [companyId, resolvedCompanyId, companyProfile?.id])
 
   const hasIncomingCompanyId = useMemo(
     () => String(companyId ?? '').trim().length > 0,
     [companyId]
   )
 
+  // Fallback company resolution for pages that do not pass companyId to this panel.
+  useEffect(() => {
+    let cancelled = false
+
+    async function resolveCompanyIdFromCurrentUser() {
+      const incomingCompanyId = String(companyId ?? '').trim()
+
+      if (incomingCompanyId) {
+        setResolvedCompanyId('')
+        setIsResolvingCompanyId(false)
+        return
+      }
+
+      setResolvedCompanyId('')
+      setIsResolvingCompanyId(true)
+
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser()
+
+      if (cancelled) return
+
+      if (authError || !user?.id) {
+        setResolvedCompanyId('')
+        setIsResolvingCompanyId(false)
+        return
+      }
+
+      const { data, error } = await supabase
+        .from('companies')
+        .select('id')
+        .eq('owner_auth_user_id', user.id)
+        .maybeSingle()
+
+      if (cancelled) return
+
+      setResolvedCompanyId(error || !data?.id ? '' : data.id)
+      setIsResolvingCompanyId(false)
+    }
+
+    resolveCompanyIdFromCurrentUser()
+
+    return () => {
+      cancelled = true
+    }
+  }, [companyId])
+
   // Grace period: if parent hasn't provided companyId immediately, show loading briefly, then "missing"
   useEffect(() => {
-    if (hasIncomingCompanyId || effectiveCompanyId) {
+    if (hasIncomingCompanyId || effectiveCompanyId || isResolvingCompanyId) {
       setCompanyContextGraceElapsed(false)
       return
     }
@@ -410,10 +463,12 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     }, COMPANY_CONTEXT_GRACE_MS)
 
     return () => window.clearTimeout(t)
-  }, [hasIncomingCompanyId, effectiveCompanyId])
+  }, [hasIncomingCompanyId, effectiveCompanyId, isResolvingCompanyId])
 
   const companyContextState = useMemo<CompanyContextState>(() => {
     if (effectiveCompanyId) return 'ready'
+
+    if (isResolvingCompanyId) return 'loading'
 
     if (!hasIncomingCompanyId) {
       return companyContextGraceElapsed ? 'missing' : 'loading'
@@ -425,6 +480,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     return 'loading'
   }, [
     effectiveCompanyId,
+    isResolvingCompanyId,
     hasIncomingCompanyId,
     companyContextGraceElapsed,
     companyProfileLoading,
@@ -436,6 +492,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
   useEffect(() => {
     console.info('[LoansPanel] company context', {
       incomingCompanyId: companyId ?? null,
+      resolvedCompanyId: resolvedCompanyId || null,
+      isResolvingCompanyId,
       effectiveCompanyId: effectiveCompanyId || null,
       companyContextState,
       companyProfileLoading,
@@ -446,6 +504,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     })
   }, [
     companyId,
+    resolvedCompanyId,
+    isResolvingCompanyId,
     effectiveCompanyId,
     companyContextState,
     companyProfileLoading,
@@ -506,12 +566,12 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     setLoading(false)
   }
 
-  // Fetch loans (based on incoming companyId)
+  // Fetch loans (based on resolved/effective companyId)
   useEffect(() => {
     let cancelled = false
 
     async function fetchLoans() {
-      const targetCompanyId = String(companyId ?? '').trim()
+      const targetCompanyId = effectiveCompanyId
 
       if (!targetCompanyId) {
         if (cancelled) return
@@ -559,14 +619,14 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [companyId])
+  }, [effectiveCompanyId])
 
-  // Fetch company profile (based on incoming companyId)
+  // Fetch company profile (based on resolved/effective companyId)
   useEffect(() => {
     let cancelled = false
 
     async function fetchCompanyProfile() {
-      const targetCompanyId = String(companyId ?? '').trim()
+      const targetCompanyId = effectiveCompanyId
 
       if (!targetCompanyId) {
         if (cancelled) return
@@ -615,7 +675,7 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [companyId])
+  }, [effectiveCompanyId])
 
   const filteredLoans = useMemo(() => {
     let result = [...loans]
@@ -938,6 +998,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
         payload,
         companyContextState,
         incomingCompanyId: companyId ?? null,
+        resolvedCompanyId: resolvedCompanyId || null,
+        isResolvingCompanyId,
         effectiveCompanyId: targetCompanyId,
         companyProfileId: companyProfile?.id ?? null,
       })
@@ -950,6 +1012,8 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
           supabaseError: insertError,
           diagnostics: {
             incomingCompanyId: companyId ?? null,
+            resolvedCompanyId: resolvedCompanyId || null,
+            isResolvingCompanyId,
             effectiveCompanyId: targetCompanyId,
             companyContextState,
             companyProfileId: companyProfile?.id ?? null,
@@ -1325,7 +1389,9 @@ export default function LoansPanel({ companyId }: Props): JSX.Element {
 
                 {(companyContextState !== 'ready' || companyProfileError) && (
                   <p className="text-[11px] text-slate-500 mt-2">
-                    Debug: incoming companyId={String(companyId ?? 'null')} · effectiveCompanyId=
+                    Debug: incoming companyId={String(companyId ?? 'null')} · resolvedCompanyId=
+                    {resolvedCompanyId || 'none'} · resolving=
+                    {isResolvingCompanyId ? 'yes' : 'no'} · effectiveCompanyId=
                     {effectiveCompanyId || 'none'}
                     {companyProfileError ? ` · profileError=${companyProfileError}` : ''}
                   </p>

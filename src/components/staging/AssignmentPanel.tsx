@@ -28,7 +28,8 @@ import StagingAssignmentsPanel from './StagingAssignmentsPanel'
 /**
  * Temporary safety switch: keep preview flow enabled but disable final acceptance writes.
  */
-const ASSIGNMENT_FINALIZE_ENABLED = false
+// Flow switch: set to true to allow final assignment acceptance writes.
+const ASSIGNMENT_FINALIZE_ENABLED = true
 
 /**
  * DroppedItem
@@ -205,7 +206,8 @@ function RouteCalculatorBox({
     0
   )
 
-  const estimatedRouteStartFromDrivers = relocationHours > 0 ? new Date(Date.now() + relocationHours * 3600 * 1000) : null
+  const estimatedRouteStartFromDrivers =
+    relocationHours > 0 ? new Date(Date.now() + relocationHours * 3600 * 1000) : null
 
   if (previewData) {
     const rel1 = previewData.dist_truck_to_trailer
@@ -223,15 +225,22 @@ function RouteCalculatorBox({
     const fuelCost = Number(previewData.fuel_cost ?? 0)
     const tollCost = Number(previewData.toll_cost ?? 0)
     // Include relocation cost into total cost
-    const totalCost = Number(previewData.total_cost ?? 0) + (relocationCost > 0 ? relocationCost : previewRelocationCost)
+    const totalCost =
+      Number(previewData.total_cost ?? 0) +
+      (relocationCost > 0 ? relocationCost : previewRelocationCost)
     // Prefer a server-provided reward when present
     const reward = Number(previewData.reward ?? 0)
     const profit = Number(reward) - Number(totalCost)
 
     // Route start time: prefer aggregated driver relocation hours, fallback to preview hours
     const routeStartTime =
-      (relocationHours > 0 ? relocationHours : (previewRelocationHours ?? 0)) > 0
-        ? new Date(Date.now() + (relocationHours > 0 ? relocationHours : (previewRelocationHours ?? 0)) * 3600 * 1000)
+      (relocationHours > 0 ? relocationHours : previewRelocationHours ?? 0) > 0
+        ? new Date(
+            Date.now() +
+              (relocationHours > 0 ? relocationHours : previewRelocationHours ?? 0) *
+                3600 *
+                1000
+          )
         : null
 
     return (
@@ -246,48 +255,52 @@ function RouteCalculatorBox({
             <div>
               <div className="text-xs text-slate-500">Truck → Trailer relocation</div>
               <div className="font-medium text-slate-800">
-                {rel1 != null && Number.isFinite(Number(rel1)) && Number(rel1) > 0 ? `${Number(rel1).toFixed(0)} km` : '—'}
+                {rel1 != null && Number.isFinite(Number(rel1)) && Number(rel1) > 0
+                  ? `${Number(rel1).toFixed(0)} km`
+                  : '—'}
               </div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Trailer → Pickup relocation</div>
               <div className="font-medium text-slate-800">
-                {rel2 != null && Number.isFinite(Number(rel2)) && Number(rel2) > 0 ? `${Number(rel2).toFixed(0)} km` : '—'}
+                {rel2 != null && Number.isFinite(Number(rel2)) && Number(rel2) > 0
+                  ? `${Number(rel2).toFixed(0)} km`
+                  : '—'}
               </div>
             </div>
 
             <div>
               <div className="text-xs text-slate-500">Job delivery route</div>
               <div className="font-medium text-slate-800">
-                {jobDistance != null && Number.isFinite(Number(jobDistance)) && Number(jobDistance) > 0 ? `${Number(jobDistance).toFixed(0)} km` : '—'}
+                {jobDistance != null && Number.isFinite(Number(jobDistance)) && Number(jobDistance) > 0
+                  ? `${Number(jobDistance).toFixed(0)} km`
+                  : '—'}
               </div>
             </div>
 
             <div>
-              <div className="text-xs text-slate-500">
-                Relocation / transfer before route
-              </div>
+              <div className="text-xs text-slate-500">Relocation / transfer before route</div>
 
               <div className="font-medium text-slate-800">
                 {relocationKm > 0 || relocationHours > 0 || relocationCost > 0 ? (
-                  <>
-                    {`${relocationKm.toFixed(0)} km • ${formatHoursToHM(relocationHours)} • $${relocationCost.toFixed(2)}`}
-                  </>
+                  <>{`${relocationKm.toFixed(0)} km • ${formatHoursToHM(relocationHours)} • $${relocationCost.toFixed(2)}`}</>
+                ) : // fallback to preview numbers when driver relocation not available
+                previewRelocationCost > 0 && previewRelocationHours > 0 ? (
+                  `${Number(previewRelocationCost).toFixed(2)} • ${formatHoursToHM(previewRelocationHours)}`
                 ) : (
-                  // fallback to preview numbers when driver relocation not available
-                  (previewRelocationCost > 0 && previewRelocationHours > 0) ? (
-                    `${Number(previewRelocationCost).toFixed(2)} • ${formatHoursToHM(previewRelocationHours)}`
-                  ) : '—'
+                  '—'
                 )}
               </div>
 
-              <div className="text-xs text-slate-500 mt-1">
-                Estimated route start
-              </div>
+              <div className="text-xs text-slate-500 mt-1">Estimated route start</div>
 
               <div className="font-medium text-slate-800">
-                {estimatedRouteStartFromDrivers ? estimatedRouteStartFromDrivers.toLocaleString() : (routeStartTime ? routeStartTime.toLocaleString() : 'Immediate')}
+                {estimatedRouteStartFromDrivers
+                  ? estimatedRouteStartFromDrivers.toLocaleString()
+                  : routeStartTime
+                    ? routeStartTime.toLocaleString()
+                    : 'Immediate'}
               </div>
             </div>
 
@@ -303,7 +316,9 @@ function RouteCalculatorBox({
                   </div>
 
                   <div className="text-sm">
-                    {pickupWeather?.temperature != null ? `${pickupWeather.temperature.toFixed(1)} °C` : '—'}
+                    {pickupWeather?.temperature != null
+                      ? `${pickupWeather.temperature.toFixed(1)} °C`
+                      : '—'}
                   </div>
                 </div>
               </div>
@@ -318,7 +333,9 @@ function RouteCalculatorBox({
                   </div>
 
                   <div className="text-sm">
-                    {deliveryWeather?.temperature != null ? `${deliveryWeather.temperature.toFixed(1)} °C` : '—'}
+                    {deliveryWeather?.temperature != null
+                      ? `${deliveryWeather.temperature.toFixed(1)} °C`
+                      : '—'}
                   </div>
                 </div>
               </div>
@@ -328,7 +345,11 @@ function RouteCalculatorBox({
           <div className="space-y-2 h-full flex flex-col">
             <div>
               <div className="text-xs text-slate-500">Total distance</div>
-              <div className="font-medium text-slate-800">{total != null && Number.isFinite(Number(total)) && Number(total) > 0 ? `${Number(total).toFixed(0)} km` : '—'}</div>
+              <div className="font-medium text-slate-800">
+                {total != null && Number.isFinite(Number(total)) && Number(total) > 0
+                  ? `${Number(total).toFixed(0)} km`
+                  : '—'}
+              </div>
             </div>
 
             <div>
@@ -340,7 +361,9 @@ function RouteCalculatorBox({
 
             <div>
               <div className="text-xs text-slate-500">Fuel estimate</div>
-              <div className="font-medium text-slate-800">{fuelL != null && !Number.isNaN(Number(fuelL)) ? `${Number(fuelL).toFixed(1)} L` : '—'}</div>
+              <div className="font-medium text-slate-800">
+                {fuelL != null && !Number.isNaN(Number(fuelL)) ? `${Number(fuelL).toFixed(1)} L` : '—'}
+              </div>
             </div>
 
             <div>
@@ -354,33 +377,59 @@ function RouteCalculatorBox({
               <div>
                 <div className="flex items-center justify-between">
                   <div className="text-xs text-slate-500">Reward</div>
-                  <div className="font-semibold text-slate-800">{reward != null ? `$${Number(reward).toFixed(2)}` : '—'}</div>
+                  <div className="font-semibold text-slate-800">
+                    {reward != null ? `$${Number(reward).toFixed(2)}` : '—'}
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between mt-2">
                   <div className="text-xs text-slate-500">Fuel cost</div>
-                  <div className="font-medium text-slate-800">{fuelCost != null && !Number.isNaN(Number(fuelCost)) ? `$${Number(fuelCost).toFixed(2)}` : '—'}</div>
+                  <div className="font-medium text-slate-800">
+                    {fuelCost != null && !Number.isNaN(Number(fuelCost))
+                      ? `$${Number(fuelCost).toFixed(2)}`
+                      : '—'}
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between mt-2">
                   <div className="text-xs text-slate-500">Tolls</div>
-                  <div className="font-medium text-slate-800">{tollCost != null && !Number.isNaN(Number(tollCost)) ? `$${Number(tollCost).toFixed(2)}` : '—'}</div>
+                  <div className="font-medium text-slate-800">
+                    {tollCost != null && !Number.isNaN(Number(tollCost))
+                      ? `$${Number(tollCost).toFixed(2)}`
+                      : '—'}
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between mt-2">
                   <div className="text-xs text-slate-500">Relocation</div>
-                  <div className="font-medium text-slate-800">{(relocationCost > 0 || previewRelocationCost > 0) ? `$${(relocationCost > 0 ? relocationCost : previewRelocationCost).toFixed(2)}` : '—'}</div>
+                  <div className="font-medium text-slate-800">
+                    {relocationCost > 0 || previewRelocationCost > 0
+                      ? `$${(relocationCost > 0 ? relocationCost : previewRelocationCost).toFixed(2)}`
+                      : '—'}
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between mt-3 border-t pt-3">
                   <div className="text-xs text-slate-500">Total cost</div>
-                  <div className="font-semibold text-slate-800">{totalCost != null && !Number.isNaN(Number(totalCost)) ? `$${Number(totalCost).toFixed(2)}` : '—'}</div>
+                  <div className="font-semibold text-slate-800">
+                    {totalCost != null && !Number.isNaN(Number(totalCost))
+                      ? `$${Number(totalCost).toFixed(2)}`
+                      : '—'}
+                  </div>
                 </div>
               </div>
 
               <div className="flex items-center justify-between mt-2">
                 <div className="text-xs text-slate-500">Estimated profit</div>
-                <div className={`font-semibold ${profit != null && Number(profit) < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>{profit != null && !Number.isNaN(Number(profit)) ? `$${Number(profit).toFixed(2)}` : '—'}</div>
+                <div
+                  className={`font-semibold ${
+                    profit != null && Number(profit) < 0 ? 'text-rose-600' : 'text-emerald-600'
+                  }`}
+                >
+                  {profit != null && !Number.isNaN(Number(profit))
+                    ? `$${Number(profit).toFixed(2)}`
+                    : '—'}
+                </div>
               </div>
             </div>
           </div>
@@ -396,36 +445,45 @@ function RouteCalculatorBox({
 
   const totalDistanceKm = jobDistanceKm // without relocation when coords missing
   const durationHours = totalDistanceKm > 0 ? totalDistanceKm / 68 : 0 // heuristic
-  const fuelEstimateL = Math.round((totalDistanceKm * 28) / 100 * 100) / 100
+  const fuelEstimateL = Math.round(((totalDistanceKm * 28) / 100) * 100) / 100
   const fuelCost = Math.round(fuelEstimateL * 1.7 * 100) / 100
   const tollCost = Math.round(totalDistanceKm * 0.1 * 100) / 100
   // Include relocation cost from aggregated driver relocation (client computed)
   const totalCost = Math.round((fuelCost + tollCost + relocationCost) * 100) / 100
   const reward = job?.reward_load_cargo ?? job?.reward_trailer_cargo ?? job?.reward ?? null
-  const profit = reward != null ? Math.round((Number(reward) - totalCost) * 100) / 100 : null
+  const profit =
+    reward != null ? Math.round((Number(reward) - totalCost) * 100) / 100 : null
 
   return (
     <section className="mt-4 bg-white rounded-lg border border-slate-200 p-4 shadow-sm h-full">
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold">Route calculator</h3>
-        <div className="text-xs text-slate-500">Estimates are heuristics — review before confirm</div>
+        <div className="text-xs text-slate-500">
+          Estimates are heuristics — review before confirm
+        </div>
       </div>
 
       <div className="text-sm text-slate-700 h-full">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 h-full items-start">
           <div>
             <div className="text-xs text-slate-500">Job delivery route</div>
-            <div className="font-medium text-slate-800">{jobDistanceKm > 0 ? `${jobDistanceKm.toFixed(0)} km` : '—'}</div>
+            <div className="font-medium text-slate-800">
+              {jobDistanceKm > 0 ? `${jobDistanceKm.toFixed(0)} km` : '—'}
+            </div>
           </div>
 
           <div>
             <div className="text-xs text-slate-500">Total distance</div>
-            <div className="font-medium text-slate-800">{totalDistanceKm > 0 ? `${totalDistanceKm.toFixed(0)} km` : '—'}</div>
+            <div className="font-medium text-slate-800">
+              {totalDistanceKm > 0 ? `${totalDistanceKm.toFixed(0)} km` : '—'}
+            </div>
           </div>
 
           <div>
             <div className="text-xs text-slate-500">Duration (est.)</div>
-            <div className="font-medium text-slate-800">{durationHours > 0 ? formatHoursToHM(durationHours) : '—'}</div>
+            <div className="font-medium text-slate-800">
+              {durationHours > 0 ? formatHoursToHM(durationHours) : '—'}
+            </div>
           </div>
 
           <div>
@@ -436,7 +494,9 @@ function RouteCalculatorBox({
           <div className="col-span-1 sm:col-span-2 mt-3 p-3 border border-slate-100 rounded bg-slate-50">
             <div className="flex items-center justify-between">
               <div className="text-xs text-slate-500">Reward</div>
-              <div className="font-semibold text-slate-800">{reward != null ? `$${Number(reward).toFixed(2)}` : '—'}</div>
+              <div className="font-semibold text-slate-800">
+                {reward != null ? `$${Number(reward).toFixed(2)}` : '—'}
+              </div>
             </div>
 
             <div className="flex items-center justify-between mt-2">
@@ -451,7 +511,9 @@ function RouteCalculatorBox({
 
             <div className="flex items-center justify-between mt-2">
               <div className="text-xs text-slate-500">Relocation</div>
-              <div className="font-medium text-slate-800">{relocationCost > 0 ? `$${relocationCost.toFixed(2)}` : '—'}</div>
+              <div className="font-medium text-slate-800">
+                {relocationCost > 0 ? `$${relocationCost.toFixed(2)}` : '—'}
+              </div>
             </div>
 
             <div className="flex items-center justify-between mt-3 border-t pt-3">
@@ -461,7 +523,13 @@ function RouteCalculatorBox({
 
             <div className="flex items-center justify-between mt-2">
               <div className="text-xs text-slate-500">Estimated profit</div>
-              <div className={`font-semibold ${profit != null && profit < 0 ? 'text-rose-600' : 'text-emerald-600'}`}>{profit != null ? `$${profit.toFixed(2)}` : '—'}</div>
+              <div
+                className={`font-semibold ${
+                  profit != null && profit < 0 ? 'text-rose-600' : 'text-emerald-600'
+                }`}
+              >
+                {profit != null ? `$${profit.toFixed(2)}` : '—'}
+              </div>
             </div>
           </div>
 
@@ -478,7 +546,9 @@ function RouteCalculatorBox({
                   </div>
 
                   <div className="text-sm">
-                    {pickupWeather?.temperature != null ? `${pickupWeather.temperature.toFixed(1)} °C` : '—'}
+                    {pickupWeather?.temperature != null
+                      ? `${pickupWeather.temperature.toFixed(1)} °C`
+                      : '—'}
                   </div>
                 </div>
               </div>
@@ -493,7 +563,9 @@ function RouteCalculatorBox({
                   </div>
 
                   <div className="text-sm">
-                    {deliveryWeather?.temperature != null ? `${deliveryWeather.temperature.toFixed(1)} °C` : '—'}
+                    {deliveryWeather?.temperature != null
+                      ? `${deliveryWeather.temperature.toFixed(1)} °C`
+                      : '—'}
                   </div>
                 </div>
               </div>
@@ -586,11 +658,19 @@ export default function AssignmentPanel({
   const truckCount = assignment.truck ? 1 : 0
   const trailerCount = assignment.trailer ? 1 : 0
   const driverCount = assignment.drivers.length
-  const cargoWeight = Number(assignment.cargo?.job_offer?.weight_kg ?? assignment.cargo?.weight_kg ?? 0) || 0
+  const cargoWeight =
+    Number(assignment.cargo?.job_offer?.weight_kg ?? assignment.cargo?.weight_kg ?? 0) || 0
   const cargoCount = cargoWeight > 0 ? 1 : 0
 
-  const truckPayload = Number(assignment.truck?.model?.max_payload ?? assignment.truck?.model?.max_load_kg ?? 0) || 0
-  const trailerPayload = Number(assignment.trailer?.payloadKg ?? assignment.trailer?.payload ?? assignment.trailer?.model?.max_payload ?? 0) || 0
+  const truckPayload =
+    Number(assignment.truck?.model?.max_payload ?? assignment.truck?.model?.max_load_kg ?? 0) || 0
+  const trailerPayload =
+    Number(
+      assignment.trailer?.payloadKg ??
+        assignment.trailer?.payload ??
+        assignment.trailer?.model?.max_payload ??
+        0
+    ) || 0
 
   const capacity = trailerPayload || truckPayload || 0
   const capacityDisplay = capacity > 0 ? String(capacity) : '—'
@@ -598,16 +678,14 @@ export default function AssignmentPanel({
   const hasCargo = !!assignment.cargo
   const hasTruck = !!assignment.truck
   const jobProvidesTrailer =
-    assignment.cargo && (assignment.cargo.job_offer?.transport_mode === 'trailer_cargo' || assignment.cargo.transport_mode === 'trailer_cargo')
+    assignment.cargo &&
+    (assignment.cargo.job_offer?.transport_mode === 'trailer_cargo' ||
+      assignment.cargo.transport_mode === 'trailer_cargo')
   const hasTrailer = !!assignment.trailer
 
   const truckClass = String(assignment.truck?.model?.class ?? '').toLowerCase()
 
-  const trailerEnabled =
-    hasCargo &&
-    hasTruck &&
-    truckClass === 'big' &&
-    !jobProvidesTrailer
+  const trailerEnabled = hasCargo && hasTruck && truckClass === 'big' && !jobProvidesTrailer
   const truckEnabled = hasCargo
   const driversEnabled = true // drivers slot is always enabled (prevents ReferenceError)
 
@@ -623,8 +701,6 @@ export default function AssignmentPanel({
     }
   }, [assignment.truck])
 
-
-
   /**
    * Load idle configurations (recent completed assignments) for reuse.
    *
@@ -632,7 +708,7 @@ export default function AssignmentPanel({
    */
   useEffect(() => {
     async function loadIdleConfigs() {
-      if (!((user as any)?.company_id)) return
+      if (!(user as any)?.company_id) return
 
       try {
         const { data } = await supabase
@@ -685,7 +761,9 @@ export default function AssignmentPanel({
       truck: cfg.user_truck
         ? {
             id: cfg.user_truck.id,
-            label: cfg.user_truck.master_truck_id?.name ?? `Truck ${String(cfg.user_truck.id).substring(0, 8)}`,
+            label:
+              cfg.user_truck.master_truck_id?.name ??
+              `Truck ${String(cfg.user_truck.id).substring(0, 8)}`,
             model: { name: cfg.user_truck.master_truck_id?.name ?? null },
             _raw: cfg.user_truck,
           }
@@ -693,13 +771,12 @@ export default function AssignmentPanel({
       trailer: cfg.user_trailer
         ? {
             id: cfg.user_trailer.id,
-            label: cfg.user_trailer.name ?? `Trailer ${String(cfg.user_trailer.id).substring(0, 8)}`,
+            label:
+              cfg.user_trailer.name ?? `Trailer ${String(cfg.user_trailer.id).substring(0, 8)}`,
             _raw: cfg.user_trailer,
           }
         : null,
-      drivers: cfg.hired_staff
-        ? [{ id: cfg.hired_staff.id, name: cfg.hired_staff.name }]
-        : [],
+      drivers: cfg.hired_staff ? [{ id: cfg.hired_staff.id, name: cfg.hired_staff.name }] : [],
     }))
   }
 
@@ -842,7 +919,11 @@ export default function AssignmentPanel({
     setDeliveryForecast(null)
 
     try {
-      const { data: preview, error: previewErr } = await supabase.from('assignment_previews').select('*').eq('id', id).single()
+      const { data: preview, error: previewErr } = await supabase
+        .from('assignment_previews')
+        .select('*')
+        .eq('id', id)
+        .single()
 
       if (previewErr) {
         setPreviewError(previewErr.message)
@@ -980,19 +1061,21 @@ export default function AssignmentPanel({
 
       // Try to find driver in props list first (most detailed)
       let driverObj: any =
-        (drivers ?? []).find((d: any) => String(d?.id ?? '') === String(driverId ?? '')) ??
-        null
+        (drivers ?? []).find((d: any) => String(d?.id ?? '') === String(driverId ?? '')) ?? null
 
       // If not present, try assignment.drivers list (may contain _raw)
       if (!driverObj) {
-        const localDrv = (assignment.drivers ?? []).find((d: any) => String(d?.id ?? '') === String(driverId ?? ''))
+        const localDrv = (assignment.drivers ?? []).find(
+          (d: any) => String(d?.id ?? '') === String(driverId ?? '')
+        )
         if (localDrv) {
           driverObj = localDrv._raw ?? localDrv
         }
       }
 
       // At this point driverObj may still lack a city id. Best-effort DB fetch:
-      let driverCityId: string | null = driverObj?.current_location_id ?? driverObj?.location_city_id ?? null
+      let driverCityId: string | null =
+        driverObj?.current_location_id ?? driverObj?.location_city_id ?? null
 
       if (!driverCityId) {
         try {
@@ -1023,7 +1106,9 @@ export default function AssignmentPanel({
         setPreviewError((prev) => (prev ? prev + ' | Driver update failed' : 'Driver update failed'))
       } else {
         // keep local previewData in sync when possible
-        setPreviewData((pd) => (pd ? { ...pd, driver_id: driverId, driver_city_id: driverCityId ?? null } : pd))
+        setPreviewData((pd) =>
+          pd ? { ...pd, driver_id: driverId, driver_city_id: driverCityId ?? null } : pd
+        )
       }
     } catch (err) {
       console.debug('[AssignmentPanel] updatePreviewDriverInDB exception', err)
@@ -1057,7 +1142,9 @@ export default function AssignmentPanel({
    */
   async function handleConfirmFinalize() {
     if (!ASSIGNMENT_FINALIZE_ENABLED) {
-      setPreviewError('Job acceptance is temporarily disabled while the assignment flow is under review.')
+      setPreviewError(
+        'Job acceptance is temporarily disabled while the assignment flow is under review.'
+      )
       return
     }
 
@@ -1075,10 +1162,7 @@ export default function AssignmentPanel({
     const userCompanyId = (user as any)?.company_id ?? null
 
     const carrierCompanyId =
-      userCompanyId ??
-      previewData?.carrier_company_id ??
-      assignment.truck?._raw?.owner_company_id ??
-      null
+      userCompanyId ?? previewData?.carrier_company_id ?? assignment.truck?._raw?.owner_company_id ?? null
 
     const userTruckId = assignment.truck?.id ?? null
     const trailerId = assignment.trailer?.id ?? null
@@ -1101,7 +1185,11 @@ export default function AssignmentPanel({
       previewData?.dist_pickup_to_delivery ??
       null
 
-    const companyId = userCompanyId ?? previewData?.carrier_company_id ?? assignment.truck?._raw?.owner_company_id ?? null
+    const companyId =
+      userCompanyId ??
+      previewData?.carrier_company_id ??
+      assignment.truck?._raw?.owner_company_id ??
+      null
 
     // Debug log before finalization (Step 2)
     // eslint-disable-next-line no-console
@@ -1180,7 +1268,9 @@ export default function AssignmentPanel({
     <div className="mt-6">
       <h2 className="text-lg font-semibold mb-3">Quick assembler</h2>
 
-      <p className="text-sm text-slate-500 mb-4">Drag items (rows) from lists/tables onto the slots below to compose an assignment.</p>
+      <p className="text-sm text-slate-500 mb-4">
+        Drag items (rows) from lists/tables onto the slots below to compose an assignment.
+      </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <DroppableSlot
@@ -1199,7 +1289,10 @@ export default function AssignmentPanel({
             if (it.type && it.type !== 'cargo') return
             const normalizedCargo = {
               id: it.id,
-              label: it.label ?? it.job_offer?.cargo_items?.name ?? `Cargo ${String(it.id).substring(0, 8)}`,
+              label:
+                it.label ??
+                it.job_offer?.cargo_items?.name ??
+                `Cargo ${String(it.id).substring(0, 8)}`,
               job_offer: it.job_offer ?? it._raw?.job_offer ?? null,
               _raw: it._raw ?? null,
             }
@@ -1258,16 +1351,35 @@ export default function AssignmentPanel({
             const raw = it._raw ?? {}
             const normalized = {
               id: it.id ?? raw.id ?? null,
-              label: it.label ?? it.name ?? raw.label ?? `Trailer ${String(it.id ?? raw.id ?? '').substring(0, 8)}`,
+              label:
+                it.label ??
+                it.name ??
+                raw.label ??
+                `Trailer ${String(it.id ?? raw.id ?? '').substring(0, 8)}`,
               model: it.model ?? raw.trailer_models ?? null,
               _raw: {
                 ...raw,
-                location_city_name: raw.location_city_name ?? it.location_city ?? it.locationCityName ?? it.location ?? null,
-                cargo_type_names: raw.cargo_type_names ?? it.cargo_type_names ?? it.cargoTypeName ?? null,
+                location_city_name:
+                  raw.location_city_name ??
+                  it.location_city ??
+                  it.locationCityName ??
+                  it.location ??
+                  null,
+                cargo_type_names:
+                  raw.cargo_type_names ?? it.cargo_type_names ?? it.cargoTypeName ?? null,
               },
-              payloadKg: Number(it.payloadKg ?? it.payload ?? raw.payload_kg ?? raw.max_payload ?? 0) || 0,
-              location: raw.location_city_name ?? it.location_city ?? it.locationCityName ?? it.location ?? null,
-              cargo_type_names: Array.isArray(raw.cargo_type_names) ? raw.cargo_type_names : raw.cargo_type_names ?? it.cargo_type_names ?? it.cargoTypeName ?? null,
+              payloadKg: Number(
+                it.payloadKg ?? it.payload ?? raw.payload_kg ?? raw.max_payload ?? 0
+              ) || 0,
+              location:
+                raw.location_city_name ??
+                it.location_city ??
+                it.locationCityName ??
+                it.location ??
+                null,
+              cargo_type_names: Array.isArray(raw.cargo_type_names)
+                ? raw.cargo_type_names
+                : raw.cargo_type_names ?? it.cargo_type_names ?? it.cargoTypeName ?? null,
               status: it.status ?? raw.status ?? 'available',
             }
             updateAssignment((a) => ({ ...a, trailer: normalized }))
@@ -1292,7 +1404,10 @@ export default function AssignmentPanel({
               if (a.drivers.length >= 2) return a
               const drv: HiredDriverRow = {
                 id: it.id ?? String(Date.now()),
-                name: it.label ?? it.name ?? `${it.first_name ?? ''} ${it.last_name ?? ''}`.trim(),
+                name:
+                  it.label ??
+                  it.name ??
+                  `${it.first_name ?? ''} ${it.last_name ?? ''}`.trim(),
                 first_name: it.first_name ?? null,
                 last_name: it.last_name ?? null,
                 _raw: it._raw ?? it,
@@ -1316,13 +1431,26 @@ export default function AssignmentPanel({
             <div className="mt-3 sm:mt-0 sm:ml-4 flex items-center gap-3">
               <div className="bg-white border border-slate-100 px-3 py-2 rounded text-sm text-slate-800">
                 <span className="font-normal">Current job payload:</span>{' '}
-                <span className="text-orange-600 font-semibold">{`${cargoWeight.toFixed(2)} / ${capacityDisplay} kg`}</span>
+                <span className="text-orange-600 font-semibold">{`${cargoWeight.toFixed(
+                  2
+                )} / ${capacityDisplay} kg`}</span>
               </div>
 
-              <div className={`bg-white border ${0 > 0 ? 'border-orange-100' : 'border-emerald-100'} px-3 py-2 rounded text-sm text-slate-700`}>
+              <div
+                className={`bg-white border ${
+                  0 > 0 ? 'border-orange-100' : 'border-emerald-100'
+                } px-3 py-2 rounded text-sm text-slate-700`}
+              >
                 <span className="text-slate-600">Remaining after assignment:</span>{' '}
-                <span className={`font-semibold ${0 > 0 ? 'text-orange-600' : 'text-emerald-600'}`}>
-                  {jobProvidesTrailer ? '0.00' : Math.max(0, Math.round((cargoWeight - capacity) * 100) / 100).toFixed(2)} kg
+                <span
+                  className={`font-semibold ${
+                    0 > 0 ? 'text-orange-600' : 'text-emerald-600'
+                  }`}
+                >
+                  {jobProvidesTrailer
+                    ? '0.00'
+                    : Math.max(0, Math.round((cargoWeight - capacity) * 100) / 100).toFixed(2)}{' '}
+                  kg
                 </span>
               </div>
             </div>
@@ -1339,9 +1467,15 @@ export default function AssignmentPanel({
 
             <button
               type="button"
-              onClick={() => handleConfirmAssignmentClick()}
+              onClick={() => {
+                handleConfirmAssignmentClick()
+              }}
               disabled={!canConfirm || creatingPreview}
-              className={`px-4 py-2 rounded font-medium transition ${canConfirm ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'}`}
+              className={`px-4 py-2 rounded font-medium transition ${
+                canConfirm
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                  : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
+              }`}
               aria-disabled={!canConfirm}
             >
               {creatingPreview ? 'Creating preview…' : 'Confirm Assignment'}
@@ -1395,7 +1529,9 @@ export default function AssignmentPanel({
                   : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
               }`}
             >
-              {ASSIGNMENT_FINALIZE_ENABLED ? 'Confirm Assignment' : 'Assignment confirm disabled'}
+              {ASSIGNMENT_FINALIZE_ENABLED
+                ? 'Confirm Assignment'
+                : 'Assignment confirm disabled'}
             </button>
           </div>
         }
@@ -1404,9 +1540,14 @@ export default function AssignmentPanel({
           <div className="text-sm text-slate-700 space-y-1">
             <div>Please review the assignment before confirming.</div>
             {!ASSIGNMENT_FINALIZE_ENABLED && (
-              <div className="text-xs text-amber-700">Final assignment acceptance is temporarily disabled while this flow is under review.</div>
+              <div className="text-xs text-amber-700">
+                Final assignment acceptance is temporarily disabled while this flow is under
+                review.
+              </div>
             )}
-            <div className="text-xs text-amber-600">Server preview is used when available. Client-side heuristics are used as fallback.</div>
+            <div className="text-xs text-amber-600">
+              Server preview is used when available. Client-side heuristics are used as fallback.
+            </div>
           </div>
 
           <div className="bg-slate-50 border border-slate-100 rounded p-3">
