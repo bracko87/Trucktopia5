@@ -12,6 +12,13 @@
  *
  * Note: driving_sessions is treated as REQUIRED for active movement lifecycle.
  * If driving_sessions insert is blocked (including RLS), finalization now throws.
+ *
+ * Lifecycle / locking note:
+ * - Partial lifecycle enforcement is already implemented:
+ *   1) truck uniqueness during active assignment is handled via
+ *      ux_job_offer_truck_active_assignment conflict recovery/reuse paths
+ *   2) selected drivers are marked as assigned on finalize
+ *      (hired_staff.activity_id = 'assigned')
  */
 
 import { supabase } from '../lib/supabase'
@@ -43,6 +50,8 @@ export interface FinalizeAssignmentOpts {
  * Steps:
  * 1) Find an existing assignment for the job_offer that is in an active/assignable state.
  * 2) If found, update the assignment with truck/user and move it to an active status.
+ *    - Includes conflict recovery for ux_job_offer_truck_active_assignment to preserve
+ *      active-truck uniqueness semantics.
  * 2b) For multi-run load cargo jobs, create/update a follow-up assigned row with remaining payload.
  * 2c) Keep job_offers.remaining_payload in sync with the computed remainder.
  * 3) Insert a driving_sessions row (phase = 'TO_PICKUP') linked to the updated assignment
@@ -275,6 +284,11 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     .select()
     .single()
 
+  /**
+   * Partial lifecycle/locking enforcement:
+   * If the target row update hits ux_job_offer_truck_active_assignment, try to reuse
+   * the conflicting active row already bound to the selected truck for this job lifecycle.
+   */
   if (
     updateErr?.code == '23505' &&
     String(updateErr?.message ?? '').includes('ux_job_offer_truck_active_assignment') &&
@@ -604,6 +618,8 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   }
 
   // Step 6 — Update only selected hired_staff rows (mark selected drivers as 'assigned').
+  // This is the current driver lifecycle/locking enforcement on finalize: only the chosen
+  // drivers are transitioned to assigned, avoiding any mass update of company staff.
   try {
     // Extract driver ids from the passed assignment object (UI-provided).
     const driverIds: string[] =

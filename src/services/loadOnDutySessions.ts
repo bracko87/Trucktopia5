@@ -11,6 +11,26 @@
 import { supabase } from '../lib/supabase'
 
 /**
+ * buildDisplayName
+ *
+ * Shared display-name normalizer for hydrated related entities.
+ * Prefers human-readable values and avoids leaking raw IDs into UI labels.
+ */
+function buildDisplayName(row: any): string | null {
+  if (!row) return null
+  if (typeof row.name === 'string' && row.name.trim()) return row.name.trim()
+
+  const first = typeof row.first_name === 'string' ? row.first_name.trim() : ''
+  const last = typeof row.last_name === 'string' ? row.last_name.trim() : ''
+  const full = [first, last].filter(Boolean).join(' ').trim()
+  if (full) return full
+
+  if (typeof row.registration === 'string' && row.registration.trim()) return row.registration.trim()
+  if (typeof row.email === 'string' && row.email.trim()) return row.email.trim()
+  return null
+}
+
+/**
  * loadActiveAssignmentsFallback
  *
  * Fallback loader for environments where driving_sessions INSERT/SELECT is blocked by RLS,
@@ -315,24 +335,46 @@ export async function loadOnDutySessions(companyId?: string | null) {
       try {
         const ids = Array.from(truckIds)
         console.debug('loadOnDutySessions: fetching user_trucks for ids', ids)
-        const { data: trucks, error: truckErr } = await supabase
-          .from('user_trucks')
-          .select('id,registration,owner_company_id,master_truck:master_truck_id(name)')
-          .in('id', ids)
 
-        if (truckErr) {
-          console.warn('loadOnDutySessions: trucks load returned error', truckErr)
-        } else if (Array.isArray(trucks)) {
-          trucks.forEach((t: any) => {
-            if (t?.id) {
-              const normalized = {
-                ...t,
-                name: (t.master_truck && t.master_truck.name) || t.registration || null,
-              }
-              truckMap[String(t.id)] = normalized
+        const truckSelectVariants = [
+          'id,registration,owner_company_id,master_truck:master_truck_id(name)',
+          'id,name,registration,owner_company_id',
+          'id,registration,owner_company_id',
+        ]
+
+        for (const selectClause of truckSelectVariants) {
+          const { data: trucks, error: truckErr } = await supabase
+            .from('user_trucks')
+            .select(selectClause)
+            .in('id', ids)
+
+          if (truckErr) {
+            const code = String(truckErr?.code ?? '')
+            if (code === '42703') {
+              console.debug(
+                'loadOnDutySessions: retry user_trucks select with fallback columns',
+                selectClause
+              )
+              continue
             }
-          })
-          console.debug(`loadOnDutySessions: trucks loaded = ${Object.keys(truckMap).length}`)
+            console.warn('loadOnDutySessions: trucks load returned error', truckErr)
+            break
+          }
+
+          if (Array.isArray(trucks)) {
+            trucks.forEach((t: any) => {
+              if (t?.id) {
+                const normalized = {
+                  ...t,
+                  name: t?.master_truck?.name ?? buildDisplayName(t),
+                  display_name: t?.master_truck?.name ?? buildDisplayName(t),
+                }
+                truckMap[String(t.id)] = normalized
+              }
+            })
+            console.debug(`loadOnDutySessions: trucks loaded = ${Object.keys(truckMap).length}`)
+          }
+          break
         }
       } catch (e) {
         console.warn('loadOnDutySessions: trucks load failed', e)
@@ -353,7 +395,14 @@ export async function loadOnDutySessions(companyId?: string | null) {
           console.warn('loadOnDutySessions: trailers load returned error', trailerErr)
         } else if (Array.isArray(trailers)) {
           trailers.forEach((tr: any) => {
-            if (tr?.id) trailerMap[String(tr.id)] = tr
+            if (tr?.id) {
+              const readableName = buildDisplayName(tr)
+              trailerMap[String(tr.id)] = {
+                ...tr,
+                name: readableName ?? tr?.name ?? null,
+                display_name: readableName,
+              }
+            }
           })
           console.debug(`loadOnDutySessions: trailers loaded = ${Object.keys(trailerMap).length}`)
         }
@@ -365,20 +414,102 @@ export async function loadOnDutySessions(companyId?: string | null) {
     // Drivers: try hired_staff first (game model), then fallback to users table
     if (userIds.size > 0) {
       const ids = Array.from(userIds)
+
       try {
         console.debug('loadOnDutySessions: fetching hired_staff for ids', ids)
-        const { data: hs, error: hsErr } = await supabase
-          .from('hired_staff')
-          .select('id,first_name,last_name,name')
-          .in('id', ids)
 
-        if (hsErr) {
-          console.warn('loadOnDutySessions: hired_staff load returned error', hsErr)
-        } else if (Array.isArray(hs)) {
-          hs.forEach((h: any) => {
-            if (h?.id) driverMap[String(h.id)] = h
-          })
-          console.debug(`loadOnDutySessions: hired_staff loaded = ${Object.keys(driverMap).length}`)
+        const hiredStaffSelectVariants = [
+          'id,user_id,first_name,last_name,name',
+          'id,first_name,last_name,name',
+          'id,user_id,name',
+        ]
+
+        let hiredStaffLoaded = false
+
+        // Preferred path: resolve by both hired_staff.id and hired_staff.user_id
+        for (const selectClause of hiredStaffSelectVariants) {
+          const { data: hs, error: hsErr } = await supabase
+            .from('hired_staff')
+            .select(selectClause)
+            .or(`id.in.(${ids.join(',')}),user_id.in.(${ids.join(',')})`)
+
+          if (hsErr) {
+            const code = String(hsErr?.code ?? '')
+            if (code === '42703') {
+              console.debug(
+                'loadOnDutySessions: retry hired_staff select with fallback columns',
+                selectClause
+              )
+              continue
+            }
+            console.warn('loadOnDutySessions: hired_staff load returned error', hsErr)
+            break
+          }
+
+          if (Array.isArray(hs)) {
+            hs.forEach((h: any) => {
+              const normalized = {
+                ...h,
+                name: buildDisplayName(h),
+                display_name: buildDisplayName(h),
+              }
+
+              if (h?.id) driverMap[String(h.id)] = normalized
+              if (h?.user_id) driverMap[String(h.user_id)] = normalized
+            })
+            console.debug(`loadOnDutySessions: hired_staff loaded = ${Object.keys(driverMap).length}`)
+          }
+
+          hiredStaffLoaded = true
+          break
+        }
+
+        // Fallback path for schemas without hired_staff.user_id:
+        // query by hired_staff.id only so we still hydrate names where possible.
+        if (!hiredStaffLoaded) {
+          console.debug(
+            'loadOnDutySessions: hired_staff dual-key lookup unavailable; retrying by hired_staff.id only'
+          )
+
+          const idOnlySelectVariants = [
+            'id,first_name,last_name,name',
+            'id,name',
+          ]
+
+          for (const selectClause of idOnlySelectVariants) {
+            const { data: hs, error: hsErr } = await supabase
+              .from('hired_staff')
+              .select(selectClause)
+              .in('id', ids)
+
+            if (hsErr) {
+              const code = String(hsErr?.code ?? '')
+              if (code === '42703') {
+                console.debug(
+                  'loadOnDutySessions: retry hired_staff id-only select with fallback columns',
+                  selectClause
+                )
+                continue
+              }
+              console.warn('loadOnDutySessions: hired_staff id-only load returned error', hsErr)
+              break
+            }
+
+            if (Array.isArray(hs)) {
+              hs.forEach((h: any) => {
+                const normalized = {
+                  ...h,
+                  name: buildDisplayName(h),
+                  display_name: buildDisplayName(h),
+                }
+                if (h?.id) driverMap[String(h.id)] = normalized
+              })
+              console.debug(
+                `loadOnDutySessions: hired_staff id-only loaded = ${Object.keys(driverMap).length}`
+              )
+            }
+            break
+          }
         }
       } catch (e) {
         console.warn('loadOnDutySessions: hired_staff load failed', e)
@@ -398,7 +529,12 @@ export async function loadOnDutySessions(companyId?: string | null) {
           } else if (Array.isArray(users)) {
             users.forEach((u: any) => {
               if (u?.id && !driverMap[String(u.id)]) {
-                driverMap[String(u.id)] = u
+                const readableName = buildDisplayName(u)
+                driverMap[String(u.id)] = {
+                  ...u,
+                  name: readableName ?? u?.name ?? null,
+                  display_name: readableName,
+                }
               }
             })
             console.debug(
@@ -451,10 +587,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
           } else if (mode === 'trailer_cargo') {
             resolvedReward = jobOffer.reward_trailer_cargo ?? null
           } else {
-            if (
-              jobOffer.reward_load_cargo !== undefined &&
-              jobOffer.reward_load_cargo !== null
-            ) {
+            if (jobOffer.reward_load_cargo !== undefined && jobOffer.reward_load_cargo !== null) {
               resolvedReward = jobOffer.reward_load_cargo
             } else if (
               jobOffer.reward_trailer_cargo !== undefined &&
@@ -470,9 +603,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
         }
 
         // Prefer truck from assignment; fall back to truck referenced directly on driving_sessions
-        const truckFromAssignmentId = assignment.user_truck_id
-          ? String(assignment.user_truck_id)
-          : null
+        const truckFromAssignmentId = assignment.user_truck_id ? String(assignment.user_truck_id) : null
         const truckFromSessionId = s.user_truck_id ? String(s.user_truck_id) : null
 
         const truck =

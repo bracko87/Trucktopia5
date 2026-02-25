@@ -3,8 +3,13 @@
  *
  * Page showing an interactive live map with positions of all user trucks.
  *
- * Note: This version uses real backend data (Supabase) and renders a no-cost
- * OpenStreetMap tile background with SVG overlays for hubs, routes, and trucks.
+ * This version uses:
+ * - Supabase for real data
+ * - React-Leaflet (Leaflet) for a real interactive map (zoom/pan)
+ * - OpenStreetMap tiles as a free/open basemap
+ *
+ * NOTE:
+ * react-leaflet is loaded dynamically (client-only) to avoid SSR/top-level import issues.
  */
 
 import React from 'react'
@@ -43,27 +48,13 @@ type FleetMapData = {
   companyId: string | null
 }
 
-type WorldPoint = {
-  x: number
-  y: number
-}
+type ReactLeafletModule = typeof import('react-leaflet')
 
-type WorldBounds = {
-  minX: number
-  minY: number
-  maxX: number
-  maxY: number
-}
+type LatLngTuple = [number, number]
+type LatLngBoundsTuple = [LatLngTuple, LatLngTuple]
 
-type TileDescriptor = {
-  x: number
-  y: number
-  z: number
-}
-
-const MAP_ZOOM = 6
 const MAP_POLL_MS = 30000
-const TILE_SIZE = 256
+const DEFAULT_INITIAL_ZOOM = 6
 
 const ACTIVE_ASSIGNMENT_STATUSES = [
   'assigned',
@@ -86,91 +77,260 @@ function interpolatePoint(from: LatLon, to: LatLon, progress: number): LatLon {
   }
 }
 
-/**
- * Convert latitude/longitude to world pixel coordinates for Web Mercator.
- * Coordinates are scaled for the selected zoom level.
- */
-function latLonToWorld(point: LatLon): WorldPoint {
-  const scale = TILE_SIZE * 2 ** MAP_ZOOM
-  const lat = clamp(point.lat, -85.05112878, 85.05112878)
-  const x = ((point.lon + 180) / 360) * scale
-  const sinLat = Math.sin((lat * Math.PI) / 180)
-  const y =
-    (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * scale
-  return { x, y }
-}
+function computeLatLonBounds(data: FleetMapData): LatLngBoundsTuple {
+  const points: LatLon[] = []
 
-function worldToPercent(point: WorldPoint, bounds: WorldBounds) {
-  const width = Math.max(bounds.maxX - bounds.minX, 1)
-  const height = Math.max(bounds.maxY - bounds.minY, 1)
-  return {
-    left: ((point.x - bounds.minX) / width) * 100,
-    top: ((point.y - bounds.minY) / height) * 100,
-  }
-}
-
-function tileGridForBounds(bounds: WorldBounds): TileDescriptor[] {
-  const minTileX = Math.floor(bounds.minX / TILE_SIZE)
-  const maxTileX = Math.floor(bounds.maxX / TILE_SIZE)
-  const minTileY = Math.floor(bounds.minY / TILE_SIZE)
-  const maxTileY = Math.floor(bounds.maxY / TILE_SIZE)
-  const maxTile = 2 ** MAP_ZOOM
-
-  const tiles: TileDescriptor[] = []
-  for (let x = minTileX; x <= maxTileX; x += 1) {
-    for (let y = minTileY; y <= maxTileY; y += 1) {
-      if (y < 0 || y >= maxTile) continue
-      const wrappedX = ((x % maxTile) + maxTile) % maxTile
-      tiles.push({ x: wrappedX, y, z: MAP_ZOOM })
-    }
-  }
-  return tiles
-}
-
-function computeBoundsFromData(data: FleetMapData): WorldBounds {
-  const pts: WorldPoint[] = []
-
-  for (const h of data.hubs) pts.push(latLonToWorld(h.point))
+  for (const h of data.hubs) points.push(h.point)
   for (const r of data.routes) {
-    pts.push(latLonToWorld(r.from))
-    pts.push(latLonToWorld(r.to))
-    pts.push(latLonToWorld(interpolatePoint(r.from, r.to, r.progress)))
+    points.push(r.from, r.to, interpolatePoint(r.from, r.to, r.progress))
   }
 
-  if (pts.length === 0) {
+  if (points.length === 0) {
     // Fallback around central Europe
-    const fallback = [
+    points.push(
       { lat: 52.52, lon: 13.405 }, // Berlin
       { lat: 48.2082, lon: 16.3738 }, // Vienna
-      { lat: 50.0755, lon: 14.4378 }, // Prague
-    ].map(latLonToWorld)
-
-    pts.push(...fallback)
+      { lat: 50.0755, lon: 14.4378 } // Prague
+    )
   }
 
-  let minX = Infinity
-  let minY = Infinity
-  let maxX = -Infinity
-  let maxY = -Infinity
+  let minLat = Infinity
+  let maxLat = -Infinity
+  let minLon = Infinity
+  let maxLon = -Infinity
 
-  for (const p of pts) {
-    if (p.x < minX) minX = p.x
-    if (p.y < minY) minY = p.y
-    if (p.x > maxX) maxX = p.x
-    if (p.y > maxY) maxY = p.y
+  for (const p of points) {
+    const lat = clamp(Number(p.lat), -85.0511, 85.0511)
+    const lon = clamp(Number(p.lon), -180, 180)
+
+    if (lat < minLat) minLat = lat
+    if (lat > maxLat) maxLat = lat
+    if (lon < minLon) minLon = lon
+    if (lon > maxLon) maxLon = lon
   }
 
-  const width = Math.max(maxX - minX, 1)
-  const height = Math.max(maxY - minY, 1)
-  const padX = Math.max(width * 0.15, 80)
-  const padY = Math.max(height * 0.15, 80)
+  const latSpan = Math.max(maxLat - minLat, 0.01)
+  const lonSpan = Math.max(maxLon - minLon, 0.01)
 
-  return {
-    minX: minX - padX,
-    minY: minY - padY,
-    maxX: maxX + padX,
-    maxY: maxY + padY,
-  }
+  // Add padding so markers aren't at the edges.
+  const padLat = Math.max(latSpan * 0.18, 0.6)
+  const padLon = Math.max(lonSpan * 0.18, 0.9)
+
+  const south = clamp(minLat - padLat, -85.0511, 85.0511)
+  const north = clamp(maxLat + padLat, -85.0511, 85.0511)
+  const west = clamp(minLon - padLon, -180, 180)
+  const east = clamp(maxLon + padLon, -180, 180)
+
+  return [
+    [south, west],
+    [north, east],
+  ]
+}
+
+function boundsCenter(bounds: LatLngBoundsTuple): LatLngTuple {
+  const [[south, west], [north, east]] = bounds
+  return [(south + north) / 2, (west + east) / 2]
+}
+
+function FleetLeafletMap({
+  data,
+  loading,
+  error,
+}: {
+  data: FleetMapData
+  loading: boolean
+  error: string | null
+}) {
+  const bounds = React.useMemo(() => computeLatLonBounds(data), [data])
+  const center = React.useMemo(() => boundsCenter(bounds), [bounds])
+
+  const [rl, setRl] = React.useState<ReactLeafletModule | null>(null)
+  const [rlError, setRlError] = React.useState<string | null>(null)
+  const mapRef = React.useRef<any>(null)
+
+  // Load react-leaflet only on the client
+  React.useEffect(() => {
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const mod = await import('react-leaflet')
+        if (!cancelled) setRl(mod)
+      } catch (e: any) {
+        if (!cancelled) {
+          setRlError(e?.message ?? 'Failed to load map library')
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Fit bounds whenever data changes
+  React.useEffect(() => {
+    if (!rl || !mapRef.current) return
+
+    const t = window.setTimeout(() => {
+      try {
+        mapRef.current.invalidateSize?.()
+        mapRef.current.fitBounds(bounds, {
+          padding: [24, 24],
+          maxZoom: 11,
+        })
+      } catch {
+        // no-op
+      }
+    }, 0)
+
+    return () => window.clearTimeout(t)
+  }, [rl, bounds, data.routes.length, data.hubs.length])
+
+  return (
+    <div className="relative aspect-[16/9] w-full overflow-hidden rounded border border-black/10 bg-slate-100">
+      {!rl ? (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-black/60">
+          Loading map…
+        </div>
+      ) : (
+        (() => {
+          const RL: any = rl
+
+          return (
+            <RL.MapContainer
+              center={center}
+              zoom={DEFAULT_INITIAL_ZOOM}
+              zoomControl={false}
+              scrollWheelZoom
+              doubleClickZoom
+              dragging
+              attributionControl
+              className="h-full w-full"
+              style={{ height: '100%', width: '100%' }}
+              ref={(mapInstance: any) => {
+                if (mapInstance) mapRef.current = mapInstance
+              }}
+            >
+              <RL.ZoomControl position="topright" />
+
+              {/* Free / open basemap */}
+              <RL.TileLayer
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                attribution="&copy; OpenStreetMap contributors"
+                maxZoom={19}
+              />
+
+              {/* Route lines */}
+              {data.routes.map((route) => {
+                const positions: LatLngTuple[] = [
+                  [route.from.lat, route.from.lon],
+                  [route.to.lat, route.to.lon],
+                ]
+                const progressPct = Math.round(route.progress * 100)
+
+                return (
+                  <RL.Polyline
+                    key={`${route.assignmentId}-line`}
+                    positions={positions}
+                    pathOptions={{
+                      color: '#0284c7',
+                      weight: 2,
+                      dashArray: '6 6',
+                      opacity: 0.8,
+                    }}
+                  >
+                    <RL.Tooltip sticky>
+                      <div className="text-xs">
+                        <div className="font-semibold">{route.truckLabel}</div>
+                        <div>
+                          {route.fromCity} → {route.toCity}
+                        </div>
+                        <div>{route.cargo}</div>
+                        <div>Progress: {progressPct}%</div>
+                      </div>
+                    </RL.Tooltip>
+                  </RL.Polyline>
+                )
+              })}
+
+              {/* Hubs */}
+              {data.hubs.map((hub) => (
+                <RL.CircleMarker
+                  key={hub.id}
+                  center={[hub.point.lat, hub.point.lon]}
+                  radius={6}
+                  pathOptions={{
+                    color: '#166534',
+                    weight: 2,
+                    fillColor: '#22c55e',
+                    fillOpacity: 0.95,
+                  }}
+                >
+                  <RL.Tooltip direction="top" offset={[0, -2]}>
+                    <div className="text-xs">
+                      <div className="font-semibold">{hub.city}</div>
+                      {hub.country ? <div>{hub.country}</div> : null}
+                    </div>
+                  </RL.Tooltip>
+                </RL.CircleMarker>
+              ))}
+
+              {/* Trucks (interpolated along straight line route) */}
+              {data.routes.map((route) => {
+                const truckPoint = interpolatePoint(route.from, route.to, route.progress)
+                const progressPct = Math.round(route.progress * 100)
+
+                return (
+                  <RL.CircleMarker
+                    key={`${route.assignmentId}-truck`}
+                    center={[truckPoint.lat, truckPoint.lon]}
+                    radius={7}
+                    pathOptions={{
+                      color: '#ffffff',
+                      weight: 2,
+                      fillColor: '#f97316',
+                      fillOpacity: 1,
+                    }}
+                  >
+                    <RL.Tooltip direction="right" offset={[8, 0]}>
+                      <div className="text-xs">
+                        <div className="font-semibold">{route.truckLabel}</div>
+                        <div>
+                          {route.fromCity} → {route.toCity}
+                        </div>
+                        <div>{route.cargo}</div>
+                        <div>Progress: {progressPct}%</div>
+                      </div>
+                    </RL.Tooltip>
+                  </RL.CircleMarker>
+                )
+              })}
+            </RL.MapContainer>
+          )
+        })()
+      )}
+
+      {/* Errors / empty-state overlays */}
+      {rlError ? (
+        <div className="absolute left-2 top-2 z-[500] rounded border border-rose-200 bg-white/95 px-2 py-1 text-xs text-rose-700 shadow-sm">
+          Map library error: {rlError}
+        </div>
+      ) : null}
+
+      {error ? (
+        <div className="absolute left-2 top-2 z-[500] rounded border border-rose-200 bg-white/95 px-2 py-1 text-xs text-rose-700 shadow-sm">
+          {error}
+        </div>
+      ) : null}
+
+      {!loading && !error && data.routes.length === 0 ? (
+        <div className="absolute left-2 top-2 z-[500] rounded border border-black/10 bg-white/95 px-2 py-1 text-xs text-black/75 shadow-sm">
+          No active assignments with mappable coordinates.
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 async function resolveCompanyId(authUserId: string): Promise<string | null> {
@@ -308,8 +468,14 @@ async function loadFleetMapData(authUserId: string): Promise<FleetMapData> {
       const distanceCompleted =
         Number(session?.distance_completed_km ?? session?.segment_completed_km ?? 0) || 0
       const totalDistance =
-        Number(session?.total_distance_km ?? session?.segment_distance_km ?? offer?.distance_km ?? 0) || 0
-      const progress = totalDistance > 0 ? clamp(distanceCompleted / totalDistance, 0, 1) : 0
+        Number(
+          session?.total_distance_km ??
+            session?.segment_distance_km ??
+            offer?.distance_km ??
+            0
+        ) || 0
+      const progress =
+        totalDistance > 0 ? clamp(distanceCompleted / totalDistance, 0, 1) : 0
 
       const truckId = row?.user_truck_id ? String(row.user_truck_id) : null
       const cargo = String(
@@ -339,13 +505,17 @@ async function loadFleetMapData(authUserId: string): Promise<FleetMapData> {
 /**
  * MapPage
  *
- * Real-data fleet map using Supabase + free OpenStreetMap tiles.
+ * Real-data fleet map using Supabase + Leaflet + OpenStreetMap tiles.
  */
 export default function MapPage() {
   const { user } = useAuth()
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
-  const [data, setData] = React.useState<FleetMapData>({ hubs: [], routes: [], companyId: null })
+  const [data, setData] = React.useState<FleetMapData>({
+    hubs: [],
+    routes: [],
+    companyId: null,
+  })
   const [lastRefreshAt, setLastRefreshAt] = React.useState<Date | null>(null)
 
   const load = React.useCallback(async () => {
@@ -358,6 +528,7 @@ export default function MapPage() {
 
     setLoading(true)
     setError(null)
+
     try {
       const mapData = await loadFleetMapData(String(user.id))
       setData(mapData)
@@ -378,9 +549,6 @@ export default function MapPage() {
     return () => window.clearInterval(timer)
   }, [load])
 
-  const bounds = React.useMemo(() => computeBoundsFromData(data), [data])
-  const tiles = React.useMemo(() => tileGridForBounds(bounds), [bounds])
-
   return (
     <Layout>
       <div className="space-y-4">
@@ -390,7 +558,7 @@ export default function MapPage() {
         </header>
 
         <section className="grid gap-4 lg:grid-cols-[2fr_1fr]">
-          <div className="bg-white p-4 rounded shadow border border-black/10">
+          <div className="rounded border border-black/10 bg-white p-4 shadow">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="font-semibold">Live Route View</h2>
               <span className="text-xs text-black/60">
@@ -399,119 +567,15 @@ export default function MapPage() {
             </div>
 
             {loading && data.routes.length === 0 && data.hubs.length === 0 ? (
-              <div className="text-sm text-black/65">Loading map data…</div>
+              <div className="mb-2 text-sm text-black/65">Loading map data…</div>
             ) : null}
 
-            <div className="relative aspect-[16/9] w-full overflow-hidden rounded border border-black/10 bg-slate-200">
-              {/* OpenStreetMap tile background */}
-              <div className="absolute inset-0">
-                {tiles.map((tile) => {
-                  const tileMinX = tile.x * TILE_SIZE
-                  const tileMinY = tile.y * TILE_SIZE
-                  const tileMaxX = tileMinX + TILE_SIZE
-                  const tileMaxY = tileMinY + TILE_SIZE
-                  const topLeft = worldToPercent({ x: tileMinX, y: tileMinY }, bounds)
-                  const bottomRight = worldToPercent({ x: tileMaxX, y: tileMaxY }, bounds)
-
-                  return (
-                    <img
-                      key={`${tile.z}-${tile.x}-${tile.y}`}
-                      src={`https://tile.openstreetmap.org/${tile.z}/${tile.x}/${tile.y}.png`}
-                      alt=""
-                      aria-hidden="true"
-                      className="absolute select-none pointer-events-none"
-                      style={{
-                        left: `${topLeft.left}%`,
-                        top: `${topLeft.top}%`,
-                        width: `${bottomRight.left - topLeft.left}%`,
-                        height: `${bottomRight.top - topLeft.top}%`,
-                      }}
-                    />
-                  )
-                })}
-              </div>
-
-              {/* Overlay */}
-              <svg viewBox="0 0 100 100" className="relative h-full w-full">
-                <rect x="0" y="0" width="100" height="100" fill="rgba(15,23,42,0.06)" />
-
-                {data.routes.map((route) => {
-                  const a = worldToPercent(latLonToWorld(route.from), bounds)
-                  const b = worldToPercent(latLonToWorld(route.to), bounds)
-
-                  return (
-                    <line
-                      key={`${route.assignmentId}-line`}
-                      x1={a.left}
-                      y1={a.top}
-                      x2={b.left}
-                      y2={b.top}
-                      stroke="#0369a1"
-                      strokeWidth="0.45"
-                      strokeDasharray="1.8 1"
-                    />
-                  )
-                })}
-
-                {data.hubs.map((hub) => {
-                  const p = worldToPercent(latLonToWorld(hub.point), bounds)
-                  return (
-                    <g key={hub.id}>
-                      <circle cx={p.left} cy={p.top} r="0.9" fill="#16a34a" />
-                      <text
-                        x={p.left + 1.1}
-                        y={p.top - 0.9}
-                        fill="#0f172a"
-                        fontSize="2.6"
-                        fontWeight="600"
-                      >
-                        {hub.city}
-                      </text>
-                    </g>
-                  )
-                })}
-
-                {data.routes.map((route) => {
-                  const truckPoint = interpolatePoint(route.from, route.to, route.progress)
-                  const p = worldToPercent(latLonToWorld(truckPoint), bounds)
-                  return (
-                    <g key={`${route.assignmentId}-truck`}>
-                      <circle cx={p.left} cy={p.top} r="1" fill="#ea580c" />
-                      <text
-                        x={p.left + 1.2}
-                        y={p.top + 0.9}
-                        fill="#7c2d12"
-                        fontSize="2.3"
-                        fontWeight="700"
-                      >
-                        {route.truckLabel}
-                      </text>
-                    </g>
-                  )
-                })}
-              </svg>
-
-              {error ? (
-                <div className="absolute left-2 top-2 text-xs text-rose-700 bg-white/90 border border-rose-200 px-2 py-1 rounded">
-                  {error}
-                </div>
-              ) : null}
-
-              {!loading && !error && data.routes.length === 0 ? (
-                <div className="absolute left-2 top-2 text-xs text-black/75 bg-white/90 border border-black/10 px-2 py-1 rounded">
-                  No active assignments with mappable coordinates.
-                </div>
-              ) : null}
-
-              <div className="absolute right-2 bottom-1 text-[10px] text-black/70 bg-white/80 px-1.5 py-0.5 rounded">
-                © OpenStreetMap contributors
-              </div>
-            </div>
+            <FleetLeafletMap data={data} loading={loading} error={error} />
           </div>
 
           <aside className="space-y-4">
-            <div className="bg-white p-4 rounded shadow border border-black/10">
-              <h2 className="font-semibold mb-2">Active Trucks</h2>
+            <div className="rounded border border-black/10 bg-white p-4 shadow">
+              <h2 className="mb-2 font-semibold">Active Trucks</h2>
 
               {loading ? <div className="text-sm text-black/65">Loading map data…</div> : null}
               {error ? <div className="text-sm text-rose-600">{error}</div> : null}
@@ -542,9 +606,9 @@ export default function MapPage() {
               </ul>
             </div>
 
-            <div className="bg-white p-4 rounded shadow border border-black/10 text-sm">
-              <h2 className="font-semibold mb-2">Data source</h2>
-              <ul className="list-disc pl-5 space-y-1 text-black/75">
+            <div className="rounded border border-black/10 bg-white p-4 text-sm shadow">
+              <h2 className="mb-2 font-semibold">Data source</h2>
+              <ul className="list-disc space-y-1 pl-5 text-black/75">
                 <li>
                   Routes: <code>job_assignments</code> + <code>driving_sessions</code>.
                 </li>
@@ -558,10 +622,10 @@ export default function MapPage() {
               </ul>
             </div>
 
-            <div className="bg-white p-4 rounded shadow border border-black/10 text-sm">
-              <h2 className="font-semibold mb-2">How to make this fully real (free stack)</h2>
-              <ol className="list-decimal pl-5 space-y-1 text-black/75">
-                <li>Keep using OpenStreetMap tiles with this overlay approach (or Leaflet/MapLibre).</li>
+            <div className="rounded border border-black/10 bg-white p-4 text-sm shadow">
+              <h2 className="mb-2 font-semibold">How to make this fully real (free stack)</h2>
+              <ol className="list-decimal space-y-1 pl-5 text-black/75">
+                <li>Keep using OpenStreetMap tiles + Leaflet (what this page now uses).</li>
                 <li>Store GPS points in Supabase and poll/realtime-subscribe for updates.</li>
                 <li>Record driving progress in <code>driving_sessions</code> more frequently.</li>
                 <li>Replace straight lines with route polylines from a routing engine later.</li>

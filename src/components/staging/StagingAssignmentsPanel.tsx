@@ -7,6 +7,15 @@
  *
  * Notes:
  * - This file implements phase-aware ETA/pickup display logic.
+ * - Updated Active details to never show raw ID fragments for Truck/Trailer/Driver;
+ *   only readable names/registrations are shown (or — if unavailable).
+ *
+ * Lifecycle / locking note (related finalize flow, for reference):
+ * - Partial lifecycle enforcement is already in place in assignment finalization:
+ *   - truck uniqueness during active assignment is enforced via
+ *     ux_job_offer_truck_active_assignment conflict handling/reuse paths
+ *   - selected drivers are marked as assigned on finalize
+ *     (hired_staff.activity_id = 'assigned')
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
@@ -576,35 +585,28 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                             </div>
                           </div>
 
+                          {/* Updated: never show raw ID fragments here */}
                           <div>
                             <div className="text-slate-500 text-xs">Truck</div>
-                            <div className="text-sm">
-                              {a.user_truck?.name ??
-                                a.user_truck?.registration ??
-                                a.user_truck_id?.slice?.(0, 8) ??
-                                '—'}
-                            </div>
+                            <div className="text-sm">{a.user_truck?.name ?? a.user_truck?.registration ?? '—'}</div>
                           </div>
 
+                          {/* Updated: never show raw ID fragments here */}
                           <div>
                             <div className="text-slate-500 text-xs">Trailer</div>
-                            <div className="text-sm">
-                              {a.user_trailer?.name ??
-                                a.user_trailer?.registration ??
-                                a.user_trailer_id?.slice?.(0, 8) ??
-                                '—'}
-                            </div>
+                            <div className="text-sm">{a.user_trailer?.name ?? a.user_trailer?.registration ?? '—'}</div>
                           </div>
 
+                          {/* Updated: never show raw ID fragments here */}
                           <div>
                             <div className="text-slate-500 text-xs">Driver</div>
                             <div className="text-sm">
                               {Array.isArray(a?.drivers) && a.drivers.length
                                 ? a.drivers
-                                    .map((d: any) => d?.name ?? d?.first_name ?? d?.id)
+                                    .map((d: any) => d?.name ?? d?.first_name)
                                     .filter(Boolean)
                                     .join(', ')
-                                : a?.driver?.name ?? a?.driver?.first_name ?? a?.user_id?.slice?.(0, 8) ?? '—'}
+                                : a?.driver?.name ?? a?.driver?.first_name ?? '—'}
                             </div>
                           </div>
 
