@@ -9,6 +9,9 @@
  *
  * This prevents duplicate-insert unique-constraint errors (ux_job_offer_active_assignment)
  * and avoids mass-updating all free staff in a company.
+ *
+ * Note: driving_sessions is treated as REQUIRED for active movement lifecycle.
+ * If driving_sessions insert is blocked (including RLS), finalization now throws.
  */
 
 import { supabase } from '../lib/supabase'
@@ -43,7 +46,7 @@ export interface FinalizeAssignmentOpts {
  * 2b) For multi-run load cargo jobs, create/update a follow-up assigned row with remaining payload.
  * 2c) Keep job_offers.remaining_payload in sync with the computed remainder.
  * 3) Insert a driving_sessions row (phase = 'TO_PICKUP') linked to the updated assignment
- *    only if no driving session already exists for that assignment.
+ *    only if no driving session already exists for that assignment. This is REQUIRED and will throw on failure.
  * 4) Update user_trucks / user_trailers statuses to 'PICKING_LOAD' when provided.
  * 5) Update only the selected hired_staff rows (by id) to activity_id = 'assigned'.
  *
@@ -106,7 +109,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     throw new Error('Missing jobOfferId')
   }
 
-  const { data: existingAssignment, error: findErr } = await supabase
+  const { data: existingAssignments, error: findErr } = await supabase
     .from('job_assignments')
     .select('*')
     .eq('job_offer_id', jobOfferKey)
@@ -121,14 +124,24 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
       'to_pickup',
       'TO_PICKUP',
     ])
-    .limit(1)
-    .maybeSingle()
+    .order('accepted_at', { ascending: false })
 
   if (findErr) {
     // eslint-disable-next-line no-console
     console.error('finalizeAssignmentDirect: failed to find existing job_assignments', findErr)
     throw findErr
   }
+
+  const assignmentPool = Array.isArray(existingAssignments) ? existingAssignments : []
+
+  const existingAssignment =
+    assignmentPool.find(
+      (a: any) => previewData?.id && String(a?.assignment_preview_id ?? '') === String(previewData.id)
+    ) ??
+    assignmentPool.find((a: any) => userTruckId && String(a?.user_truck_id ?? '') === String(userTruckId)) ??
+    assignmentPool.find((a: any) => String(a?.status ?? '').toLowerCase() === 'assigned') ??
+    assignmentPool[0] ??
+    null
 
   if (!existingAssignment) {
     // No prior assignment found — cannot finalize what doesn't exist
@@ -245,20 +258,79 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   }
 
   // Step 2 — Update the existing assignment (do NOT insert)
-  const { data: assignmentRow, error: updateErr } = await supabase
+  const updateDoc: any = {
+    user_truck_id: updatePayload.user_truck_id,
+    user_id: updatePayload.user_id,
+    accepted_at: updatePayload.accepted_at,
+    status: updatePayload.status,
+    assignment_preview_id: previewData?.id ?? existingAssignment?.assignment_preview_id ?? null,
+    assigned_payload_kg: assignedPayload,
+    payload_remaining_kg: remainingPayload,
+  }
+
+  let { data: assignmentRow, error: updateErr } = await supabase
     .from('job_assignments')
-    .update({
-      user_truck_id: updatePayload.user_truck_id,
-      user_id: updatePayload.user_id,
-      accepted_at: updatePayload.accepted_at,
-      status: updatePayload.status,
-      assignment_preview_id: previewData?.id ?? existingAssignment?.assignment_preview_id ?? null,
-      assigned_payload_kg: assignedPayload,
-      payload_remaining_kg: remainingPayload,
-    })
+    .update(updateDoc)
     .eq('id', existingAssignment.id)
     .select()
     .single()
+
+  if (
+    updateErr?.code == '23505' &&
+    String(updateErr?.message ?? '').includes('ux_job_offer_truck_active_assignment') &&
+    userTruckId
+  ) {
+    const conflictRow = assignmentPool.find(
+      (a: any) =>
+        String(a?.id ?? '') !== String(existingAssignment.id) &&
+        String(a?.user_truck_id ?? '') === String(userTruckId)
+    )
+
+    if (conflictRow?.id) {
+      const retry = await supabase
+        .from('job_assignments')
+        .update(updateDoc)
+        .eq('id', conflictRow.id)
+        .select()
+        .single()
+
+      assignmentRow = retry.data as any
+      updateErr = retry.error as any
+    }
+  }
+
+  // Harden against persistent collisions: if update still conflicts, reuse the already-active row
+  // for the same (job_offer_id, user_truck_id) instead of failing outright.
+  if (
+    updateErr?.code == '23505' &&
+    String(updateErr?.message ?? '').includes('ux_job_offer_truck_active_assignment') &&
+    userTruckId
+  ) {
+    const { data: alreadyActiveForTruck } = await supabase
+      .from('job_assignments')
+      .select('*')
+      .eq('job_offer_id', jobOfferKey)
+      .eq('user_truck_id', userTruckId)
+      .in('status', [
+        'assigned',
+        'picking_load',
+        'PICKING_LOAD',
+        'in_progress',
+        'IN_PROGRESS',
+        'delivering',
+        'DELIVERING',
+        'to_pickup',
+        'TO_PICKUP',
+      ])
+      .order('accepted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (alreadyActiveForTruck?.id) {
+      assignmentRow = alreadyActiveForTruck as any
+      updateErr = null as any
+    }
+  }
 
   if (updateErr) {
     // eslint-disable-next-line no-console
@@ -441,6 +513,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     if (existingSessionErr) {
       // eslint-disable-next-line no-console
       console.error('finalizeAssignmentDirect: failed to check existing driving_sessions', existingSessionErr)
+      throw existingSessionErr
     }
 
     if (!existingSession) {
@@ -459,15 +532,17 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
 
         if (isRlsInsertError) {
           // eslint-disable-next-line no-console
-          console.warn(
-            'finalizeAssignmentDirect: driving_sessions insert blocked by RLS; continuing without session',
+          console.error(
+            'finalizeAssignmentDirect: driving_sessions insert blocked by RLS; aborting finalization',
             insertRes.error
           )
         } else {
           // eslint-disable-next-line no-console
           console.error('finalizeAssignmentDirect: failed to insert driving_sessions', insertRes.error)
-          throw insertRes.error
         }
+
+        // driving_sessions is required for active movement lifecycle
+        throw insertRes.error
       }
     } else {
       // eslint-disable-next-line no-console
@@ -482,12 +557,14 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
 
     if (isRlsInsertError) {
       // eslint-disable-next-line no-console
-      console.warn('finalizeAssignmentDirect: driving_sessions insert exception caused by RLS; continuing', e)
+      console.error('finalizeAssignmentDirect: driving_sessions insert exception caused by RLS; aborting', e)
     } else {
       // eslint-disable-next-line no-console
       console.error('finalizeAssignmentDirect: driving_sessions insert exception', e)
-      throw e
     }
+
+    // driving_sessions is required for active movement lifecycle
+    throw e
   }
 
   // Step 4 — Update truck status

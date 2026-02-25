@@ -304,11 +304,27 @@ export default function DroppableSlot({
     const label = value?.label ?? value?.name ?? ''
     const job = value?.job_offer ?? value
 
+    // Prefer assignment remainder, then offer remainder, then original offer weight
+    const rowRemainingPayload = Number(value?.payload_remaining_kg ?? NaN)
+    const offerRemainingPayload = Number(job?.remaining_payload ?? NaN)
+    const offerWeightPayload = Number(job?.weight_kg ?? NaN)
+
     // Cargo detection
-    const isCargo = Boolean(job?.weight_kg)
+    const isCargo =
+      Number.isFinite(rowRemainingPayload) ||
+      Number.isFinite(offerRemainingPayload) ||
+      Number.isFinite(offerWeightPayload)
 
     if (isCargo) {
-      const cargoWeight = Number(job.weight_kg ?? 0)
+      const cargoWeight =
+        Number.isFinite(rowRemainingPayload)
+          ? rowRemainingPayload
+          : Number.isFinite(offerRemainingPayload)
+          ? offerRemainingPayload
+          : Number.isFinite(offerWeightPayload)
+          ? offerWeightPayload
+          : 0
+
       const pickup =
         job.origin_city?.city_name ??
         job.pickup_city ??

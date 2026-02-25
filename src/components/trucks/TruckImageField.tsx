@@ -196,10 +196,16 @@ export default function TruckImageField({
   }
 
   const previewSmall = (
-    <div
-      className={`w-12 h-12 rounded-sm border border-slate-100 bg-white flex items-center justify-center overflow-hidden ${className ?? ''}`}
+    <button
+      type="button"
+      onClick={() => {
+        if (!loading && url) setPreviewOpen(true)
+      }}
+      disabled={loading || !url}
+      className={`w-12 h-12 rounded-sm border border-slate-100 bg-white flex items-center justify-center overflow-hidden transition disabled:cursor-not-allowed enabled:hover:border-slate-300 enabled:hover:shadow-sm ${className ?? ''}`}
       style={{ minWidth: 48, minHeight: 48 }}
-      aria-hidden
+      aria-label={url ? 'Preview truck image' : 'No truck image available'}
+      title={url ? 'Click to preview image' : 'No truck image available'}
     >
       {loading ? (
         <div className="text-xs text-slate-500">…</div>
@@ -209,7 +215,7 @@ export default function TruckImageField({
       ) : (
         <div className="text-sm font-semibold text-slate-700">T</div>
       )}
-    </div>
+    </button>
   )
 
   return (

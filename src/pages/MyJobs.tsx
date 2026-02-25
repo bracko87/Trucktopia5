@@ -11,6 +11,13 @@
  * - Fetch + map origin/destination client companies so JobCard shows company blocks.
  * - Fetch + map origin_city_id/destination_city_id so WeatherBadge can resolve weather.
  * - Retry without pickup_ready if backend schema doesn't yet have that column (42703).
+ *
+ * Cancellation behavior:
+ * - Preferred path uses DB RPC cancel_assignment(p_assignment_id) so backend handles
+ *   penalty/session/offer reopen logic.
+ * - Fallback path patches job_assignments as cancelled and explicitly reopens job_offers
+ *   so the job returns to Market if RPC is unavailable.
+ * - After cancel, remove the job from Market's local hidden-id set so it can reappear.
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -81,6 +88,26 @@ function stripPickupReadyFromEncodedSelect(encodedSelect: string): string {
     .replace(/,pickup_ready(?=,|\))/g, '')
     .replace(/pickup_ready,(?=[^)]*\))/g, '')
   return encodeURIComponent(cleaned)
+}
+
+/**
+ * Market local hidden jobs key (must match Market page).
+ * If your Market page uses a different key, update this constant to match.
+ */
+const HIDDEN_MARKET_JOBS_KEY = 'hidden_market_jobs'
+
+function unhideJobInMarket(jobOfferId: string) {
+  try {
+    if (!jobOfferId) return
+    const raw = localStorage.getItem(HIDDEN_MARKET_JOBS_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return
+    const next = parsed.map(String).filter((id) => id !== String(jobOfferId))
+    localStorage.setItem(HIDDEN_MARKET_JOBS_KEY, JSON.stringify(next))
+  } catch {
+    // ignore localStorage parse/write errors
+  }
 }
 
 /**
@@ -343,10 +370,7 @@ export default function MyJobs(): JSX.Element {
           requires_customs: j.requires_customs ?? null,
           special_requirements: j.special_requirements ?? null,
           job_offer_type_code: j.job_offer_type_code ?? null,
-          pickup_ready:
-            typeof j.pickup_ready === 'boolean'
-              ? j.pickup_ready
-              : null,
+          pickup_ready: typeof j.pickup_ready === 'boolean' ? j.pickup_ready : null,
 
           origin_city_id: j.origin_city_id ?? null,
           destination_city_id: j.destination_city_id ?? null,
@@ -362,6 +386,8 @@ export default function MyJobs(): JSX.Element {
           // assignment metadata
           status: row.status ?? null,
           assignment_status: row.status ?? null,
+          payload_remaining_kg: row.payload_remaining_kg ?? null,
+          assigned_payload_kg: row.assigned_payload_kg ?? null,
 
           // driving session fields (authoritative)
           driving_session_phase: ds?.phase ?? null,
@@ -502,7 +528,21 @@ export default function MyJobs(): JSX.Element {
         const accessToken = session.data.session?.access_token ?? null
 
         const assignmentId = (cancelJob as any)?.assignment_id ?? cancelJob.id
+        const jobOfferId = cancelJob.id // JobRow.id is job_offer.id in this page mapping
+        let cancelledServerSide = false
+
+        // Preferred path: DB function handles penalty + offer re-open + session updates.
         if (assignmentId) {
+          const { error: rpcErr } = await supabase.rpc('cancel_assignment', { p_assignment_id: assignmentId })
+          if (!rpcErr) {
+            cancelledServerSide = true
+          } else {
+            console.debug('[MyJobs] cancel_assignment rpc failed, using fallback patch path', rpcErr)
+          }
+        }
+
+        // Fallback path: cancel assignment + explicitly re-open offer so it returns to Market.
+        if (!cancelledServerSide && assignmentId) {
           await fetch(`${API_BASE}/rest/v1/job_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
             method: 'PATCH',
             headers: {
@@ -510,8 +550,32 @@ export default function MyJobs(): JSX.Element {
               'Content-Type': 'application/json',
               Prefer: 'return=representation',
             },
-            body: JSON.stringify({ status: 'cancelled' }),
+            body: JSON.stringify({ status: 'cancelled', cancelled_at: new Date().toISOString() }),
           })
+
+          // Fallback: return offer to market if RPC is unavailable.
+          if (jobOfferId) {
+            await fetch(`${API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobOfferId)}`, {
+              method: 'PATCH',
+              headers: {
+                ...buildHeaders(accessToken),
+                'Content-Type': 'application/json',
+                Prefer: 'return=representation',
+              },
+              body: JSON.stringify({
+                status: 'open',
+                assigned_user_truck_id: null,
+                user_id: null,
+                user_truck_id: null,
+                accepted_at: null,
+              }),
+            })
+          }
+        }
+
+        // Ensure reopened job can actually reappear in Market UI.
+        if (jobOfferId) {
+          unhideJobInMarket(String(jobOfferId))
         }
       } catch (e) {
         console.debug('[MyJobs] server cancellation attempt failed', e)
@@ -532,6 +596,7 @@ export default function MyJobs(): JSX.Element {
 
     for (const j of jobs) {
       const status = (j as any)?.computed_status ?? (j.status ?? '').toString().toLowerCase()
+      const rowRemaining = Number((j as any)?.payload_remaining_kg ?? (j as any)?.remaining_payload ?? NaN)
 
       if (status === 'assigned') {
         wait.push(j)
@@ -539,6 +604,18 @@ export default function MyJobs(): JSX.Element {
       }
 
       if (status === 'completed' || status === 'cancelled') continue
+
+      // Keep remainder visible in Waiting even while one run is active.
+      if (Number.isFinite(rowRemaining) && rowRemaining > 0) {
+        wait.push(
+          {
+            ...(j as any),
+            computed_status: 'assigned',
+            assignment_status: 'assigned',
+            remaining_payload: rowRemaining,
+          } as JobRow
+        )
+      }
 
       active.push(j)
     }

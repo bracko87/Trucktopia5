@@ -21,6 +21,9 @@
  * - Inserts job assignment with nullable user_truck_id and patches job offer accordingly.
  * - Adds backend policy error mapping for job_assignments_truck_required.
  * - AcceptModal binding updated to call confirmAccept with no arguments.
+ * - Accept-time payload no longer gets consumed in Market:
+ *   assigned_payload_kg is always 0 and payload_remaining_kg remains unchanged until
+ *   actual finalize/start flow consumes payload.
  *
  * Mandatory Sider.ai alignment (2026-02-23 20:50 UTC):
  * - resolveAcceptTruckId keeps ownership buckets:
@@ -658,8 +661,8 @@ export default function MarketPage(): JSX.Element {
    * confirmAccept
    *
    * Accept the currently selected job. This version allows accept without a truck:
-   * - If a truck is found => payload is assigned immediately up to capacity
-   * - If no truck is found => payload assigned is 0 (remaining stays the same)
+   * - If a truck is found => payload is NOT consumed yet at market accept time
+   * - If no truck is found => payload also remains unchanged
    *
    * IMPORTANT:
    * Force pre-dispatch status to "assigned" always (per catalog/state machine).
@@ -696,15 +699,16 @@ export default function MarketPage(): JSX.Element {
       }
 
       const selectedJob = jobs.find((j) => j.id === jobId) ?? null
-      const remainingBeforeRaw = Number(selectedJob?.remaining_payload ?? selectedJob?.weight_kg ?? 0)
-      const remainingBefore = Number.isFinite(remainingBeforeRaw) && remainingBeforeRaw > 0 ? remainingBeforeRaw : 0
+      const remainingBefore = Number(selectedJob?.remaining_payload ?? selectedJob?.weight_kg ?? 0)
 
-      const truckCapacity = await resolveTruckPayloadCapacity(truckId, authHeader)
-      const thisRunPayload = truckId ? Math.max(0, Math.min(remainingBefore, Number(truckCapacity ?? remainingBefore))) : 0
-      const remainingAfter = truckId ? Math.max(0, remainingBefore - thisRunPayload) : remainingBefore
+      // Keep capacity resolution call (for compatibility/side effects/diagnostics), but do not consume payload on accept.
+      await resolveTruckPayloadCapacity(truckId, authHeader)
 
-      // Keep accepted market jobs in the "assigned" lane so they appear in Waiting/Staging
-      // even when truck is attached later in staging.
+      // Accepting in Market should not consume payload yet; payload is consumed when assignment is finalized/started.
+      const thisRunPayload = 0
+      const remainingAfter = Math.max(0, remainingBefore)
+
+      // Keep accepted market jobs in the "assigned" lane so they appear in Waiting/Staging.
       const assignmentStatus = 'assigned'
 
       const commonHeaders: Record<string, string> = {

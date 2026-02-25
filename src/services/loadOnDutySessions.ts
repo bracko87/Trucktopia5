@@ -13,12 +13,18 @@ import { supabase } from '../lib/supabase'
 /**
  * loadActiveAssignmentsFallback
  *
- * Fallback loader for environments where driving_sessions INSERT/SELECT is blocked by RLS.
- * Builds session-shaped rows from active job_assignments so Staging Active stays functional.
+ * Fallback loader for environments where driving_sessions INSERT/SELECT is blocked by RLS,
+ * or when sessions come back empty/unlinked and staging would otherwise show a blank state.
+ *
+ * IMPORTANT:
+ * - This fallback builds session-shaped rows from active job_assignments so Staging Active
+ *   remains usable.
+ * - It is NOT a full replacement for proper movement tracking / triggers on driving_sessions.
  */
 async function loadActiveAssignmentsFallback(companyId: string) {
+  // IMPORTANT: Do not include plain "assigned" here.
+  // Accepted-but-not-started jobs should not pollute Staging "Active".
   const activeStatuses = [
-    'assigned',
     'picking_load',
     'PICKING_LOAD',
     'to_pickup',
@@ -106,6 +112,12 @@ async function loadActiveAssignmentsFallback(companyId: string) {
  *  - counts of returned rows
  *  - any errors encountered when a column/table is missing
  *
+ * NOTE:
+ * - When driving_sessions are blocked (e.g. RLS) or come back empty/unlinked, staging may
+ *   use fallback-from-job_assignments to avoid a total blank state.
+ * - That fallback is a temporary UI safeguard and not a full replacement for proper
+ *   movement tracking/triggers on driving_sessions.
+ *
  * @param {string | null | undefined} companyId - ID of the company to filter by.
  * @returns {Promise<any[]>} Array of enriched driving session rows.
  */
@@ -118,37 +130,90 @@ export async function loadOnDutySessions(companyId?: string | null) {
   try {
     // STEP 1: sessions only (safe select)
     // NOTE: Do NOT request non-existing columns - a single bad column breaks the whole query.
+    // Some environments drifted from user_truck_id -> truck_id, so try both and normalize.
+    // Some environments are more limited; final fallback variant requests only minimal columns.
     console.debug('loadOnDutySessions: fetching driving_sessions (step 1)')
-    const { data: sessions, error: sessErr } = await supabase
-      .from('driving_sessions')
-      .select(
-        [
-          'id',
-          'phase',
-          'distance_completed_km',
-          'total_distance_km',
-          'phase_started_at',
-          'created_at',
-          'user_truck_id',
-          'job_assignment_id',
-          // driver_id kept as some schemas put driver on the session row
-          'driver_id',
-          'relocation_ready_at',
-        ].join(',')
-      )
-      .order('created_at', { ascending: false })
-      .limit(200)
+
+    const selectVariants = [
+      [
+        'id',
+        'phase',
+        'distance_completed_km',
+        'total_distance_km',
+        'phase_started_at',
+        'created_at',
+        'user_truck_id',
+        'job_assignment_id',
+        'driver_id',
+        'relocation_ready_at',
+      ].join(','),
+      [
+        'id',
+        'phase',
+        'distance_completed_km',
+        'total_distance_km',
+        'phase_started_at',
+        'created_at',
+        'truck_id',
+        'job_assignment_id',
+        'driver_id',
+        'relocation_ready_at',
+      ].join(','),
+      [
+        'id',
+        'phase',
+        'distance_completed_km',
+        'total_distance_km',
+        'phase_started_at',
+        'created_at',
+        'job_assignment_id',
+      ].join(','),
+    ]
+
+    let sessions: any[] | null = null
+    let sessErr: any = null
+
+    for (const selectClause of selectVariants) {
+      console.debug('loadOnDutySessions: trying driving_sessions select variant', selectClause)
+
+      const res = await supabase
+        .from('driving_sessions')
+        .select(selectClause)
+        .order('created_at', { ascending: false })
+        .limit(200)
+
+      if (!res.error) {
+        sessions = Array.isArray(res.data)
+          ? res.data.map((row: any) => ({
+              ...row,
+              user_truck_id: row?.user_truck_id ?? row?.truck_id ?? null,
+            }))
+          : []
+        sessErr = null
+        break
+      }
+
+      const code = String(res.error?.code ?? '')
+      if (code !== '42703') {
+        sessErr = res.error
+        break
+      }
+
+      // Schema drift (missing column in this variant) — try next variant.
+      console.warn('loadOnDutySessions: select variant hit 42703, trying next variant', res.error)
+      sessErr = res.error
+    }
 
     if (sessErr) {
-      // Log full error and return empty so UI does not break.
-      console.error('loadOnDutySessions: sessions load error', sessErr)
-
       const msg = String(sessErr?.message ?? '').toLowerCase()
       const code = String(sessErr?.code ?? '')
-      if (code === '42501' || msg.includes('row-level security policy')) {
+      if (code === '42501' || code === '42703' || msg.includes('row-level security policy')) {
+        console.warn('loadOnDutySessions: driving_sessions unavailable, using assignments fallback', sessErr)
         return await loadActiveAssignmentsFallback(String(companyId))
       }
 
+      // Unexpected sessions load error — log and return empty so UI does not break.
+      console.error('loadOnDutySessions: sessions load error', sessErr)
       return []
     }
 
@@ -166,7 +231,9 @@ export async function loadOnDutySessions(companyId?: string | null) {
     console.debug(`loadOnDutySessions: derived assignmentIds = ${assignmentIds.length}`)
 
     if (assignmentIds.length === 0) {
-      console.debug('loadOnDutySessions: no assignmentIds found — using assignments fallback')
+      console.debug(
+        'loadOnDutySessions: no assignmentIds found (sessions empty/unlinked) — using fallback-from-job_assignments for staging; fallback only, not a full replacement for driving_sessions tracking/triggers'
+      )
       return await loadActiveAssignmentsFallback(String(companyId))
     }
 
@@ -205,7 +272,9 @@ export async function loadOnDutySessions(companyId?: string | null) {
     }
 
     if (!Array.isArray(assignments)) {
-      console.debug('loadOnDutySessions: assignments is not an array — returning sessions-only fallback')
+      console.debug(
+        'loadOnDutySessions: assignments is not an array — returning sessions-only fallback'
+      )
       return sessions
     }
 
@@ -330,7 +399,9 @@ export async function loadOnDutySessions(companyId?: string | null) {
                 driverMap[String(u.id)] = u
               }
             })
-            console.debug(`loadOnDutySessions: users fallback loaded = ${Object.keys(driverMap).length}`)
+            console.debug(
+              `loadOnDutySessions: users fallback loaded = ${Object.keys(driverMap).length}`
+            )
           }
         } catch (e) {
           console.warn('loadOnDutySessions: users fallback load failed', e)
@@ -378,9 +449,15 @@ export async function loadOnDutySessions(companyId?: string | null) {
           } else if (mode === 'trailer_cargo') {
             resolvedReward = jobOffer.reward_trailer_cargo ?? null
           } else {
-            if (jobOffer.reward_load_cargo !== undefined && jobOffer.reward_load_cargo !== null) {
+            if (
+              jobOffer.reward_load_cargo !== undefined &&
+              jobOffer.reward_load_cargo !== null
+            ) {
               resolvedReward = jobOffer.reward_load_cargo
-            } else if (jobOffer.reward_trailer_cargo !== undefined && jobOffer.reward_trailer_cargo !== null) {
+            } else if (
+              jobOffer.reward_trailer_cargo !== undefined &&
+              jobOffer.reward_trailer_cargo !== null
+            ) {
               resolvedReward = jobOffer.reward_trailer_cargo
             } else {
               resolvedReward = null
@@ -391,18 +468,21 @@ export async function loadOnDutySessions(companyId?: string | null) {
         }
 
         // Prefer truck from assignment; fall back to truck referenced directly on driving_sessions
-        const truckFromAssignmentId = assignment.user_truck_id ? String(assignment.user_truck_id) : null
+        const truckFromAssignmentId = assignment.user_truck_id
+          ? String(assignment.user_truck_id)
+          : null
         const truckFromSessionId = s.user_truck_id ? String(s.user_truck_id) : null
 
         const truck =
           (truckFromAssignmentId ? truckMap[truckFromAssignmentId] ?? null : null) ??
           (truckFromSessionId ? truckMap[truckFromSessionId] ?? null : null)
 
-        const trailer = assignment.user_trailer_id ? trailerMap[String(assignment.user_trailer_id)] ?? null : null
+        const trailer = assignment.user_trailer_id
+          ? trailerMap[String(assignment.user_trailer_id)] ?? null
+          : null
 
         // Driver resolution: prefer assignment.user_id, then session-level driver_id
-        let driver =
-          (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ?? null
+        let driver = (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ?? null
 
         if (!driver) {
           if (s.driver_id && driverMap[String(s.driver_id)]) driver = driverMap[String(s.driver_id)]

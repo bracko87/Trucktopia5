@@ -6,8 +6,9 @@
  * using PostgREST range queries and shows a maximum of 10 entries per page.
  *
  * FIXES:
- * - Robust companyId resolution (user fields + user_metadata + window + localStorage + DB fallback)
- * - useEffect dependency fixed (runs when user loads/changes)
+ * - Robust companyId resolution (user fields + DB fallback + browser fallback)
+ * - Per-user localStorage scoping to avoid stale cross-account company ids
+ * - useEffect dependency fixed (runs when user id/company changes)
  * - Includes created_at in select (since we order by it)
  * - Uses explicit FK join hint for truck_models to avoid ambiguous joins
  */
@@ -173,32 +174,38 @@ export default function LeasesPanel(): JSX.Element {
   /**
    * resolveCompanyIdFromUser
    *
-   * Best-effort extraction from whatever shape AuthContext provides.
+   * Best-effort extraction from common auth/user shapes.
    */
   function resolveCompanyIdFromUser(u: any): string | null {
     if (!u) return null
-    const candidates = [
-      u.company_id,
-      u.companyId,
-      u.company?.id,
-      u.user_metadata?.company_id,
-      u.user_metadata?.companyId,
-      u.profile?.company_id,
-      u.profile?.companyId,
-    ].filter(Boolean)
-
-    return candidates.length ? String(candidates[0]) : null
+    const candidate =
+      u.company_id ??
+      u.companyId ??
+      u.user_metadata?.company_id ??
+      u.user_metadata?.companyId ??
+      null
+    return candidate ? String(candidate) : null
   }
 
   /**
    * resolveCompanyIdFromBrowser
+   *
+   * Browser fallback with per-user localStorage scoping to avoid stale company ids
+   * from previously signed-in accounts.
    */
-  function resolveCompanyIdFromBrowser(): string | null {
+  function resolveCompanyIdFromBrowser(uid?: string | null): string | null {
     try {
       const w = (window as any).__CURRENT_COMPANY_ID
       if (w) return String(w)
-      const ls = localStorage.getItem('current_company_id')
-      if (ls) return ls
+
+      // Prefer per-user storage key to avoid stale cross-account company ids.
+      if (uid) {
+        const scoped = localStorage.getItem(`current_company_id:${uid}`)
+        if (scoped) return scoped
+      }
+
+      const legacy = localStorage.getItem('current_company_id')
+      if (legacy) return legacy
     } catch {}
     return null
   }
@@ -207,22 +214,16 @@ export default function LeasesPanel(): JSX.Element {
    * resolveCompanyIdFromDb
    *
    * Best-effort fallback: try common column names in `public.users`.
-   * If your schema differs, adjust the column checks below.
+   * Primary expected linkage is users.auth_user_id -> auth user id.
    */
   async function resolveCompanyIdFromDb(u: any): Promise<string | null> {
-    const uid =
-      u?.id ?? u?.auth_id ?? u?.authId ?? u?.user_id ?? u?.userId ?? null
+    const uid = u?.id ? String(u.id) : null
     if (!uid) return null
 
-    // Try common shapes in your `public.users` table
-    const attempts: Array<{
-      column: string
-      value: string
-    }> = [
-      { column: 'auth_id', value: String(uid) },
-      { column: 'owner_user_auth_id', value: String(uid) },
-      { column: 'user_auth_id', value: String(uid) },
-      { column: 'id', value: String(uid) },
+    // public.users commonly stores auth linkage as auth_user_id.
+    const attempts: Array<{ column: string; value: string }> = [
+      { column: 'auth_user_id', value: uid },
+      { column: 'id', value: uid },
     ]
 
     for (const a of attempts) {
@@ -237,9 +238,7 @@ export default function LeasesPanel(): JSX.Element {
         console.log('resolveCompanyIdFromDb attempt', a, { data, error })
       }
 
-      if (!error && data?.company_id) {
-        return String(data.company_id)
-      }
+      if (!error && data?.company_id) return String(data.company_id)
     }
 
     return null
@@ -248,11 +247,11 @@ export default function LeasesPanel(): JSX.Element {
   /**
    * resolveCompanyId
    *
-   * Full resolution (cached):
+   * Async resolution chain (cached):
    * 1) cached ref
-   * 2) from user object
-   * 3) from window/localStorage
-   * 4) DB fallback
+   * 2) user object
+   * 3) DB fallback (public.users.auth_user_id)
+   * 4) browser fallback (__CURRENT_COMPANY_ID + localStorage)
    */
   async function resolveCompanyId(): Promise<string | null> {
     if (companyIdRef.current) return companyIdRef.current
@@ -261,24 +260,26 @@ export default function LeasesPanel(): JSX.Element {
     if (fromUser) {
       companyIdRef.current = fromUser
       try {
+        if (user?.id) localStorage.setItem(`current_company_id:${user.id}`, fromUser)
         localStorage.setItem('current_company_id', fromUser)
       } catch {}
       return fromUser
-    }
-
-    const fromBrowser = resolveCompanyIdFromBrowser()
-    if (fromBrowser) {
-      companyIdRef.current = fromBrowser
-      return fromBrowser
     }
 
     const fromDb = await resolveCompanyIdFromDb(user as any)
     if (fromDb) {
       companyIdRef.current = fromDb
       try {
+        if (user?.id) localStorage.setItem(`current_company_id:${user.id}`, fromDb)
         localStorage.setItem('current_company_id', fromDb)
       } catch {}
       return fromDb
+    }
+
+    const fromBrowser = resolveCompanyIdFromBrowser(user?.id ?? null)
+    if (fromBrowser) {
+      companyIdRef.current = fromBrowser
+      return fromBrowser
     }
 
     return null
@@ -305,15 +306,18 @@ export default function LeasesPanel(): JSX.Element {
         console.log('leases: resolved companyId=', companyId)
         // eslint-disable-next-line no-console
         console.log(
-          'leases: ls current_company_id=',
+          'leases: scoped current_company_id=',
+          user?.id ? localStorage.getItem(`current_company_id:${user.id}`) : null
+        )
+        // eslint-disable-next-line no-console
+        console.log(
+          'leases: legacy current_company_id=',
           localStorage.getItem('current_company_id')
         )
       }
 
       if (!companyId) {
-        setError(
-          'No company context available. Please set current_company_id or ensure the logged-in user has a company_id.'
-        )
+        setError('No company context available.')
         setLeases([])
         setTotalCount(0)
         return
@@ -376,14 +380,12 @@ export default function LeasesPanel(): JSX.Element {
     }
   }
 
-  // IMPORTANT: depend on user (or user?.id) so it reruns when auth finishes loading
+  // Reset cached company id on user change and refetch.
   React.useEffect(() => {
-    if (!user) return
-    // Clear cached company when user changes
     companyIdRef.current = null
     fetchLeases(1).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user])
+  }, [user?.id, (user as any)?.company_id])
 
   const currencyFormatter = new Intl.NumberFormat(undefined, {
     style: 'currency',

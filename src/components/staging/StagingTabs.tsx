@@ -12,6 +12,12 @@
  *
  * This version also removes the yellow "recommended" visual highlights and
  * ensures relocation info is rendered on a single inline row to save vertical space.
+ *
+ * Update:
+ * - Fixed Staging cargo continuity for multi-run jobs:
+ *   - cargo list now includes active statuses too
+ *   - weight display prefers assignment.payload_remaining_kg when available
+ *   - remainder cargo stays visible after one run is confirmed instead of disappearing
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -812,7 +818,7 @@ export default function StagingTabs(): JSX.Element {
             location_city_id: locId,
             // explicit alias: current_location_id for clarity (mapped from stats.current_location_id)
             current_location_id: locId,
-            }
+          }
         })
 
       // Merge: profile drivers first (owner/CEO visible on top), then hired drivers
@@ -834,6 +840,9 @@ export default function StagingTabs(): JSX.Element {
    *
    * Note: original query included a non-existent job_assignment_id column. That field
    * has been removed to avoid SQL/postgrest errors.
+   *
+   * Updated for multi-run continuity:
+   * includes active statuses so remaining payload jobs stay visible after a run starts.
    */
   async function fetchAssignedJobs(overrideCompanyId?: string) {
     setLoadingCargo(true)
@@ -877,7 +886,17 @@ export default function StagingTabs(): JSX.Element {
           )
         `)
         .eq('carrier_company_id', cid)
-        .eq('status', 'assigned')
+        .in('status', [
+          'assigned',
+          'picking_load',
+          'PICKING_LOAD',
+          'to_pickup',
+          'TO_PICKUP',
+          'in_progress',
+          'IN_PROGRESS',
+          'delivering',
+          'DELIVERING',
+        ])
         .gt('job_offer.remaining_payload', 0)
         .order('accepted_at', { ascending: false })
 
@@ -1193,7 +1212,7 @@ export default function StagingTabs(): JSX.Element {
                         <div>
                           <div className="font-medium text-slate-800 flex items-center gap-2">
                             <span>{tr.label || `Trailer ${String((tr.id ?? tr._raw?.id ?? '')).substring(0, 8)}`}</span>
-                            
+
                           </div>
                           <div className="text-xs text-slate-500 mt-1 flex flex-wrap gap-3">
                             {tr.locationCityName && (
@@ -1276,7 +1295,7 @@ export default function StagingTabs(): JSX.Element {
                               </div>
                             ) : null}
                             <div className="font-medium text-slate-800 flex items-center gap-2">
-                              
+
                               <span>{d.name ?? `${d.first_name ?? ''} ${d.last_name ?? ''}`}</span>
                             </div>
                           </div>
@@ -1399,14 +1418,14 @@ export default function StagingTabs(): JSX.Element {
                     const offerWeight = Number(job?.weight_kg ?? NaN)
 
                     const weight =
-                      rowStatus === 'assigned'
-                        ? (Number.isFinite(rowRemainingPayload)
-                            ? rowRemainingPayload
-                            : Number.isFinite(offerRemainingPayload)
-                              ? offerRemainingPayload
-                              : Number.isFinite(offerWeight)
-                                ? offerWeight
-                                : null)
+                      Number.isFinite(rowRemainingPayload) && rowRemainingPayload > 0
+                        ? rowRemainingPayload
+                        : rowStatus === 'assigned'
+                        ? (Number.isFinite(offerRemainingPayload)
+                            ? offerRemainingPayload
+                            : Number.isFinite(offerWeight)
+                              ? offerWeight
+                              : null)
                         : (Number.isFinite(rowAssignedPayload)
                             ? rowAssignedPayload
                             : Number.isFinite(offerWeight)
@@ -1432,7 +1451,15 @@ export default function StagingTabs(): JSX.Element {
                             ev.preventDefault()
                             return
                           }
-                          const payload = { type: 'cargo', id: assignment.id, label: cargoItemName, job_offer: job }
+                          const payload = {
+                            type: 'cargo',
+                            id: assignment.id,
+                            label: cargoItemName,
+                            status: assignment.status ?? null,
+                            assigned_payload_kg: assignment.assigned_payload_kg ?? null,
+                            payload_remaining_kg: assignment.payload_remaining_kg ?? null,
+                            job_offer: job,
+                          }
                           ev.dataTransfer.setData('application/json', JSON.stringify(payload))
                           ev.dataTransfer.setData('text/plain', `cargo:${assignment.id}:${cargoItemName}`)
                         }}
@@ -1549,7 +1576,7 @@ export default function StagingTabs(): JSX.Element {
           </div>
 
           <div className="mt-4 flex flex-col gap-2">
-            <div className="w-full px-3 py-2 rounded" style={{ visibility: 'hidden' }} />{/* placeholder to keep layout unchanged */} 
+            <div className="w-full px-3 py-2 rounded" style={{ visibility: 'hidden' }} />{/* placeholder to keep layout unchanged */}
             <div className="flex gap-2">
               <button
                 onClick={async () => {
@@ -1613,7 +1640,11 @@ export default function StagingTabs(): JSX.Element {
       </section>
 
       <div className="mt-6">
-        <AssignmentPanel onAssignmentChange={setAssignment} relocationInfo={relocationInfo} />
+        <AssignmentPanel
+          onAssignmentChange={setAssignment}
+          relocationInfo={relocationInfo}
+          companyId={initialCompanyId || null}
+        />
       </div>
     </>
   )
