@@ -3,13 +3,10 @@
  *
  * Compact bottom panel for the staging area showing Active assignments.
  * - Renders each row as a 5-column grid: Route | Distance | Phase | ETA | Progress+Actions.
- * - Adds Start time and Job type to the expanded details without changing layout.
+ * - Adds Payload and Job type to the expanded details without changing layout.
  *
  * Notes:
- * - This file implements phase-aware start time selection:
- *   If session.phase === 'WAITING_DRIVER' the displayed start time prefers
- *   session.relocation_ready_at (driver arrival). Otherwise the assignment accepted_at
- *   is used. Fallbacks are provided to avoid empty displays.
+ * - This file implements phase-aware ETA/pickup display logic.
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
@@ -380,21 +377,27 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                 const timeStatus = getTimeStatus(pickupMs, deadlineMs, now)
 
                 const deliveryClass =
-                  timeStatus.delivery === 'urgent' ? 'text-rose-600 font-semibold' : timeStatus.delivery === 'past' ? 'text-rose-700 font-bold' : 'text-slate-800'
+                  timeStatus.delivery === 'urgent'
+                    ? 'text-rose-600 font-semibold'
+                    : timeStatus.delivery === 'past'
+                    ? 'text-rose-700 font-bold'
+                    : 'text-slate-800'
 
                 const idKey = a?.id ?? s.id
+                const assignedPayloadKg = Number(a?.assigned_payload_kg ?? NaN)
+                const payloadThisRunLabel =
+                  Number.isFinite(assignedPayloadKg) && assignedPayloadKg > 0
+                    ? `${Math.round(assignedPayloadKg)} kg`
+                    : '—'
 
                 /**
                  * normalize phase for UI decisions and check if this is a return trip.
                  * Keep a small resilient set of variants to match backend naming differences.
                  */
                 const normalizedPhase = String(s.phase ?? '').toLowerCase()
-                const isReturn = [
-                  'return_to_hub',
-                  'return-to-hub',
-                  'return to hub',
-                  'returning',
-                ].includes(normalizedPhase)
+                const isReturn = ['return_to_hub', 'return-to-hub', 'return to hub', 'returning'].includes(
+                  normalizedPhase
+                )
 
                 /**
                  * isAborted
@@ -423,19 +426,6 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                 const showGrayEta = isReturn || isAborted
 
                 /**
-                 * Start time selection (PHASE-AWARE)
-                 *
-                 * If the session phase is WAITING_DRIVER show relocation_ready_at (driver arrival)
-                 * because the job cannot truly start until the driver is present. Fall back to
-                 * assignment accepted_at and other session fields when necessary.
-                 */
-                const phaseUpper = String(s.phase ?? '').toUpperCase()
-                const startTime =
-                  phaseUpper === 'WAITING_DRIVER'
-                    ? (s.relocation_ready_at ?? a?.accepted_at ?? s.phase_started_at ?? a?.job_offer?.pickup_time ?? null)
-                    : (a?.accepted_at ?? s.phase_started_at ?? s.relocation_ready_at ?? a?.job_offer?.pickup_time ?? null)
-
-                /**
                  * jobTypeLabel
                  *
                  * Map transport_mode values to display labels ("Load" / "Trailer").
@@ -460,7 +450,10 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                       {/* Section 1 — Route (wide) */}
                       <div className="truncate">
                         <span className="text-slate-600">Route:</span>
-                        <span className="ml-2 font-medium text-slate-800"> {origin} - {destination}</span>
+                        <span className="ml-2 font-medium text-slate-800">
+                          {' '}
+                          {origin} - {destination}
+                        </span>
                       </div>
 
                       {/* Section 2 — Distance */}
@@ -528,7 +521,9 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                             setAbortTarget(a?.id ?? s.id)
                           }}
                           className={`px-3 py-1 rounded-md text-xs transition shadow ${
-                            canAbort ? 'bg-rose-600 text-white hover:bg-rose-700' : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                            canAbort
+                              ? 'bg-rose-600 text-white hover:bg-rose-700'
+                              : 'bg-slate-100 text-slate-400 cursor-not-allowed'
                           }`}
                           title={canAbort ? 'Abort Job' : 'Cannot abort a returning or cancelled assignment'}
                           aria-label="Abort Job"
@@ -554,7 +549,9 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
 
                           <div>
                             <div className="text-slate-500 text-xs">Route</div>
-                            <div className="text-sm">{origin} → {destination}</div>
+                            <div className="text-sm">
+                              {origin} → {destination}
+                            </div>
                           </div>
 
                           <div>
@@ -574,43 +571,64 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
 
                           <div>
                             <div className="text-slate-500 text-xs">ETA</div>
-                            <div className={`text-sm ${showGrayEta ? 'text-slate-400' : deliveryClass}`}>{showGrayEta ? '—' : formatArrival(now + (estimatedMsRemaining ?? 0))}</div>
+                            <div className={`text-sm ${showGrayEta ? 'text-slate-400' : deliveryClass}`}>
+                              {showGrayEta ? '—' : formatArrival(now + (estimatedMsRemaining ?? 0))}
+                            </div>
                           </div>
 
                           <div>
                             <div className="text-slate-500 text-xs">Truck</div>
-                            <div className="text-sm">{a.user_truck?.model?.name ?? a.user_truck?.id?.slice?.(0, 8) ?? '—'}</div>
+                            <div className="text-sm">
+                              {a.user_truck?.name ??
+                                a.user_truck?.registration ??
+                                a.user_truck_id?.slice?.(0, 8) ??
+                                '—'}
+                            </div>
                           </div>
 
                           <div>
                             <div className="text-slate-500 text-xs">Trailer</div>
-                            <div className="text-sm">{a.assignment_preview?.user_trailer?.name ?? a.user_trailer?.name ?? '—'}</div>
+                            <div className="text-sm">
+                              {a.user_trailer?.name ??
+                                a.user_trailer?.registration ??
+                                a.user_trailer_id?.slice?.(0, 8) ??
+                                '—'}
+                            </div>
                           </div>
 
                           <div>
                             <div className="text-slate-500 text-xs">Driver</div>
-                            <div className="text-sm">{s.job_assignment?.hired_staff?.name ?? '—'}</div>
+                            <div className="text-sm">
+                              {Array.isArray(a?.drivers) && a.drivers.length
+                                ? a.drivers
+                                    .map((d: any) => d?.name ?? d?.first_name ?? d?.id)
+                                    .filter(Boolean)
+                                    .join(', ')
+                                : a?.driver?.name ?? a?.driver?.first_name ?? a?.user_id?.slice?.(0, 8) ?? '—'}
+                            </div>
                           </div>
 
                           <div>
                             <div className="text-slate-500 text-xs">Reward</div>
-                            <div className="text-sm">{a.final_reward == null ? '—' : `${a.final_reward} ${a.currency ?? 'USD'}`}</div>
+                            <div className="text-sm">
+                              {a.resolved_reward == null
+                                ? a.final_reward == null
+                                  ? '—'
+                                  : `${a.final_reward} ${a.currency ?? 'USD'}`
+                                : `${a.resolved_reward} ${a.currency ?? 'USD'}`}
+                            </div>
                           </div>
 
-                          {/* Start time (phase-aware) */}
+                          {/* Payload for this assignment run */}
                           <div>
-                            <div className="text-slate-500 text-xs">Start time</div>
-                            <div className="font-medium">
-                              {formatDateTime(startTime)}
-                            </div>
+                            <div className="text-slate-500 text-xs">Payload</div>
+                            <div className="font-medium">{payloadThisRunLabel}</div>
                           </div>
 
                           {/* Job type */}
                           <div>
                             <div className="text-slate-500 text-xs">Job type</div>
-                            <div className="font-medium">
-                              {jobTypeLabel}
-                            </div>
+                            <div className="font-medium">{jobTypeLabel}</div>
                           </div>
                         </div>
                       </div>
@@ -640,11 +658,7 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
             </p>
 
             <div className="flex justify-end gap-2">
-              <button
-                className="px-3 py-1 border rounded"
-                onClick={() => setAbortTarget(null)}
-                type="button"
-              >
+              <button className="px-3 py-1 border rounded" onClick={() => setAbortTarget(null)} type="button">
                 Cancel
               </button>
 

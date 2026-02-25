@@ -250,6 +250,8 @@ export async function loadOnDutySessions(companyId?: string | null) {
           'user_trailer_id',
           'user_id',
           'final_reward',
+          'assigned_payload_kg',
+          'payload_remaining_kg',
           'job_offer:job_offer_id(' +
             'id,' +
             'transport_mode,' +
