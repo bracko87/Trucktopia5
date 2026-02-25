@@ -12,6 +12,11 @@
  * - Backwards compatible: if pickup_ready is not present, client-side time
  *   comparison is used as a fallback (now() >= pickup_time).
  *
+ * - NEW: On "My Jobs" cards, disable "Cancel Load" when the job is already in an
+ *   active transport phase (picking_load, to_pickup, in_progress, delivering, etc.)
+ *   and show helper text: “Abort in Staging first.” This enforces lifecycle:
+ *   active run → abort in staging → return to waiting → cancel from waiting only.
+ *
  * Note: This file focuses only on UI behavior; actual data queries must expose
  * pickup_ready (see migrations/075_pickup_ready.sql).
  */
@@ -182,11 +187,7 @@ function SquareFlag({
     >
       {src ? (
         // eslint-disable-next-line jsx-a11y/alt-text
-        <img
-          src={src}
-          className="w-full h-full object-cover block"
-          onError={onImageError}
-        />
+        <img src={src} className="w-full h-full object-cover block" onError={onImageError} />
       ) : (
         <span
           style={{
@@ -231,11 +232,7 @@ function CompanyAvatar({
     >
       {!imgError && src ? (
         // eslint-disable-next-line jsx-a11y/alt-text
-        <img
-          src={src}
-          className="w-full h-full object-cover block"
-          onError={() => setImgError(true)}
-        />
+        <img src={src} className="w-full h-full object-cover block" onError={() => setImgError(true)} />
       ) : (
         <span style={{ fontSize, lineHeight: 1 }} className="text-slate-700 font-semibold">
           {initials}
@@ -619,6 +616,7 @@ function RewardsBox({
   actionsVariant = 'default',
   job,
   disabled,
+  cancelDisabled,
 }: {
   trailer: number
   load: number
@@ -629,6 +627,7 @@ function RewardsBox({
   actionsVariant?: 'default' | 'my-jobs'
   job: JobRow
   disabled?: boolean
+  cancelDisabled?: boolean
 }) {
   let primary = 0
   if (modeKey === 'load') primary = load
@@ -762,16 +761,19 @@ function RewardsBox({
           <div className="flex-1" aria-hidden />
           {actionsVariant === 'my-jobs' ? (
             <div className="ml-auto flex items-center gap-3">
-              <button
-                type="button"
-                onClick={() => onCancel?.()}
-                disabled={disabled}
-                className={`px-4 py-2 rounded-md text-white text-sm transition shadow ${
-                  disabled ? 'bg-rose-300 cursor-not-allowed opacity-60' : 'bg-rose-600 hover:bg-rose-700'
-                }`}
-              >
-                Cancel Load
-              </button>
+              <div className="flex flex-col items-end">
+                <button
+                  type="button"
+                  onClick={() => onCancel?.()}
+                  disabled={cancelDisabled}
+                  className={`px-4 py-2 rounded-md text-white text-sm transition shadow ${
+                    cancelDisabled ? 'bg-rose-300 cursor-not-allowed opacity-60' : 'bg-rose-600 hover:bg-rose-700'
+                  }`}
+                >
+                  Cancel Load
+                </button>
+                {!cancelDisabled ? null : <span className="text-xs text-slate-500">Abort in Staging first</span>}
+              </div>
               {!disabled ? null : <span className="text-xs text-slate-500">Assign disabled</span>}
             </div>
           ) : (
@@ -791,7 +793,9 @@ function RewardsBox({
                 }}
                 disabled={disabled}
                 className={`px-4 py-2 rounded-md text-sm transition shadow ${
-                  disabled ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-70' : 'bg-sky-600 text-white hover:bg-sky-700'
+                  disabled
+                    ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-70'
+                    : 'bg-sky-600 text-white hover:bg-sky-700'
                 }`}
               >
                 Accept
@@ -873,6 +877,13 @@ export default function JobCard({
 
   const disabled = pickupReady === false && (effectiveMode === 'staging' || effectiveMode === 'my-jobs')
 
+  // NEW: disable cancel when job is already in active transport phases
+  const phase = String(authoritativePhase ?? '').toLowerCase()
+  const cancelDisabled =
+    actionsVariant === 'my-jobs' &&
+    variant === 'active' &&
+    ['picking_load', 'to_pickup', 'in_progress', 'delivering', 'loading', 'unloading'].includes(phase)
+
   const hasCompanyInfo = Boolean(job.origin_client_company_name || job.destination_client_company_name)
 
   return (
@@ -951,7 +962,11 @@ export default function JobCard({
                     className="flex items-center gap-3 w-full text-left p-0"
                     aria-label={`Open profile for ${job.origin_client_company_name}`}
                   >
-                    <CompanyAvatar name={job.origin_client_company_name} logoUrl={job.origin_client_company_logo} size={56} />
+                    <CompanyAvatar
+                      name={job.origin_client_company_name}
+                      logoUrl={job.origin_client_company_logo}
+                      size={56}
+                    />
                     <div className="min-w-0">
                       <div className="text-xs text-slate-500">Origin client</div>
                       <div className="text-sm font-medium truncate">{job.origin_client_company_name}</div>
@@ -1012,6 +1027,7 @@ export default function JobCard({
             actionsVariant={actionsVariant}
             job={job}
             disabled={disabled}
+            cancelDisabled={cancelDisabled}
           />
         </div>
       </div>

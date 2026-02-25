@@ -18,6 +18,11 @@
  *   - cargo list now includes active statuses too
  *   - weight display prefers assignment.payload_remaining_kg when available
  *   - remainder cargo stays visible after one run is confirmed instead of disappearing
+ *
+ * Additional update:
+ * - Fixed Staging Cargo filtering so trailer jobs only appear in Cargo while still assigned.
+ *   Once they move to active phases (picking_load, in_progress, etc.), they no longer remain in Cargo.
+ *   Load-cargo jobs still stay visible while there is remaining payload.
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -843,6 +848,10 @@ export default function StagingTabs(): JSX.Element {
    *
    * Updated for multi-run continuity:
    * includes active statuses so remaining payload jobs stay visible after a run starts.
+   *
+   * Updated cargo filtering behavior:
+   * - trailer_cargo: only show while status is still "assigned"
+   * - load_cargo: keep visible while there is remaining payload
    */
   async function fetchAssignedJobs(overrideCompanyId?: string) {
     setLoadingCargo(true)
@@ -897,12 +906,35 @@ export default function StagingTabs(): JSX.Element {
           'delivering',
           'DELIVERING',
         ])
-        .gt('job_offer.remaining_payload', 0)
         .order('accepted_at', { ascending: false })
 
       if (error) throw error
 
-      setCargoJobs(Array.isArray(data) ? data : [])
+      const normalized = Array.isArray(data) ? data : []
+
+      // Keep Cargo list aligned with My Jobs behavior:
+      // - trailer_cargo: one-run jobs should only appear before activation (status=assigned)
+      // - load_cargo: keep visible while there is remaining payload
+      const filtered = normalized.filter((row: any) => {
+        const job = row?.job_offer ?? {}
+        const mode = String(job?.transport_mode ?? '').toLowerCase()
+        const status = String(row?.status ?? '').toLowerCase()
+
+        if (mode === 'trailer_cargo') {
+          return status === 'assigned'
+        }
+
+        const rowRemaining = Number(row?.payload_remaining_kg ?? NaN)
+        if (Number.isFinite(rowRemaining)) return rowRemaining > 0
+
+        const offerRemaining = Number(job?.remaining_payload ?? NaN)
+        if (Number.isFinite(offerRemaining)) return offerRemaining > 0
+
+        const offerWeight = Number(job?.weight_kg ?? NaN)
+        return Number.isFinite(offerWeight) && offerWeight > 0
+      })
+
+      setCargoJobs(filtered)
     } catch (e: any) {
       setCargoError(e?.message ?? 'Failed to load cargo')
       setCargoJobs([])

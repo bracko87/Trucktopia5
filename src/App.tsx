@@ -80,6 +80,13 @@ import LeaseTruckButtonHider from './components/leases/LeaseTruckButtonHider'
  */
 import RemoveAssemblerBox from './components/patches/RemoveAssemblerBox'
 
+/**
+ * HideQuickCreateButton
+ *
+ * Runtime DOM patcher to hide "Quick Create" buttons (preserves layout).
+ */
+import HideQuickCreateButton from './components/patches/HideQuickCreateButton'
+
 import './lib/safeInsertPatch'
 import './lib/removeChildSafePatch'
 import './services/abortRpcPatch'
@@ -148,6 +155,9 @@ export default function App() {
 
             {/* Remove unwanted assembler summary box */}
             <RemoveAssemblerBox />
+
+            {/* Hide any dynamically-inserted "Quick Create" buttons (preserves layout) */}
+            <HideQuickCreateButton />
 
             <LocalizationPatch />
 

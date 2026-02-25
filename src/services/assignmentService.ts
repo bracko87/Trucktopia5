@@ -55,7 +55,8 @@ export interface FinalizeAssignmentOpts {
  * 2b) For multi-run load cargo jobs, create/update a follow-up assigned row with remaining payload.
  * 2c) Keep job_offers.remaining_payload in sync with the computed remainder.
  * 3) Insert a driving_sessions row (phase = 'TO_PICKUP') linked to the updated assignment
- *    only if no driving session already exists for that assignment. This is REQUIRED and will throw on failure.
+ *    only if no driving session already exists for that assignment.
+ *    If insert is blocked by RLS, continue without a session row (warn only).
  * 4) Update user_trucks / user_trailers statuses to 'PICKING_LOAD' when provided.
  * 5) Update only the selected hired_staff rows (by id) to activity_id = 'assigned'.
  *
@@ -101,12 +102,19 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
 
   const acceptedAt = new Date().toISOString()
 
+  const selectedDriverId =
+    Array.isArray(assignment?.drivers) && assignment.drivers.length > 0
+      ? String(assignment.drivers[0]?.id ?? '') || null
+      : null
+
   // Prepare minimal update payload for the assignment
   const updatePayload: any = {
     user_truck_id: userTruckId ?? null,
+    user_trailer_id: trailerId ?? null,
+    // job_assignments.user_id usually references auth/public users; keep actor user id here.
     user_id: userId ?? null,
     accepted_at: acceptedAt,
-    // Normalize assignment status casing for environments using lowercase enums.
+    // Use consistent enum casing to match truck status updates and DB expectations.
     status: 'picking_load',
   }
 
@@ -213,11 +221,15 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     }
   }
 
+  // Fixed duplicate “leftover cargo card” issue for multi-run load jobs:
+  // - Active run row: payload_remaining_kg = 0
+  // - Follow-up assigned row: keeps remaining payload
   const assignedPayload = Math.max(
     0,
     Math.min(sourcePayload, resolvedTruckCapacity > 0 ? resolvedTruckCapacity : sourcePayload)
   )
   const remainingPayload = Math.max(0, sourcePayload - assignedPayload)
+  const isLoadCargo = String(jobOfferRow?.transport_mode ?? '').toLowerCase() === 'load_cargo'
 
   // Helper: resolve another owned truck id for follow-up "waiting" rows when the primary truck
   // conflicts with a unique active-assignment constraint.
@@ -267,14 +279,16 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   }
 
   // Step 2 — Update the existing assignment (do NOT insert)
-  const updateDoc: any = {
+  const updateDoc = {
     user_truck_id: updatePayload.user_truck_id,
+    user_trailer_id: updatePayload.user_trailer_id,
     user_id: updatePayload.user_id,
     accepted_at: updatePayload.accepted_at,
     status: updatePayload.status,
     assignment_preview_id: previewData?.id ?? existingAssignment?.assignment_preview_id ?? null,
     assigned_payload_kg: assignedPayload,
-    payload_remaining_kg: remainingPayload,
+    // Active run row should represent this run payload; keep remaining payload on follow-up assigned rows.
+    payload_remaining_kg: isLoadCargo ? 0 : remainingPayload,
   }
 
   let { data: assignmentRow, error: updateErr } = await supabase
@@ -371,7 +385,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   }
 
   // Step 2b — For multi-run load cargo, create follow-up waiting assignment with remaining payload.
-  if (String(jobOfferRow?.transport_mode ?? '').toLowerCase() === 'load_cargo' && remainingPayload > 0) {
+  if (isLoadCargo && remainingPayload > 0) {
     const { data: existingFollowUp } = await supabase
       .from('job_assignments')
       .select('id')
@@ -385,7 +399,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
 
     const baseFollowUpPayload: any = {
       carrier_company_id: resolvedCarrierCompanyId,
-      user_id: userId ?? null,
+      user_id: updatePayload.user_id ?? null,
       user_truck_id: null,
       user_trailer_id: null,
       accepted_at: acceptedAt,
@@ -501,7 +515,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     console.error('finalizeAssignmentDirect: job_offers update exception', e)
   }
 
-  // Step 3 — Insert driving_sessions (required for finalized flow; retry lowercase phase for schema/env differences)
+  // Step 3 — Insert driving_sessions
   try {
     const drivingPayload: any = {
       job_assignment_id: assignmentRow.id,
@@ -512,6 +526,9 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
       total_distance_km: distance ?? assignment?.cargo?.job_offer?.distance_km ?? null,
       distance_completed_km: 0,
       phase_started_at: acceptedAt,
+      user_truck_id: userTruckId ?? null,
+      user_trailer_id: trailerId ?? null,
+      driver_id: selectedDriverId ?? null,
     }
 
     /**
@@ -527,36 +544,55 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     if (existingSessionErr) {
       // eslint-disable-next-line no-console
       console.error('finalizeAssignmentDirect: failed to check existing driving_sessions', existingSessionErr)
-      throw existingSessionErr
     }
 
     if (!existingSession) {
-      let insertRes = await supabase.from('driving_sessions').insert(drivingPayload)
+      const drivingPayloadVariants: any[] = [
+        drivingPayload,
+        { ...drivingPayload, phase: 'to_pickup' },
+        {
+          job_assignment_id: assignmentRow.id,
+          phase: 'to_pickup',
+          origin_city_id: drivingPayload.origin_city_id,
+          target_city_id: drivingPayload.target_city_id,
+          current_city_id: drivingPayload.current_city_id,
+          total_distance_km: drivingPayload.total_distance_km,
+          distance_completed_km: 0,
+          phase_started_at: acceptedAt,
+        },
+      ]
 
-      // Some environments require lowercase enum/text phase values.
-      if (insertRes.error) {
-        const retryPayload = { ...drivingPayload, phase: 'to_pickup' }
-        insertRes = await supabase.from('driving_sessions').insert(retryPayload)
+      let insertRes: any = null
+      for (const payload of drivingPayloadVariants) {
+        insertRes = await supabase.from('driving_sessions').insert(payload)
+        if (!insertRes.error) break
+
+        const code = String(insertRes.error?.code ?? '')
+        const msg = String(insertRes.error?.message ?? '').toLowerCase()
+        if (code !== '42703' && !msg.includes('column') && !msg.includes('schema cache')) {
+          break
+        }
       }
 
-      if (insertRes.error) {
+      if (insertRes?.error) {
         const errMsg = String(insertRes.error?.message ?? '').toLowerCase()
         const errCode = String(insertRes.error?.code ?? '')
-        const isRlsInsertError = errCode === '42501' || errMsg.includes('row-level security policy')
+        const isRlsInsertError =
+          errCode === '42501' ||
+          errMsg.includes('row-level security policy') ||
+          errMsg.includes('permission denied')
 
         if (isRlsInsertError) {
           // eslint-disable-next-line no-console
-          console.error(
-            'finalizeAssignmentDirect: driving_sessions insert blocked by RLS; aborting finalization',
+          console.warn(
+            'finalizeAssignmentDirect: driving_sessions insert blocked by RLS; continuing without session',
             insertRes.error
           )
         } else {
           // eslint-disable-next-line no-console
           console.error('finalizeAssignmentDirect: failed to insert driving_sessions', insertRes.error)
+          throw insertRes.error
         }
-
-        // driving_sessions is required for active movement lifecycle
-        throw insertRes.error
       }
     } else {
       // eslint-disable-next-line no-console
@@ -567,18 +603,17 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   } catch (e: any) {
     const msg = String(e?.message ?? '').toLowerCase()
     const code = String(e?.code ?? '')
-    const isRlsInsertError = code === '42501' || msg.includes('row-level security policy')
+    const isRlsInsertError =
+      code === '42501' || msg.includes('row-level security policy') || msg.includes('permission denied')
 
     if (isRlsInsertError) {
       // eslint-disable-next-line no-console
-      console.error('finalizeAssignmentDirect: driving_sessions insert exception caused by RLS; aborting', e)
+      console.warn('finalizeAssignmentDirect: driving_sessions insert exception caused by RLS; continuing', e)
     } else {
       // eslint-disable-next-line no-console
       console.error('finalizeAssignmentDirect: driving_sessions insert exception', e)
+      throw e
     }
-
-    // driving_sessions is required for active movement lifecycle
-    throw e
   }
 
   // Step 4 — Update truck status

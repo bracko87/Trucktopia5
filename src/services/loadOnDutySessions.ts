@@ -40,6 +40,11 @@ function buildDisplayName(row: any): string | null {
  * - This fallback builds session-shaped rows from active job_assignments so Staging Active
  *   remains usable.
  * - It is NOT a full replacement for proper movement tracking / triggers on driving_sessions.
+ *
+ * UPDATE:
+ * - Improved Active-name hydration in fallback mode: fallback rows now load and attach
+ *   truck/trailer/driver objects by backend IDs (user_trucks, user_trailers, hired_staff/users)
+ *   so Active details can show names instead of —.
  */
 async function loadActiveAssignmentsFallback(companyId: string) {
   // IMPORTANT: Do not include plain "assigned" here.
@@ -94,6 +99,144 @@ async function loadActiveAssignmentsFallback(companyId: string) {
     return []
   }
 
+  // ---- NEW: hydrate related entities (trucks/trailers/drivers) for fallback rows ----
+  const truckIds = Array.from(new Set(rows.map((r: any) => r?.user_truck_id).filter(Boolean).map(String)))
+  const trailerIds = Array.from(new Set(rows.map((r: any) => r?.user_trailer_id).filter(Boolean).map(String)))
+  const userIds = Array.from(new Set(rows.map((r: any) => r?.user_id).filter(Boolean).map(String)))
+
+  const truckMap: Record<string, any> = {}
+  const trailerMap: Record<string, any> = {}
+  const driverMap: Record<string, any> = {}
+
+  if (truckIds.length > 0) {
+    const truckSelectVariants = [
+      'id,registration,owner_company_id,master_truck:master_truck_id(name)',
+      'id,name,registration,owner_company_id',
+      'id,registration,owner_company_id',
+    ]
+
+    for (const selectClause of truckSelectVariants) {
+      const { data: trucks, error: truckErr } = await supabase
+        .from('user_trucks')
+        .select(selectClause)
+        .in('id', truckIds)
+
+      if (truckErr) {
+        // schema drift: retry with next variant
+        if (
+          String(truckErr?.code ?? '') === '42703' ||
+          String(truckErr?.code ?? '').startsWith('PGRST') ||
+          String(truckErr?.message ?? '').toLowerCase().includes('relationship')
+        ) {
+          continue
+        }
+        break
+      }
+
+      if (Array.isArray(trucks)) {
+        trucks.forEach((t: any) => {
+          if (!t?.id) return
+          truckMap[String(t.id)] = {
+            ...t,
+            name: t?.master_truck?.name ?? buildDisplayName(t),
+            display_name: t?.master_truck?.name ?? buildDisplayName(t),
+          }
+        })
+      }
+      break
+    }
+  }
+
+  if (trailerIds.length > 0) {
+    const trailerSelectVariants = ['id,name,registration', 'id,registration', 'id,name']
+    for (const selectClause of trailerSelectVariants) {
+      const { data: trailers, error: trailerErr } = await supabase
+        .from('user_trailers')
+        .select(selectClause)
+        .in('id', trailerIds)
+
+      if (trailerErr) {
+        // schema drift: retry with next variant
+        if (
+          String(trailerErr?.code ?? '') === '42703' ||
+          String(trailerErr?.code ?? '').startsWith('PGRST') ||
+          String(trailerErr?.message ?? '').toLowerCase().includes('relationship')
+        ) {
+          continue
+        }
+        break
+      }
+
+      if (Array.isArray(trailers)) {
+        trailers.forEach((tr: any) => {
+          if (!tr?.id) return
+          trailerMap[String(tr.id)] = {
+            ...tr,
+            name: buildDisplayName(tr),
+            display_name: buildDisplayName(tr),
+          }
+        })
+      }
+      break
+    }
+  }
+
+  if (userIds.length > 0) {
+    const hiredSelectVariants = [
+      'id,user_id,first_name,last_name,name',
+      'id,first_name,last_name,name',
+      'id,user_id,name',
+    ]
+
+    for (const selectClause of hiredSelectVariants) {
+      const hasUserIdColumn = selectClause.includes('user_id')
+      const staffQuery = supabase.from('hired_staff').select(selectClause)
+
+      const { data: hs, error: hsErr } = hasUserIdColumn
+        ? await staffQuery.or(`id.in.(${userIds.join(',')}),user_id.in.(${userIds.join(',')})`)
+        : await staffQuery.in('id', userIds)
+
+      if (hsErr) {
+        // schema drift: retry with next variant
+        if (
+          String(hsErr?.code ?? '') === '42703' ||
+          String(hsErr?.code ?? '').startsWith('PGRST') ||
+          String(hsErr?.message ?? '').toLowerCase().includes('relationship')
+        ) {
+          continue
+        }
+        break
+      }
+
+      if (Array.isArray(hs)) {
+        hs.forEach((h: any) => {
+          const normalized = { ...h, name: buildDisplayName(h), display_name: buildDisplayName(h) }
+          if (h?.id) driverMap[String(h.id)] = normalized
+          if (h?.user_id) driverMap[String(h.user_id)] = normalized
+        })
+      }
+      break
+    }
+
+    const unresolved = userIds.filter((id) => !driverMap[id])
+    if (unresolved.length > 0) {
+      const { data: users, error: usersErr } = await supabase
+        .from('users')
+        .select('id,first_name,last_name,name,email')
+        .in('id', unresolved)
+
+      if (usersErr) {
+        console.warn('loadOnDutySessions: users fallback load returned error (fallback mode)', usersErr)
+      } else if (Array.isArray(users)) {
+        users.forEach((u: any) => {
+          if (!u?.id) return
+          driverMap[String(u.id)] = { ...u, name: buildDisplayName(u), display_name: buildDisplayName(u) }
+        })
+      }
+    }
+  }
+  // ---- END NEW hydration ----
+
   return rows.map((a: any) => ({
     id: `fallback-${a.id}`,
     job_assignment_id: a.id,
@@ -103,11 +246,21 @@ async function loadActiveAssignmentsFallback(companyId: string) {
     phase_started_at: a.accepted_at ?? null,
     created_at: a.accepted_at ?? null,
     user_truck_id: a.user_truck_id ?? null,
+    user_trailer_id: a.user_trailer_id ?? null,
     driver_id: a.user_id ?? null,
     relocation_ready_at: null,
-    user_truck: null,
+
+    // NEW: attach hydrated truck on the session row too
+    user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
+
     job_assignment: {
       ...a,
+
+      // NEW: attach hydrated entities so UI can show names/details
+      user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
+      user_trailer: a.user_trailer_id ? trailerMap[String(a.user_trailer_id)] ?? null : null,
+      driver: a.user_id ? driverMap[String(a.user_id)] ?? null : null,
+
       resolved_reward:
         a.final_reward ??
         (a?.job_offer?.transport_mode === 'trailer_cargo'
@@ -150,7 +303,8 @@ export async function loadOnDutySessions(companyId?: string | null) {
   try {
     // STEP 1: sessions only (safe select)
     // NOTE: Do NOT request non-existing columns - a single bad column breaks the whole query.
-    // Some environments drifted from user_truck_id -> truck_id, so try both and normalize.
+    // Some environments drifted from user_truck_id -> truck_id and user_trailer_id -> trailer_id,
+    // so try both and normalize.
     // Some environments are more limited; final fallback variant requests only minimal columns.
     console.debug('loadOnDutySessions: fetching driving_sessions (step 1)')
 
@@ -163,6 +317,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
         'phase_started_at',
         'created_at',
         'user_truck_id',
+        'user_trailer_id',
         'job_assignment_id',
         'driver_id',
         'relocation_ready_at',
@@ -175,6 +330,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
         'phase_started_at',
         'created_at',
         'truck_id',
+        'trailer_id',
         'job_assignment_id',
         'driver_id',
         'relocation_ready_at',
@@ -207,6 +363,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
           ? res.data.map((row: any) => ({
               ...row,
               user_truck_id: row?.user_truck_id ?? row?.truck_id ?? null,
+              user_trailer_id: row?.user_trailer_id ?? row?.trailer_id ?? null,
             }))
           : []
         sessErr = null
@@ -214,14 +371,31 @@ export async function loadOnDutySessions(companyId?: string | null) {
       }
 
       const code = String(res.error?.code ?? '')
-      if (code !== '42703') {
+      const msg = String(res.error?.message ?? '').toLowerCase()
+
+      // Retry on schema/relation drift, stop on policy errors.
+      if (
+        code === '42501' ||
+        msg.includes('row-level security policy') ||
+        msg.includes('permission denied')
+      ) {
         sessErr = res.error
         break
       }
 
-      // Schema drift (missing column in this variant) — try next variant.
-      console.warn('loadOnDutySessions: select variant hit 42703, trying next variant', res.error)
+      // Schema drift / relation mismatch — try next variant before failing.
+      if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
+        console.warn(
+          'loadOnDutySessions: select variant schema/relation mismatch, trying next variant',
+          res.error
+        )
+        sessErr = res.error
+        continue
+      }
+
+      // Unknown error: stop retry loop and handle below.
       sessErr = res.error
+      break
     }
 
     if (sessErr) {
@@ -244,9 +418,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
 
     console.debug(`loadOnDutySessions: sessions fetched = ${sessions.length}`)
 
-    const assignmentIds = Array.from(
-      new Set(sessions.map((s: any) => s.job_assignment_id).filter(Boolean))
-    )
+    const assignmentIds = Array.from(new Set(sessions.map((s: any) => s.job_assignment_id).filter(Boolean)))
 
     console.debug(`loadOnDutySessions: derived assignmentIds = ${assignmentIds.length}`)
 
@@ -294,9 +466,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
     }
 
     if (!Array.isArray(assignments)) {
-      console.debug(
-        'loadOnDutySessions: assignments is not an array — returning sessions-only fallback'
-      )
+      console.debug('loadOnDutySessions: assignments is not an array — returning sessions-only fallback')
       return sessions
     }
 
@@ -315,10 +485,11 @@ export async function loadOnDutySessions(companyId?: string | null) {
       if (a.user_id) userIds.add(String(a.user_id))
     })
 
-    // Add drivers and trucks referenced on sessions (some schemas put these on the session row)
+    // Add drivers/trucks/trailers referenced on sessions (some schemas put these on the session row)
     sessions.forEach((s: any) => {
       if (s.driver_id) userIds.add(String(s.driver_id))
       if (s.user_truck_id) truckIds.add(String(s.user_truck_id))
+      if (s.user_trailer_id) trailerIds.add(String(s.user_trailer_id))
     })
 
     console.debug(
@@ -350,11 +521,9 @@ export async function loadOnDutySessions(companyId?: string | null) {
 
           if (truckErr) {
             const code = String(truckErr?.code ?? '')
-            if (code === '42703') {
-              console.debug(
-                'loadOnDutySessions: retry user_trucks select with fallback columns',
-                selectClause
-              )
+            const msg = String(truckErr?.message ?? '').toLowerCase()
+            if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
+              console.debug('loadOnDutySessions: retry user_trucks select with fallback columns', selectClause)
               continue
             }
             console.warn('loadOnDutySessions: trucks load returned error', truckErr)
@@ -386,25 +555,40 @@ export async function loadOnDutySessions(companyId?: string | null) {
       try {
         const ids = Array.from(trailerIds)
         console.debug('loadOnDutySessions: fetching user_trailers for ids', ids)
-        const { data: trailers, error: trailerErr } = await supabase
-          .from('user_trailers')
-          .select('id,name,registration')
-          .in('id', ids)
 
-        if (trailerErr) {
-          console.warn('loadOnDutySessions: trailers load returned error', trailerErr)
-        } else if (Array.isArray(trailers)) {
-          trailers.forEach((tr: any) => {
-            if (tr?.id) {
-              const readableName = buildDisplayName(tr)
-              trailerMap[String(tr.id)] = {
-                ...tr,
-                name: readableName ?? tr?.name ?? null,
-                display_name: readableName,
-              }
+        const trailerSelectVariants = ['id,name,registration', 'id,registration', 'id,name']
+
+        for (const selectClause of trailerSelectVariants) {
+          const { data: trailers, error: trailerErr } = await supabase
+            .from('user_trailers')
+            .select(selectClause)
+            .in('id', ids)
+
+          if (trailerErr) {
+            const code = String(trailerErr?.code ?? '')
+            const msg = String(trailerErr?.message ?? '').toLowerCase()
+            if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
+              console.debug('loadOnDutySessions: retry user_trailers select with fallback columns', selectClause)
+              continue
             }
-          })
-          console.debug(`loadOnDutySessions: trailers loaded = ${Object.keys(trailerMap).length}`)
+            console.warn('loadOnDutySessions: trailers load returned error', trailerErr)
+            break
+          }
+
+          if (Array.isArray(trailers)) {
+            trailers.forEach((tr: any) => {
+              if (tr?.id) {
+                const readableName = buildDisplayName(tr)
+                trailerMap[String(tr.id)] = {
+                  ...tr,
+                  name: readableName ?? tr?.name ?? null,
+                  display_name: readableName,
+                }
+              }
+            })
+            console.debug(`loadOnDutySessions: trailers loaded = ${Object.keys(trailerMap).length}`)
+          }
+          break
         }
       } catch (e) {
         console.warn('loadOnDutySessions: trailers load failed', e)
@@ -424,22 +608,19 @@ export async function loadOnDutySessions(companyId?: string | null) {
           'id,user_id,name',
         ]
 
-        let hiredStaffLoaded = false
-
-        // Preferred path: resolve by both hired_staff.id and hired_staff.user_id
         for (const selectClause of hiredStaffSelectVariants) {
-          const { data: hs, error: hsErr } = await supabase
-            .from('hired_staff')
-            .select(selectClause)
-            .or(`id.in.(${ids.join(',')}),user_id.in.(${ids.join(',')})`)
+          const hasUserIdColumn = selectClause.includes('user_id')
+          const staffQuery = supabase.from('hired_staff').select(selectClause)
+
+          const { data: hs, error: hsErr } = hasUserIdColumn
+            ? await staffQuery.or(`id.in.(${ids.join(',')}),user_id.in.(${ids.join(',')})`)
+            : await staffQuery.in('id', ids)
 
           if (hsErr) {
             const code = String(hsErr?.code ?? '')
-            if (code === '42703') {
-              console.debug(
-                'loadOnDutySessions: retry hired_staff select with fallback columns',
-                selectClause
-              )
+            const msg = String(hsErr?.message ?? '').toLowerCase()
+            if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
+              console.debug('loadOnDutySessions: retry hired_staff select with fallback columns', selectClause)
               continue
             }
             console.warn('loadOnDutySessions: hired_staff load returned error', hsErr)
@@ -459,36 +640,31 @@ export async function loadOnDutySessions(companyId?: string | null) {
             })
             console.debug(`loadOnDutySessions: hired_staff loaded = ${Object.keys(driverMap).length}`)
           }
-
-          hiredStaffLoaded = true
           break
         }
+      } catch (e) {
+        console.warn('loadOnDutySessions: hired_staff load failed', e)
+      }
 
-        // Fallback path for schemas without hired_staff.user_id:
-        // query by hired_staff.id only so we still hydrate names where possible.
-        if (!hiredStaffLoaded) {
-          console.debug(
-            'loadOnDutySessions: hired_staff dual-key lookup unavailable; retrying by hired_staff.id only'
-          )
+      // Extra hardening: id-only fallback for schemas where hired_staff.user_id is unavailable
+      const unresolved = ids.filter((id) => !driverMap[id])
+      if (unresolved.length > 0) {
+        try {
+          console.debug('loadOnDutySessions: hired_staff id-only fallback for unresolved ids', unresolved)
 
-          const idOnlySelectVariants = [
-            'id,first_name,last_name,name',
-            'id,name',
-          ]
+          const idOnlySelectVariants = ['id,first_name,last_name,name', 'id,name']
 
           for (const selectClause of idOnlySelectVariants) {
             const { data: hs, error: hsErr } = await supabase
               .from('hired_staff')
               .select(selectClause)
-              .in('id', ids)
+              .in('id', unresolved)
 
             if (hsErr) {
               const code = String(hsErr?.code ?? '')
-              if (code === '42703') {
-                console.debug(
-                  'loadOnDutySessions: retry hired_staff id-only select with fallback columns',
-                  selectClause
-                )
+              const msg = String(hsErr?.message ?? '').toLowerCase()
+              if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
+                console.debug('loadOnDutySessions: retry hired_staff id-only select with fallback columns', selectClause)
                 continue
               }
               console.warn('loadOnDutySessions: hired_staff id-only load returned error', hsErr)
@@ -504,25 +680,23 @@ export async function loadOnDutySessions(companyId?: string | null) {
                 }
                 if (h?.id) driverMap[String(h.id)] = normalized
               })
-              console.debug(
-                `loadOnDutySessions: hired_staff id-only loaded = ${Object.keys(driverMap).length}`
-              )
+              console.debug(`loadOnDutySessions: hired_staff id-only loaded = ${Object.keys(driverMap).length}`)
             }
             break
           }
+        } catch (e) {
+          console.warn('loadOnDutySessions: hired_staff id-only fallback failed', e)
         }
-      } catch (e) {
-        console.warn('loadOnDutySessions: hired_staff load failed', e)
       }
 
-      const unresolved = ids.filter((id) => !driverMap[id])
-      if (unresolved.length > 0) {
+      const stillUnresolved = ids.filter((id) => !driverMap[id])
+      if (stillUnresolved.length > 0) {
         try {
-          console.debug('loadOnDutySessions: fetching public.users fallback for ids', unresolved)
+          console.debug('loadOnDutySessions: fetching public.users fallback for ids', stillUnresolved)
           const { data: users, error: usersErr } = await supabase
             .from('users')
             .select('id,first_name,last_name,name,email')
-            .in('id', unresolved)
+            .in('id', stillUnresolved)
 
           if (usersErr) {
             console.warn('loadOnDutySessions: users fallback load returned error', usersErr)
@@ -537,9 +711,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
                 }
               }
             })
-            console.debug(
-              `loadOnDutySessions: users fallback loaded = ${Object.keys(driverMap).length}`
-            )
+            console.debug(`loadOnDutySessions: users fallback loaded = ${Object.keys(driverMap).length}`)
           }
         } catch (e) {
           console.warn('loadOnDutySessions: users fallback load failed', e)
@@ -610,9 +782,13 @@ export async function loadOnDutySessions(companyId?: string | null) {
           (truckFromAssignmentId ? truckMap[truckFromAssignmentId] ?? null : null) ??
           (truckFromSessionId ? truckMap[truckFromSessionId] ?? null : null)
 
-        const trailer = assignment.user_trailer_id
-          ? trailerMap[String(assignment.user_trailer_id)] ?? null
-          : null
+        // Trailer: prefer assignment-level trailer, then session-level trailer fallback
+        const trailerFromAssignmentId = assignment.user_trailer_id ? String(assignment.user_trailer_id) : null
+        const trailerFromSessionId = s.user_trailer_id ? String(s.user_trailer_id) : null
+
+        const trailer =
+          (trailerFromAssignmentId ? trailerMap[trailerFromAssignmentId] ?? null : null) ??
+          (trailerFromSessionId ? trailerMap[trailerFromSessionId] ?? null : null)
 
         // Driver resolution: prefer assignment.user_id, then session-level driver_id
         let driver = (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ?? null
@@ -636,10 +812,12 @@ export async function loadOnDutySessions(companyId?: string | null) {
         }
       })
       // Filter to active sessions using phase first, then assignment status fallback.
+      // IMPORTANT: exclude raw "assigned" (accepted but not started) from Staging Active.
       .filter((row: any) => {
         const phaseRaw = row.phase ?? row.job_assignment?.status ?? ''
         const normalized = String(phaseRaw).trim().toLowerCase().replace(/[\s-]/g, '_')
         if (!normalized) return false
+        if (normalized === 'assigned') return false
         return !terminalPhases.has(normalized)
       })
       // Company ownership filter (only filter if assignment exists)
