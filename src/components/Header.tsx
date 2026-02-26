@@ -122,6 +122,8 @@ async function fetchNotificationsByReadState(
 }
 
 async function markNotificationRead(id: string): Promise<boolean> {
+  if (!id) return false
+
   try {
     const { error } = await supabase
       .from('notifications')
@@ -151,13 +153,67 @@ async function markAllNotificationsRead(userIds: string[]): Promise<boolean> {
   }
 }
 
-function formatDateTime(value?: string | null): string {
-  if (!value) return '—'
+/**
+ * formatDateTime
+ *
+ * Defensive date formatting for unknown / malformed values.
+ */
+function formatDateTime(iso: unknown): string {
+  if (typeof iso !== 'string' || iso.length === 0) return 'Unknown time'
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) return iso
+  return dt.toLocaleString()
+}
 
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return String(value)
+/**
+ * toRenderItems
+ *
+ * Filters out invalid rows before they reach the render map.
+ */
+function toRenderItems(items: AppNotification[]): AppNotification[] {
+  return items.filter((item) => !!item && typeof item === 'object')
+}
 
-  return d.toLocaleString()
+/**
+ * deriveTypeConfigSafe
+ *
+ * Safely resolves notification type config. Falls back to a generic readable
+ * config if the helper binding throws, is missing, or the row contains a bad type.
+ */
+function deriveTypeConfigSafe(rawType: unknown) {
+  try {
+    if (typeof getNotificationTypeConfig === 'function') {
+      return getNotificationTypeConfig(rawType)
+    }
+  } catch {
+    // ignore
+  }
+
+  const type = typeof rawType === 'string' && rawType.trim().length > 0 ? rawType : 'UNKNOWN'
+  return {
+    type,
+    label: type.split('_').join(' ').toLowerCase(),
+    category: type.toUpperCase().startsWith('ADMIN') ? 'admin' : 'game',
+  } as const
+}
+
+/**
+ * deriveActionSafe
+ *
+ * Safely derives the row action while sanitizing entity ids so malformed rows
+ * do not break the popup render path.
+ */
+function deriveActionSafe(rawType: unknown, entityId: unknown) {
+  try {
+    if (typeof getNotificationAction === 'function') {
+      const safeEntity = typeof entityId === 'string' ? entityId : null
+      return getNotificationAction(rawType, safeEntity)
+    }
+  } catch {
+    // ignore
+  }
+
+  return null
 }
 
 /**
@@ -183,6 +239,7 @@ export default function Header(): JSX.Element {
   const [unreadItems, setUnreadItems] = useState<AppNotification[]>([])
   const [readItems, setReadItems] = useState<AppNotification[]>([])
   const [loadingNotifications, setLoadingNotifications] = useState<boolean>(false)
+  const [panelError, setPanelError] = useState<string | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
 
   /**
@@ -233,10 +290,13 @@ export default function Header(): JSX.Element {
       setUnreadCount(0)
       setUnreadItems([])
       setReadItems([])
+      setPanelError(null)
       return
     }
 
     setLoadingNotifications(true)
+    setPanelError(null)
+
     try {
       const [count, unread, read] = await Promise.all([
         countUnreadNotifications(ids),
@@ -245,8 +305,10 @@ export default function Header(): JSX.Element {
       ])
 
       setUnreadCount(count)
-      setUnreadItems(unread)
-      setReadItems(read)
+      setUnreadItems(toRenderItems(unread))
+      setReadItems(toRenderItems(read))
+    } catch {
+      setPanelError('Failed to load notifications.')
     } finally {
       setLoadingNotifications(false)
     }
@@ -317,7 +379,7 @@ export default function Header(): JSX.Element {
   }, [openPanel])
 
   async function handleMarkOneAsRead(id: string) {
-    if (!userIds.length) return
+    if (!userIds.length || !id) return
     const ok = await markNotificationRead(id)
     if (!ok) return
     await reloadNotifications(userIds)
@@ -397,20 +459,23 @@ export default function Header(): JSX.Element {
                 </div>
 
                 <div className="overflow-y-auto max-h-[52vh]">
-                  {loadingNotifications ? (
+                  {panelError ? (
+                    <div className="p-4 text-sm text-red-600">{panelError}</div>
+                  ) : loadingNotifications ? (
                     <div className="p-4 text-sm text-slate-500">Loading notifications…</div>
                   ) : currentItems.length === 0 ? (
-                    <div className="p-4 text-sm text-slate-500">
-                      No {activeTab} notifications.
-                    </div>
+                    <div className="p-4 text-sm text-slate-500">No {activeTab} notifications.</div>
                   ) : (
                     <ul className="divide-y divide-slate-200">
-                      {currentItems.map((item) => {
-                        const typeConfig = getNotificationTypeConfig(item.type)
-                        const action = getNotificationAction(item.type, item.entity_id)
+                      {currentItems.map((item, index) => {
+                        const typeConfig = deriveTypeConfigSafe(item?.type)
+                        const action = deriveActionSafe(item?.type, item?.entity_id)
 
                         return (
-                          <li key={item.id} className="p-3">
+                          <li
+                            key={item?.id || `${item?.created_at || 'row'}-${index}`}
+                            className="p-3"
+                          >
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0">
                                 <div className="flex items-center gap-2 mb-1">
@@ -423,15 +488,18 @@ export default function Header(): JSX.Element {
                                   >
                                     {typeConfig.category === 'admin' ? 'Admin' : 'Game'}
                                   </span>
+
                                   <span className="text-[10px] uppercase tracking-wide text-slate-500">
                                     {typeConfig.label}
                                   </span>
                                 </div>
 
-                                <p className="text-xs text-slate-900">{item.message ?? 'No message'}</p>
+                                <p className="text-xs text-slate-900">
+                                  {item?.message || 'Notification'}
+                                </p>
 
                                 <p className="text-[10px] text-slate-500 mt-1">
-                                  {formatDateTime(item.created_at)}
+                                  {formatDateTime(item?.created_at)}
                                 </p>
                               </div>
 
@@ -448,11 +516,13 @@ export default function Header(): JSX.Element {
                                     {action.label}
                                   </button>
                                 ) : null}
+
                                 {activeTab === 'unread' ? (
                                   <button
                                     type="button"
-                                    onClick={() => void handleMarkOneAsRead(item.id)}
+                                    onClick={() => void handleMarkOneAsRead(item?.id || '')}
                                     className="text-[10px] px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 whitespace-nowrap"
+                                    disabled={!item?.id}
                                   >
                                     Mark read
                                   </button>

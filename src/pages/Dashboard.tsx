@@ -45,7 +45,17 @@ interface AssignmentRow {
   pickup_city?: string | null
   destination_city?: string | null
   delivery_city?: string | null
+
+  // possible status fields
   status?: string | null
+  assignment_status?: string | null
+  state?: string | null
+
+  // possible company reference fields
+  company_id?: string | null
+  owner_company_id?: string | null
+  assigned_company_id?: string | null
+
   updated_at?: string | null
   created_at?: string | null
   payout?: number | null
@@ -72,6 +82,24 @@ interface GameNewsRow {
   updated_at?: string | null
   published_at?: string | null
 }
+
+/**
+ * Local fallback until a real public.game_news table exists.
+ */
+const DEFAULT_GAME_NEWS: GameNewsRow[] = [
+  {
+    id: 'local-news-1',
+    title: 'Game news feed not connected yet',
+    summary: 'Create a public game news table or connect the dashboard to your real news source.',
+    created_at: new Date().toISOString(),
+  },
+  {
+    id: 'local-news-2',
+    title: 'Dashboard fallback mode active',
+    summary: 'This placeholder prevents 404 errors until a real news source is available.',
+    created_at: new Date().toISOString(),
+  },
+]
 
 /**
  * DashboardPage
@@ -128,19 +156,35 @@ export default function DashboardPage() {
   /**
    * fetchActiveAssignments
    *
-   * Expects a table named public.job_assignments with company_id + status.
-   * If your real table name differs, update only this query.
+   * Uses a safe fallback approach: fetches a recent batch and filters client-side,
+   * so the dashboard will not fail if company/status column names differ.
    */
   const fetchActiveAssignments = useCallback(
     async (companyId: string): Promise<AssignmentRow[]> => {
       try {
-        const res = await getTable(
-          'job_assignments',
-          `?select=*&company_id=eq.${companyId}&status=eq.active&limit=5`,
-        )
-
+        const res = await getTable('job_assignments', '?select=*&limit=25')
         const data = Array.isArray(res.data) ? (res.data as AssignmentRow[]) : []
-        return data
+
+        const filtered = data.filter((row) => {
+          const rowCompanyId =
+            row.company_id ?? row.owner_company_id ?? row.assigned_company_id ?? null
+
+          const rawStatus = row.status ?? row.assignment_status ?? row.state ?? null
+          const normalizedStatus =
+            typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : null
+
+          const companyMatches = rowCompanyId ? String(rowCompanyId) === companyId : true
+
+          const looksActive =
+            !normalizedStatus ||
+            ['active', 'assigned', 'in_progress', 'in-progress', 'running'].includes(
+              normalizedStatus,
+            )
+
+          return companyMatches && looksActive
+        })
+
+        return sortByNewest(filtered).slice(0, 5)
       } catch {
         return []
       }
@@ -169,17 +213,10 @@ export default function DashboardPage() {
   /**
    * fetchGameNews
    *
-   * Expects a table named public.game_news.
-   * If your real table name differs, update only this query.
+   * Safe fallback until a real public.game_news table exists.
    */
   const fetchGameNews = useCallback(async (): Promise<GameNewsRow[]> => {
-    try {
-      const res = await getTable('game_news', '?select=*&limit=5')
-      const data = Array.isArray(res.data) ? (res.data as GameNewsRow[]) : []
-      return data
-    } catch {
-      return []
-    }
+    return DEFAULT_GAME_NEWS
   }, [])
 
   /**
@@ -236,8 +273,8 @@ export default function DashboardPage() {
     company && company.balance_cents != null
       ? company.balance_cents / 100
       : company && company.balance != null
-      ? company.balance
-      : 0
+        ? company.balance
+        : 0
 
   const companyStatus = getCompanyStatus(company, balanceValue)
   const createdLabel = formatDate(company?.created_at, { dateStyle: 'medium' })
@@ -269,7 +306,7 @@ export default function DashboardPage() {
         activeAssignments.length > 0
           ? `${activeAssignments.length} active assignment${activeAssignments.length === 1 ? '' : 's'} currently visible for this company.`
           : 'No active assignments are currently visible in the dashboard dataset.',
-      sourceLabel: 'Source: public.job_assignments',
+      sourceLabel: 'Source: job_assignments (client-filtered fallback)',
       sourceHref: '#active-assignments',
       updated: updatedLabel,
     },
@@ -336,7 +373,7 @@ export default function DashboardPage() {
     },
     {
       name: 'Game news',
-      detail: 'Latest visible global game news entries.',
+      detail: 'Currently using fallback placeholder items until a real news source is connected.',
       href: '#game-news',
     },
   ]
@@ -495,6 +532,8 @@ export default function DashboardPage() {
                   const to = assignment.destination_city || assignment.delivery_city || '—'
                   const payout = assignment.payout ?? assignment.reward ?? null
                   const updatedAt = assignment.updated_at || assignment.created_at
+                  const displayStatus =
+                    assignment.status || assignment.assignment_status || assignment.state || 'active'
 
                   return (
                     <div
@@ -510,13 +549,15 @@ export default function DashboardPage() {
                         </div>
 
                         <span className="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
-                          {assignment.status || 'active'}
+                          {displayStatus}
                         </span>
                       </div>
 
                       <div className="mt-3 flex flex-wrap gap-4 text-xs text-slate-500">
                         <span>Updated: {formatDate(updatedAt, { dateStyle: 'medium' })}</span>
-                        {payout != null ? <span>Payout: {formatCurrency(Number(payout))}</span> : null}
+                        {payout != null ? (
+                          <span>Payout: {formatCurrency(Number(payout))}</span>
+                        ) : null}
                       </div>
                     </div>
                   )
@@ -938,15 +979,15 @@ function getCompanyInitials(name?: string | null) {
   return `${parts[0]?.[0] || ''}${parts[1]?.[0] || ''}`.toUpperCase()
 }
 
-function getNewestDateValue<T extends { updated_at?: string | null; created_at?: string | null; published_at?: string | null }>(
-  item: T,
-) {
+function getNewestDateValue<
+  T extends { updated_at?: string | null; created_at?: string | null; published_at?: string | null },
+>(item: T) {
   return item.updated_at || item.published_at || item.created_at || ''
 }
 
-function sortByNewest<T extends { updated_at?: string | null; created_at?: string | null; published_at?: string | null }>(
-  items: T[],
-) {
+function sortByNewest<
+  T extends { updated_at?: string | null; created_at?: string | null; published_at?: string | null },
+>(items: T[]) {
   return [...items].sort((a, b) => {
     const aTime = new Date(getNewestDateValue(a)).getTime()
     const bTime = new Date(getNewestDateValue(b)).getTime()
