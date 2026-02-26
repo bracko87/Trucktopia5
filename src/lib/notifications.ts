@@ -10,6 +10,82 @@ export type AppNotification = {
   read_at: string | null
 }
 
+export type NotificationAction = {
+  label: string
+  path: string
+}
+
+type NotificationTypeConfig = {
+  defaultActionLabel?: string | null
+  defaultActionPath?: ((entityId: string | null) => string | null) | null
+}
+
+function getNotificationTypeConfig(type: string): NotificationTypeConfig {
+  const t = String(type ?? '').toUpperCase()
+
+  if (t.startsWith('ADMIN_')) {
+    return {
+      defaultActionLabel: 'Open dashboard',
+      defaultActionPath: () => '/',
+    }
+  }
+
+  switch (t) {
+    case 'JOB_DEADLINE_SOON':
+    case 'JOB_FAILED':
+    case 'JOB_COMPLETED':
+      return {
+        defaultActionLabel: 'Open my jobs',
+        defaultActionPath: () => '/my-jobs',
+      }
+
+    case 'TRUCK_MAINTENANCE_DUE':
+    case 'TRUCK_REPAIR_FINISHED':
+    case 'INSURANCE_EXPIRY':
+      return {
+        defaultActionLabel: 'Open trucks',
+        defaultActionPath: () => '/trucks',
+      }
+
+    case 'STAFF_TRAINING_COMPLETE':
+    case 'STAFF_CONTRACT_EXPIRING':
+      return {
+        defaultActionLabel: 'Open staff',
+        defaultActionPath: () => '/staff',
+      }
+
+    case 'LOAN_PAYMENT_DUE':
+    case 'LOW_BALANCE_ALERT':
+      return {
+        defaultActionLabel: 'Open finances',
+        defaultActionPath: () => '/finances',
+      }
+
+    default:
+      return {
+        defaultActionLabel: null,
+        defaultActionPath: null,
+      }
+  }
+}
+
+export function getNotificationAction(type: string, entityId: string | null): NotificationAction | null {
+  const cfg = getNotificationTypeConfig(type)
+  if (!cfg.defaultActionPath || !cfg.defaultActionLabel) return null
+
+  const basePath = cfg.defaultActionPath(entityId)
+  if (!basePath) return null
+
+  const path = entityId
+    ? `${basePath}${basePath.includes('?') ? '&' : '?'}focus=${encodeURIComponent(entityId)}`
+    : basePath
+
+  return {
+    label: cfg.defaultActionLabel,
+    path,
+  }
+}
+
 export async function resolvePublicUserId(authUserId: string): Promise<string | null> {
   if (!authUserId) return null
 

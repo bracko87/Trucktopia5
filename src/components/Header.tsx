@@ -6,16 +6,19 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router'
 import { useAuth } from '../context/AuthContext'
 import SettingsMenu from './settings/SettingsMenu'
 import CompanyBalance from './common/CompanyBalance'
 import NotificationBell from './common/NotificationBell'
 import { supabase } from '../lib/supabase'
+import { getNotificationAction, getNotificationTypeConfig } from '../lib/notificationTypes'
 
 interface AppNotification {
   id: string
   user_id?: string | null
   type?: string | null
+  entity_id?: string | null
   message?: string | null
   created_at?: string | null
   read_at?: string | null
@@ -92,7 +95,7 @@ async function fetchNotificationsByReadState(
   try {
     let query = supabase
       .from('notifications')
-      .select('id,user_id,type,message,created_at,read_at')
+      .select('id,user_id,type,entity_id,message,created_at,read_at')
       .in('user_id', userIds)
       .order('created_at', { ascending: false })
       .limit(limitCount)
@@ -107,6 +110,7 @@ async function fetchNotificationsByReadState(
           id: String(row.id),
           user_id: row.user_id ?? null,
           type: row.type ?? null,
+          entity_id: row.entity_id ?? null,
           message: row.message ?? null,
           created_at: row.created_at ?? null,
           read_at: row.read_at ?? null,
@@ -147,16 +151,6 @@ async function markAllNotificationsRead(userIds: string[]): Promise<boolean> {
   }
 }
 
-function isAdminNotification(type?: string | null): boolean {
-  const t = String(type ?? '').toLowerCase()
-  return (
-    t.includes('admin') ||
-    t.includes('system') ||
-    t.includes('announcement') ||
-    t.includes('broadcast')
-  )
-}
-
 function formatDateTime(value?: string | null): string {
   if (!value) return '—'
 
@@ -181,6 +175,7 @@ function formatDateTime(value?: string | null): string {
  */
 export default function Header(): JSX.Element {
   const { user } = useAuth()
+  const navigate = useNavigate()
   const [unreadCount, setUnreadCount] = useState<number>(0)
   const [userIds, setUserIds] = useState<string[]>([])
   const [openPanel, setOpenPanel] = useState<boolean>(false)
@@ -411,7 +406,8 @@ export default function Header(): JSX.Element {
                   ) : (
                     <ul className="divide-y divide-slate-200">
                       {currentItems.map((item) => {
-                        const admin = isAdminNotification(item.type)
+                        const typeConfig = getNotificationTypeConfig(item.type)
+                        const action = getNotificationAction(item.type, item.entity_id)
 
                         return (
                           <li key={item.id} className="p-3">
@@ -420,36 +416,48 @@ export default function Header(): JSX.Element {
                                 <div className="flex items-center gap-2 mb-1">
                                   <span
                                     className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                                      admin
+                                      typeConfig.category === 'admin'
                                         ? 'bg-blue-100 text-blue-700'
                                         : 'bg-amber-100 text-amber-700'
                                     }`}
                                   >
-                                    {admin ? 'Admin' : 'Game'}
+                                    {typeConfig.category === 'admin' ? 'Admin' : 'Game'}
                                   </span>
                                   <span className="text-[10px] uppercase tracking-wide text-slate-500">
-                                    {item.type ?? 'notification'}
+                                    {typeConfig.label}
                                   </span>
                                 </div>
 
-                                <p className="text-xs text-slate-900">
-                                  {item.message ?? 'No message'}
-                                </p>
+                                <p className="text-xs text-slate-900">{item.message ?? 'No message'}</p>
 
                                 <p className="text-[10px] text-slate-500 mt-1">
                                   {formatDateTime(item.created_at)}
                                 </p>
                               </div>
 
-                              {activeTab === 'unread' ? (
-                                <button
-                                  type="button"
-                                  onClick={() => void handleMarkOneAsRead(item.id)}
-                                  className="text-[10px] px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 whitespace-nowrap"
-                                >
-                                  Mark read
-                                </button>
-                              ) : null}
+                              <div className="flex flex-col items-end gap-1">
+                                {action ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      navigate(action.path)
+                                      setOpenPanel(false)
+                                    }}
+                                    className="text-[10px] px-2 py-1 rounded border border-blue-300 text-blue-700 hover:bg-blue-50 whitespace-nowrap"
+                                  >
+                                    {action.label}
+                                  </button>
+                                ) : null}
+                                {activeTab === 'unread' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleMarkOneAsRead(item.id)}
+                                    className="text-[10px] px-2 py-1 rounded border border-slate-300 hover:bg-slate-50 whitespace-nowrap"
+                                  >
+                                    Mark read
+                                  </button>
+                                ) : null}
+                              </div>
                             </div>
                           </li>
                         )

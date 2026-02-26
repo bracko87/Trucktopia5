@@ -28,6 +28,12 @@
  * - Ensured trailer service uses resolved company id state in Staging tabs
  *   (not only initial auth snapshot), improving trailer fetch reliability
  *   when company context resolves asynchronously.
+ *
+ * Newest update:
+ * - Fixed the staging regression where Active assignments could show 0 by wiring
+ *   AssignmentPanel to pass the resolved company id (effectiveCompanyId), instead
+ *   of only the initial auth snapshot (initialCompanyId). This keeps Active
+ *   loading aligned with the rest of staging tabs when company id resolves asynchronously.
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -1694,7 +1700,7 @@ export default function StagingTabs(): JSX.Element {
         <AssignmentPanel
           onAssignmentChange={setAssignment}
           relocationInfo={relocationInfo}
-          companyId={initialCompanyId || null}
+          companyId={effectiveCompanyId || initialCompanyId || null}
         />
       </div>
     </>

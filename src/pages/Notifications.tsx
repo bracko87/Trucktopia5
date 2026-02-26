@@ -13,6 +13,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import Layout from '../components/Layout'
 import { useAuth } from '../context/AuthContext'
+import { useNavigate } from 'react-router'
 import {
   AppNotification,
   fetchNotificationsByReadState,
@@ -20,6 +21,7 @@ import {
   markNotificationRead,
   resolveNotificationUserIds,
 } from '../lib/notifications'
+import { getNotificationAction, getNotificationTypeConfig } from '../lib/notificationTypes'
 
 /**
  * formatDateTime
@@ -39,19 +41,6 @@ function formatDateTime(iso: string): string {
 }
 
 /**
- * isAdminNotification
- *
- * Determine whether a notification is an "Admin" one based on its type.
- * Treats any type starting with "ADMIN" (case-insensitive) as admin.
- *
- * @param type - Notification type string from the database.
- * @returns True if the notification should be labeled as Admin.
- */
-function isAdminNotification(type: string): boolean {
-  return type.toUpperCase().startsWith('ADMIN')
-}
-
-/**
  * NotificationsPage
  *
  * Main notifications center page component.
@@ -60,6 +49,7 @@ function isAdminNotification(type: string): boolean {
  */
 export default function NotificationsPage(): JSX.Element {
   const { user } = useAuth()
+  const navigate = useNavigate()
   const [userIds, setUserIds] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState<'unread' | 'read'>('unread')
   const [unreadItems, setUnreadItems] = useState<AppNotification[]>([])
@@ -201,21 +191,27 @@ export default function NotificationsPage(): JSX.Element {
           ) : (
             <ul className="divide-y divide-slate-200">
               {currentItems.map((item) => {
-                const admin = isAdminNotification(item.type)
+                const typeConfig = getNotificationTypeConfig(item.type)
+                const action = getNotificationAction(item.type, item.entity_id)
 
                 return (
-                  <li key={item.id} className="p-4 flex items-start justify-between gap-3">
+                  <li
+                    key={item.id}
+                    className="p-4 flex items-start justify-between gap-3"
+                  >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 mb-1">
                         <span
                           className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
-                            admin ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'
+                            typeConfig.category === 'admin'
+                              ? 'bg-blue-100 text-blue-700'
+                              : 'bg-amber-100 text-amber-700'
                           }`}
                         >
-                          {admin ? 'Admin' : 'Game'}
+                          {typeConfig.category === 'admin' ? 'Admin' : 'Game'}
                         </span>
                         <span className="text-xs text-slate-500 uppercase tracking-wide">
-                          {item.type}
+                          {typeConfig.label}
                         </span>
                       </div>
                       <p className="text-sm text-slate-900">{item.message}</p>
@@ -224,15 +220,26 @@ export default function NotificationsPage(): JSX.Element {
                       </p>
                     </div>
 
-                    {activeTab === 'unread' ? (
-                      <button
-                        type="button"
-                        className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-700 hover:bg-slate-50"
-                        onClick={() => void handleMarkOneAsRead(item)}
-                      >
-                        Mark read
-                      </button>
-                    ) : null}
+                    <div className="flex flex-col items-end gap-2">
+                      {action ? (
+                        <button
+                          type="button"
+                          className="text-xs px-2 py-1 rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
+                          onClick={() => navigate(action.path)}
+                        >
+                          {action.label}
+                        </button>
+                      ) : null}
+                      {activeTab === 'unread' ? (
+                        <button
+                          type="button"
+                          className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-700 hover:bg-slate-50"
+                          onClick={() => void handleMarkOneAsRead(item)}
+                        >
+                          Mark read
+                        </button>
+                      ) : null}
+                    </div>
                   </li>
                 )
               })}

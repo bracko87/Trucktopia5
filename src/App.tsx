@@ -10,6 +10,7 @@
  * - AuthProvider must be inside a Router so it can use useNavigate.
  */
 
+import './lib/ensureGlobals'
 import React from 'react'
 import { HashRouter, Routes, Route } from 'react-router'
 
