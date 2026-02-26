@@ -20,8 +20,32 @@ type NotificationTypeConfig = {
   defaultActionPath?: ((entityId: string | null) => string | null) | null
 }
 
-function getNotificationTypeConfig(type: string): NotificationTypeConfig {
-  const t = String(type ?? '').toUpperCase()
+function toSafeNotification(row: any): AppNotification {
+  return {
+    id:
+      typeof row?.id === 'string' && row.id
+        ? row.id
+        : `local-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    user_id: typeof row?.user_id === 'string' ? row.user_id : '',
+    type:
+      typeof row?.type === 'string' && row.type.trim()
+        ? row.type
+        : 'UNKNOWN',
+    entity_id: typeof row?.entity_id === 'string' ? row.entity_id : null,
+    message:
+      typeof row?.message === 'string' && row.message.trim()
+        ? row.message
+        : 'Notification',
+    created_at:
+      typeof row?.created_at === 'string' && row.created_at
+        ? row.created_at
+        : new Date().toISOString(),
+    read_at: typeof row?.read_at === 'string' ? row.read_at : null,
+  }
+}
+
+function getNotificationTypeConfig(type: unknown): NotificationTypeConfig {
+  const t = String(type ?? '').trim().toUpperCase()
 
   if (t.startsWith('ADMIN_')) {
     return {
@@ -69,9 +93,18 @@ function getNotificationTypeConfig(type: string): NotificationTypeConfig {
   }
 }
 
-export function getNotificationAction(type: string, entityId: string | null): NotificationAction | null {
+export function getNotificationAction(
+  type: unknown,
+  entityId: string | null
+): NotificationAction | null {
   const cfg = getNotificationTypeConfig(type)
-  if (!cfg.defaultActionPath || !cfg.defaultActionLabel) return null
+
+  if (
+    typeof cfg.defaultActionPath !== 'function' ||
+    typeof cfg.defaultActionLabel !== 'string'
+  ) {
+    return null
+  }
 
   const basePath = cfg.defaultActionPath(entityId)
   if (!basePath) return null
@@ -146,7 +179,7 @@ export async function fetchNotificationsByReadState(
 
     if (error || !Array.isArray(data)) return []
 
-    return data as AppNotification[]
+    return data.map(toSafeNotification)
   } catch (err) {
     // eslint-disable-next-line no-console
     console.debug('fetchNotificationsByReadState error', err)
@@ -187,7 +220,9 @@ export async function markNotificationRead(id: string): Promise<boolean> {
   }
 }
 
-export async function markAllNotificationsRead(userIds: string | string[]): Promise<boolean> {
+export async function markAllNotificationsRead(
+  userIds: string | string[]
+): Promise<boolean> {
   try {
     const idList = Array.isArray(userIds) ? userIds : [userIds]
     if (idList.length === 0) return false

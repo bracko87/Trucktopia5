@@ -45,7 +45,7 @@ function buildDisplayName(row: any): string | null {
  * - Improved Active-name hydration in fallback mode: fallback rows now load and attach
  *   truck/trailer/driver objects by backend IDs (user_trucks, user_trailers, hired_staff/users)
  *   so Active details can show names instead of —.
- * - Driver linkage now prefers assignment_previews.driver_id over assignment.user_id.
+ * - Driver linkage now prefers resolved assignment_previews.driver_id over assignment.user_id.
  */
 async function loadActiveAssignmentsFallback(companyId: string) {
   // IMPORTANT: Do not include plain "assigned" here.
@@ -78,7 +78,6 @@ async function loadActiveAssignmentsFallback(companyId: string) {
         'assignment_preview_id',
         'assigned_payload_kg',
         'payload_remaining_kg',
-        'assignment_preview:assignment_preview_id(driver_id)',
         'job_offer:job_offer_id(' +
           'id,' +
           'transport_mode,' +
@@ -102,13 +101,41 @@ async function loadActiveAssignmentsFallback(companyId: string) {
     return []
   }
 
+  // Load preview-selected drivers without relying on fragile embedded relations.
+  const previewIds = Array.from(new Set(rows.map((r: any) => r?.assignment_preview_id).filter(Boolean).map(String)))
+  const previewDriverByPreviewId: Record<string, string> = {}
+
+  if (previewIds.length > 0) {
+    try {
+      const { data: previews, error: previewErr } = await supabase
+        .from('assignment_previews')
+        .select('id,driver_id')
+        .in('id', previewIds)
+
+      if (!previewErr && Array.isArray(previews)) {
+        previews.forEach((p: any) => {
+          if (p?.id && p?.driver_id) {
+            previewDriverByPreviewId[String(p.id)] = String(p.driver_id)
+          }
+        })
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
   // ---- NEW: hydrate related entities (trucks/trailers/drivers) for fallback rows ----
   const truckIds = Array.from(new Set(rows.map((r: any) => r?.user_truck_id).filter(Boolean).map(String)))
   const trailerIds = Array.from(new Set(rows.map((r: any) => r?.user_trailer_id).filter(Boolean).map(String)))
   const userIds = Array.from(
     new Set(
       rows
-        .map((r: any) => r?.assignment_preview?.driver_id ?? r?.user_id)
+        .map((r: any) => {
+          const previewDriverId = r?.assignment_preview_id
+            ? previewDriverByPreviewId[String(r.assignment_preview_id)] ?? null
+            : null
+          return previewDriverId ?? r?.user_id
+        })
         .filter(Boolean)
         .map(String)
     )
@@ -247,40 +274,46 @@ async function loadActiveAssignmentsFallback(companyId: string) {
   }
   // ---- END NEW hydration ----
 
-  return rows.map((a: any) => ({
-    id: `fallback-${a.id}`,
-    job_assignment_id: a.id,
-    phase: a.status,
-    distance_completed_km: 0,
-    total_distance_km: Number(a?.job_offer?.distance_km ?? 0) || 0,
-    phase_started_at: a.accepted_at ?? null,
-    created_at: a.accepted_at ?? null,
-    user_truck_id: a.user_truck_id ?? null,
-    user_trailer_id: a.user_trailer_id ?? null,
-    driver_id: a.assignment_preview?.driver_id ?? a.user_id ?? null,
-    relocation_ready_at: null,
+  return rows.map((a: any) => {
+    const previewDriverId = a?.assignment_preview_id
+      ? previewDriverByPreviewId[String(a.assignment_preview_id)] ?? null
+      : null
 
-    // NEW: attach hydrated truck on the session row too
-    user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
+    return {
+      id: `fallback-${a.id}`,
+      job_assignment_id: a.id,
+      phase: a.status,
+      distance_completed_km: 0,
+      total_distance_km: Number(a?.job_offer?.distance_km ?? 0) || 0,
+      phase_started_at: a.accepted_at ?? null,
+      created_at: a.accepted_at ?? null,
+      user_truck_id: a.user_truck_id ?? null,
+      user_trailer_id: a.user_trailer_id ?? null,
+      driver_id: previewDriverId ?? a.user_id ?? null,
+      relocation_ready_at: null,
 
-    job_assignment: {
-      ...a,
-
-      // NEW: attach hydrated entities so UI can show names/details
+      // NEW: attach hydrated truck on the session row too
       user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
-      user_trailer: a.user_trailer_id ? trailerMap[String(a.user_trailer_id)] ?? null : null,
-      driver:
-        (a.assignment_preview?.driver_id ? driverMap[String(a.assignment_preview.driver_id)] ?? null : null) ??
-        (a.user_id ? driverMap[String(a.user_id)] ?? null : null),
 
-      resolved_reward:
-        a.final_reward ??
-        (a?.job_offer?.transport_mode === 'trailer_cargo'
-          ? a?.job_offer?.reward_trailer_cargo
-          : a?.job_offer?.reward_load_cargo) ??
-        null,
-    },
-  }))
+      job_assignment: {
+        ...a,
+
+        // NEW: attach hydrated entities so UI can show names/details
+        user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
+        user_trailer: a.user_trailer_id ? trailerMap[String(a.user_trailer_id)] ?? null : null,
+        driver:
+          (previewDriverId ? driverMap[String(previewDriverId)] ?? null : null) ??
+          (a.user_id ? driverMap[String(a.user_id)] ?? null : null),
+
+        resolved_reward:
+          a.final_reward ??
+          (a?.job_offer?.transport_mode === 'trailer_cargo'
+            ? a?.job_offer?.reward_trailer_cargo
+            : a?.job_offer?.reward_load_cargo) ??
+          null,
+      },
+    }
+  })
 }
 
 /**
@@ -457,7 +490,6 @@ export async function loadOnDutySessions(companyId?: string | null) {
           'final_reward',
           'assigned_payload_kg',
           'payload_remaining_kg',
-          'assignment_preview:assignment_preview_id(driver_id)',
           'job_offer:job_offer_id(' +
             'id,' +
             'transport_mode,' +
@@ -491,14 +523,36 @@ export async function loadOnDutySessions(companyId?: string | null) {
     const truckIds = new Set<string>()
     const trailerIds = new Set<string>()
     const userIds = new Set<string>()
+    const previewIds = new Set<string>()
+    const previewDriverByPreviewId: Record<string, string> = {}
 
     assignments.forEach((a: any) => {
       assignmentMap[String(a.id)] = a
       if (a.user_truck_id) truckIds.add(String(a.user_truck_id))
       if (a.user_trailer_id) trailerIds.add(String(a.user_trailer_id))
       if (a.user_id) userIds.add(String(a.user_id))
-      if (a?.assignment_preview?.driver_id) userIds.add(String(a.assignment_preview.driver_id))
+      if (a.assignment_preview_id) previewIds.add(String(a.assignment_preview_id))
     })
+
+    if (previewIds.size > 0) {
+      try {
+        const { data: previews, error: previewErr } = await supabase
+          .from('assignment_previews')
+          .select('id,driver_id')
+          .in('id', Array.from(previewIds))
+
+        if (!previewErr && Array.isArray(previews)) {
+          previews.forEach((p: any) => {
+            if (p?.id && p?.driver_id) {
+              previewDriverByPreviewId[String(p.id)] = String(p.driver_id)
+              userIds.add(String(p.driver_id))
+            }
+          })
+        }
+      } catch {
+        // best-effort
+      }
+    }
 
     // Add drivers/trucks/trailers referenced on sessions (some schemas put these on the session row)
     sessions.forEach((s: any) => {
@@ -805,12 +859,14 @@ export async function loadOnDutySessions(companyId?: string | null) {
           (trailerFromAssignmentId ? trailerMap[trailerFromAssignmentId] ?? null : null) ??
           (trailerFromSessionId ? trailerMap[trailerFromSessionId] ?? null : null)
 
+        const previewDriverId = assignment?.assignment_preview_id
+          ? previewDriverByPreviewId[String(assignment.assignment_preview_id)] ?? null
+          : null
+
         // Driver resolution: prefer authoritative session driver, then preview-selected driver, then assignment user.
         const driver =
           (s.driver_id ? driverMap[String(s.driver_id)] : null) ??
-          (assignment?.assignment_preview?.driver_id
-            ? driverMap[String(assignment.assignment_preview.driver_id)]
-            : null) ??
+          (previewDriverId ? driverMap[String(previewDriverId)] : null) ??
           (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ??
           null
 

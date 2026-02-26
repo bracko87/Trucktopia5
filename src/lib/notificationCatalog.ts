@@ -1,4 +1,3 @@
-
 /**
  * notificationCatalog.ts
  *
@@ -118,25 +117,52 @@ export const NOTIFICATION_TYPE_CATALOG = {
 }
 
 /**
+ * normalizeType
+ *
+ * Coerces any raw notification type into a safe, non-empty string so one bad
+ * row cannot crash the bell dropdown render path.
+ *
+ * @param {*} rawType
+ * @returns {string}
+ */
+function normalizeType(rawType) {
+  if (typeof rawType === 'string' && rawType.trim().length > 0) {
+    return rawType.trim()
+  }
+  return 'UNKNOWN'
+}
+
+/**
+ * humanizeType
+ *
+ * Converts a normalized type code into a readable label using broad runtime-
+ * compatible string operations.
+ *
+ * @param {string} type
+ * @returns {string}
+ */
+function humanizeType(type) {
+  return type.split('_').join(' ').toLowerCase()
+}
+
+/**
  * getNotificationTypeConfig
  *
  * Resolve configuration for a given notification type.
- * Falls back to a generic config when the type is unknown.
+ * Falls back to a generic config when the type is unknown or malformed.
  *
- * @param {string} type - Raw type string from the database.
+ * @param {*} rawType - Raw type value from the database.
  * @returns {NotificationTypeConfig}
  */
-export function getNotificationTypeConfig(type) {
+export function getNotificationTypeConfig(rawType) {
+  var type = normalizeType(rawType)
   var fromCatalog = NOTIFICATION_TYPE_CATALOG[type]
-  if (fromCatalog) return fromCatalog
 
-  // Fallback: derive a decent label and category automatically.
-  var label = String(type || '').replace(/_/g, ' ').toLowerCase()
+  if (fromCatalog) return fromCatalog
 
   return {
     type: type,
-    label: label,
-    category: String(type || '').toUpperCase().startsWith('ADMIN') ? 'admin' : 'game',
+    label: humanizeType(type),
+    category: type.toUpperCase().startsWith('ADMIN') ? 'admin' : 'game',
   }
 }
-  
