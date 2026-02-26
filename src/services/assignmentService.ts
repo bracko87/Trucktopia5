@@ -5,7 +5,7 @@
  *
  * Client-side helper that finalises an assignment by updating an existing
  * job_assignments row, creating a driving session (if missing), updating
- * truck/trailer statuses and marking only the selected drivers as assigned.
+ * truck/trailer statuses and reserving only the selected drivers.
  *
  * This prevents duplicate-insert unique-constraint errors (ux_job_offer_active_assignment),
  * avoids mass-updating all free staff in a company, and now blocks finalization when the
@@ -19,8 +19,8 @@
  *   1) truck uniqueness during active assignment is handled via
  *      ux_job_offer_truck_active_assignment conflict recovery/reuse paths
  *   2) selected hired_staff drivers are validated as free/standby before finalize
- *   3) selected drivers are marked as assigned on finalize
- *      (hired_staff.activity_id = 'assigned')
+ *   3) selected drivers are reserved on finalize only if still free/standby
+ *      (prevents multi-job double booking)
  */
 
 import { supabase } from '../lib/supabase'
@@ -59,9 +59,11 @@ export interface FinalizeAssignmentOpts {
  * 2c) Keep job_offers.remaining_payload in sync with the computed remainder.
  * 3) Insert a driving_sessions row (phase = 'TO_PICKUP') linked to the updated assignment
  *    only if no driving session already exists for that assignment.
+ *    The UI then waits for movement progression from that initial TO_PICKUP phase.
  *    If insert is blocked by RLS, continue without a session row (warn only).
  * 4) Update user_trucks / user_trailers statuses to 'PICKING_LOAD' when provided.
- * 5) Update only the selected hired_staff rows (by id) to activity_id = 'assigned'.
+ * 5) Reserve only the selected hired_staff rows (by id) if they are still free/standby.
+ *    Finalization fails if any selected driver cannot be reserved.
  *
  * Important: If no assignment exists (meaning accept path didn't create one), this function
  * will throw an error — prefer the market accept flow to create the assignment first.
@@ -542,6 +544,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
   }
 
   // Step 3 — Insert driving_sessions
+  // Finalize inserts a driving session in TO_PICKUP, then UI waits for progression.
   try {
     const drivingPayload: any = {
       job_assignment_id: assignmentRow.id,
@@ -678,33 +681,71 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     }
   }
 
-  // Step 6 — Update only selected hired_staff rows (mark selected drivers as 'assigned').
-  // This is the current driver lifecycle/locking enforcement on finalize: only the chosen
-  // drivers are transitioned to assigned, avoiding any mass update of company staff.
-  try {
-    // Extract driver ids from the passed assignment object (UI-provided).
-    const driverIds: string[] =
-      (assignment?.drivers?.map((d: any) => String(d?.id)).filter(Boolean) as string[]) ?? []
+  // Step 6 — Reserve selected hired_staff rows (hard-fail finalize when reservation cannot be enforced).
+  // This prevents one driver being booked on multiple jobs concurrently.
+  const driverIds: string[] =
+    (assignment?.drivers?.map((d: any) => String(d?.id)).filter(Boolean) as string[]) ?? []
 
-    if (driverIds.length > 0) {
-      // Update only the drivers involved in this assignment.
-      const { error: staffErr } = await supabase
-        .from('hired_staff')
-        .update({ activity_id: 'assigned' })
-        .in('id', driverIds)
+  if (driverIds.length > 0) {
+    try {
+      const reservationVariants: Array<Record<string, any>> = [
+        { activity_id: 'assigned', activity_until: null, last_active_at: acceptedAt },
+        { activity_id: 'assigned', last_active_at: acceptedAt },
+        { activity_id: 'assigned' },
+      ]
 
-      if (staffErr) {
-        // eslint-disable-next-line no-console
-        console.error('finalizeAssignmentDirect: failed to update hired_staff by id', staffErr)
+      let reserveErr: any = null
+      let reservedRows: Array<{ id: string }> | null = null
+
+      for (const payload of reservationVariants) {
+        const res = await supabase
+          .from('hired_staff')
+          .update(payload)
+          .in('id', driverIds)
+          .in('activity_id', ['free', 'standby', 'FREE', 'STANDBY'])
+          .select('id')
+
+        if (!res.error) {
+          reserveErr = null
+          reservedRows = Array.isArray(res.data) ? (res.data as Array<{ id: string }>) : []
+          break
+        }
+
+        const code = String(res.error?.code ?? '')
+        const msg = String(res.error?.message ?? '').toLowerCase()
+        const isMissingColumn = code === '42703' || msg.includes('column') || msg.includes('schema cache')
+        if (isMissingColumn) {
+          reserveErr = res.error
+          continue
+        }
+
+        reserveErr = res.error
+        break
       }
-    } else {
-      // No drivers selected in the assignment — do not mass-update company staff.
+
+      if (reserveErr) {
+        // eslint-disable-next-line no-console
+        console.error('finalizeAssignmentDirect: failed to reserve hired_staff by id', reserveErr)
+        throw reserveErr
+      }
+
+      const reservedCount = Array.isArray(reservedRows) ? reservedRows.length : 0
+      if (reservedCount !== driverIds.length) {
+        const reservedIds = new Set((reservedRows ?? []).map((r) => String(r.id)))
+        const missing = driverIds.filter((id) => !reservedIds.has(String(id)))
+        throw new Error(
+          `Driver reservation failed for ${missing.length} selected driver(s). Please refresh staging and choose available drivers again.`
+        )
+      }
+    } catch (e) {
       // eslint-disable-next-line no-console
-      console.debug('finalizeAssignmentDirect: no drivers provided in assignment; skipping hired_staff update')
+      console.error('finalizeAssignmentDirect: hired_staff reserve exception', e)
+      throw e
     }
-  } catch (e) {
+  } else {
+    // No drivers selected in the assignment — do not mass-update company staff.
     // eslint-disable-next-line no-console
-    console.error('finalizeAssignmentDirect: hired_staff update exception', e)
+    console.debug('finalizeAssignmentDirect: no drivers provided in assignment; skipping hired_staff reservation')
   }
 
   return { assignment: assignmentRow }

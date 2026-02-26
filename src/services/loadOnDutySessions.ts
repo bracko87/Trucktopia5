@@ -33,8 +33,8 @@ function buildDisplayName(row: any): string | null {
 /**
  * loadActiveAssignmentsFallback
  *
- * Fallback loader for environments where driving_sessions INSERT/SELECT is blocked by RLS,
- * or when sessions come back empty/unlinked and staging would otherwise show a blank state.
+ * Fallback loader for environments where driving_sessions SELECT is blocked by RLS
+ * or otherwise unavailable, and staging would otherwise show a blank state.
  *
  * IMPORTANT:
  * - This fallback builds session-shaped rows from active job_assignments so Staging Active
@@ -331,8 +331,8 @@ async function loadActiveAssignmentsFallback(companyId: string) {
  *  - any errors encountered when a column/table is missing
  *
  * NOTE:
- * - When driving_sessions are blocked (e.g. RLS) or come back empty/unlinked, staging may
- *   use fallback-from-job_assignments to avoid a total blank state.
+ * - When driving_sessions are unavailable (for example RLS / permission blocked),
+ *   staging may use fallback-from-job_assignments to avoid a total blank state.
  * - That fallback is a temporary UI safeguard and not a full replacement for proper
  *   movement tracking/triggers on driving_sessions.
  *
@@ -395,8 +395,6 @@ export async function loadOnDutySessions(companyId?: string | null) {
     let sessErr: any = null
 
     for (const selectClause of selectVariants) {
-      console.debug('loadOnDutySessions: trying driving_sessions select variant', selectClause)
-
       const res = await supabase
         .from('driving_sessions')
         .select(selectClause)
@@ -417,7 +415,6 @@ export async function loadOnDutySessions(companyId?: string | null) {
 
       const code = String(res.error?.code ?? '')
       const msg = String(res.error?.message ?? '').toLowerCase()
-
       // Retry on schema/relation drift, stop on policy errors.
       if (
         code === '42501' ||
@@ -428,19 +425,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
         break
       }
 
-      // Schema drift / relation mismatch — try next variant before failing.
-      if (code === '42703' || code.startsWith('PGRST') || msg.includes('relationship')) {
-        console.warn(
-          'loadOnDutySessions: select variant schema/relation mismatch, trying next variant',
-          res.error
-        )
-        sessErr = res.error
-        continue
-      }
-
-      // Unknown error: stop retry loop and handle below.
       sessErr = res.error
-      break
     }
 
     if (sessErr) {
@@ -468,10 +453,8 @@ export async function loadOnDutySessions(companyId?: string | null) {
     console.debug(`loadOnDutySessions: derived assignmentIds = ${assignmentIds.length}`)
 
     if (assignmentIds.length === 0) {
-      console.debug(
-        'loadOnDutySessions: no assignmentIds found (sessions empty/unlinked) — using fallback-from-job_assignments for staging; fallback only, not a full replacement for driving_sessions tracking/triggers'
-      )
-      return await loadActiveAssignmentsFallback(String(companyId))
+      console.debug('loadOnDutySessions: no assignmentIds found — returning sessions as-is')
+      return sessions
     }
 
     // STEP 2: load assignments with a safe embedded job_offer (minimal)

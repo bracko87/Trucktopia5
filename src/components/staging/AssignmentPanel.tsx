@@ -25,6 +25,8 @@
  *       during both preview creation and finalize.
  *   12) treat known finalize environment conflicts as completed UI success state
  *       (RLS driving_sessions and active duplicate conflict), reusing shared cleanup path.
+ *   13) make assignment confirmation finalize and reload UI state only; it does not
+ *       drive simulation progression itself.
  */
 
 import React, { useEffect, useState } from 'react'
@@ -596,8 +598,8 @@ function RouteCalculatorBox({
  * owns the assignment state and notifies a parent when the state changes.
  *
  * On confirm it creates a server-side assignment preview via RPC and opens
- * confirmation modal. When finalizing it uses finalizeAssignmentDirect
- * with an explicit company id fallback to the logged-in user's company.
+ * confirmation modal. When finalizing it calls finalizeAssignmentDirect and
+ * then reloads the staging UI state; it does not drive simulation itself.
  */
 export default function AssignmentPanel({
   onAssignmentChange,
@@ -1267,8 +1269,8 @@ export default function AssignmentPanel({
    * handleConfirmFinalize
    *
    * Finalize the assignment after modal confirmation by using the client-side
-   * finalizeAssignmentDirect flow (no RPC). This writes to job_assignments,
-   * driving_sessions, updates user_trucks / user_trailers and hired_staff.
+   * finalizeAssignmentDirect flow (no RPC). This path finalizes the assignment
+   * and then reloads staging UI state; it does not drive simulation itself.
    *
    * Uses previewData + assignment slots + current user to construct the opts.
    */
@@ -1346,10 +1348,11 @@ export default function AssignmentPanel({
 
     try {
       // Call client-side function that performs the multi-step write flow.
+      // This confirms the assignment only; simulation progression is handled elsewhere.
       await finalizeAssignmentDirect({
         jobOfferId: jobOfferId,
         carrierCompanyId: carrierCompanyId,
-        companyId: companyIdResolved,
+        companyId: companyId,
         userId: (user as any)?.id ?? null,
         userTruckId: userTruckId,
         trailerId: trailerId ?? null,

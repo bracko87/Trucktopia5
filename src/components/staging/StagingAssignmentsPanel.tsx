@@ -9,6 +9,9 @@
  * - This file implements phase-aware ETA/pickup display logic.
  * - Updated Active details to never show raw ID fragments for Truck/Trailer/Driver;
  *   only readable names/registrations are shown (or — if unavailable).
+ * - Added a staging-panel diagnostic warning when all active sessions remain in
+ *   picking_load / to_pickup for 15+ minutes, indicating engine tick progression
+ *   is likely not running/updating phases.
  *
  * Lifecycle / locking note (related finalize flow, for reference):
  * - Partial lifecycle enforcement is already in place in assignment finalization:
@@ -18,7 +21,7 @@
  *     (hired_staff.activity_id = 'assigned')
  */
 
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { List, Trash2 } from 'lucide-react'
 import { loadOnDutySessions } from '../../services/loadOnDutySessions'
 import { abortAssignment } from '../../services/jobsService'
@@ -38,6 +41,7 @@ interface DrivingSessionRow {
   distance_completed_km?: number | null
   total_distance_km?: number | null
   updated_at?: string | null
+  created_at?: string | null
   job_assignment?: any | null
   relocation_ready_at?: string | null
   phase_started_at?: string | null
@@ -205,6 +209,43 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
   const [abortTarget, setAbortTarget] = useState<string | null>(null)
   const [aborting, setAborting] = useState(false)
 
+  /**
+   * engineStallWarning
+   *
+   * Diagnostic warning shown when all active sessions appear stuck in pickup-related
+   * phases for 15+ minutes. This usually indicates backend engine tick progression
+   * is not running or not updating phases.
+   */
+  const engineStallWarning = useMemo(() => {
+    if (activeSessions.length === 0) return null
+
+    const normalized = activeSessions.map((row) =>
+      String(row?.phase ?? row?.job_assignment?.status ?? '').toLowerCase()
+    )
+
+    const stallLikeCount = normalized.filter(
+      (p) => p.includes('picking_load') || p.includes('to_pickup')
+    ).length
+
+    if (stallLikeCount !== activeSessions.length) return null
+
+    const oldestPhaseStartMs = activeSessions
+      .map((row) =>
+        new Date(
+          String(row?.phase_started_at ?? row?.created_at ?? row?.job_assignment?.accepted_at ?? '')
+        ).getTime()
+      )
+      .filter((ms) => Number.isFinite(ms) && ms > 0)
+      .reduce((min, cur) => Math.min(min, cur), Number.POSITIVE_INFINITY)
+
+    if (!Number.isFinite(oldestPhaseStartMs)) return null
+
+    const minutesStalled = Math.floor((now - oldestPhaseStartMs) / 60000)
+    if (minutesStalled < 15) return null
+
+    return `All active sessions are still in picking/to-pickup for ~${minutesStalled}m. This usually means the backend engine tick is not progressing driving phases.`
+  }, [activeSessions, now])
+
   useEffect(() => {
     let cancelled = false
 
@@ -360,6 +401,12 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
       <div className="p-3 max-h-56 overflow-y-auto text-sm">
         {tab === 'active' && (
           <>
+            {engineStallWarning ? (
+              <div className="mb-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-800">
+                {engineStallWarning}
+              </div>
+            ) : null}
+
             {activeSessions.length === 0 ? (
               <div className="text-slate-500">No active assignments.</div>
             ) : (
@@ -378,8 +425,8 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                   a.job_offer?.delivery_deadline
                     ? new Date(String(a.job_offer.delivery_deadline)).getTime() - now
                     : remaining > 0
-                    ? Math.round((remaining / speedKmH) * 3600 * 1000)
-                    : 0
+                      ? Math.round((remaining / speedKmH) * 3600 * 1000)
+                      : 0
 
                 const pickupMs = a.job_offer?.pickup_time ? new Date(String(a.job_offer.pickup_time)).getTime() : undefined
                 const deadlineMs = a.job_offer?.delivery_deadline ? new Date(String(a.job_offer.delivery_deadline)).getTime() : undefined
@@ -389,8 +436,8 @@ export default function StagingAssignmentsPanel({ companyId }: StagingAssignment
                   timeStatus.delivery === 'urgent'
                     ? 'text-rose-600 font-semibold'
                     : timeStatus.delivery === 'past'
-                    ? 'text-rose-700 font-bold'
-                    : 'text-slate-800'
+                      ? 'text-rose-700 font-bold'
+                      : 'text-slate-800'
 
                 const idKey = a?.id ?? s.id
                 const assignedPayloadKg = Number(a?.assigned_payload_kg ?? NaN)

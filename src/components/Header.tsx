@@ -217,19 +217,29 @@ function deriveActionSafe(rawType: unknown, entityId: unknown) {
 }
 
 /**
- * detailsPathFor
+ * moreDetailsPathFor
  *
- * Builds a contextual details URL for the full notifications page.
+ * Routes to a stable related page.
+ * - Prefer the notification action path when available.
+ * - Never route to /notifications from this popup path.
+ * - Fall back by notification type to known-stable screens.
  */
-function detailsPathFor(item: Partial<AppNotification>): string {
-  const params = new URLSearchParams()
+function moreDetailsPathFor(item: Partial<AppNotification>): string {
+  const typeConfig = deriveTypeConfigSafe(item?.type)
+  const action = deriveActionSafe(item?.type, item?.entity_id)
 
-  if (typeof item.id === 'string' && item.id) params.set('notificationId', item.id)
-  if (typeof item.type === 'string' && item.type) params.set('type', item.type)
-  if (typeof item.entity_id === 'string' && item.entity_id) params.set('entityId', item.entity_id)
+  if (action?.path) return action.path
 
-  const query = params.toString()
-  return query ? `/notifications?${query}` : '/notifications'
+  // Never route to /notifications here; some environments report a runtime
+  // loop on that page. Fallback to a known-stable screen instead.
+  if (typeConfig.category === 'admin') return '/dashboard'
+  if (typeof item?.type === 'string' && item.type.startsWith('JOB')) return '/my-jobs'
+  if (typeof item?.type === 'string' && item.type.startsWith('TRUCK')) return '/trucks'
+  if (typeof item?.type === 'string' && item.type.startsWith('STAFF')) return '/staff'
+  if (typeof item?.type === 'string' && item.type.startsWith('LOAN')) return '/finances'
+  if (typeof item?.type === 'string' && item.type.includes('BALANCE')) return '/finances'
+
+  return '/dashboard'
 }
 
 /**
@@ -515,10 +525,6 @@ export default function Header(): JSX.Element {
                                 </p>
 
                                 <p className="text-[10px] text-slate-500 mt-1">
-                                  {`Type: ${typeConfig.type}${item?.entity_id ? ` • Ref: ${String(item.entity_id).slice(0, 8)}…` : ''}`}
-                                </p>
-
-                                <p className="text-[10px] text-slate-500 mt-1">
                                   {formatDateTime(item?.created_at)}
                                 </p>
                               </div>
@@ -540,12 +546,12 @@ export default function Header(): JSX.Element {
                                 <button
                                   type="button"
                                   onClick={() => {
-                                    navigate(detailsPathFor(item || {}))
+                                    navigate(moreDetailsPathFor(item || {}))
                                     setOpenPanel(false)
                                   }}
                                   className="text-[10px] px-2 py-1 rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50 whitespace-nowrap"
                                 >
-                                  More details
+                                  Open related page
                                 </button>
 
                                 {activeTab === 'unread' ? (
