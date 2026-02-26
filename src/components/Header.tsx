@@ -217,6 +217,22 @@ function deriveActionSafe(rawType: unknown, entityId: unknown) {
 }
 
 /**
+ * detailsPathFor
+ *
+ * Builds a contextual details URL for the full notifications page.
+ */
+function detailsPathFor(item: Partial<AppNotification>): string {
+  const params = new URLSearchParams()
+
+  if (typeof item.id === 'string' && item.id) params.set('notificationId', item.id)
+  if (typeof item.type === 'string' && item.type) params.set('type', item.type)
+  if (typeof item.entity_id === 'string' && item.entity_id) params.set('entityId', item.entity_id)
+
+  const query = params.toString()
+  return query ? `/notifications?${query}` : '/notifications'
+}
+
+/**
  * Header
  *
  * Renders the top application header. Also preloads company balance and
@@ -420,7 +436,7 @@ export default function Header(): JSX.Element {
             />
 
             {openPanel ? (
-              <div className="absolute right-10 top-10 z-50 w-[380px] max-h-[70vh] bg-white text-slate-900 rounded-lg border border-slate-200 shadow-2xl overflow-hidden">
+              <div className="absolute right-10 top-10 z-50 w-[560px] max-h-[82vh] bg-white text-slate-900 rounded-lg border border-slate-200 shadow-2xl overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                   <div className="font-semibold">Notifications</div>
                   <button
@@ -458,7 +474,7 @@ export default function Header(): JSX.Element {
                   </button>
                 </div>
 
-                <div className="overflow-y-auto max-h-[52vh]">
+                <div className="overflow-y-auto max-h-[64vh]">
                   {panelError ? (
                     <div className="p-4 text-sm text-red-600">{panelError}</div>
                   ) : loadingNotifications ? (
@@ -499,6 +515,10 @@ export default function Header(): JSX.Element {
                                 </p>
 
                                 <p className="text-[10px] text-slate-500 mt-1">
+                                  {`Type: ${typeConfig.type}${item?.entity_id ? ` • Ref: ${String(item.entity_id).slice(0, 8)}…` : ''}`}
+                                </p>
+
+                                <p className="text-[10px] text-slate-500 mt-1">
                                   {formatDateTime(item?.created_at)}
                                 </p>
                               </div>
@@ -516,6 +536,17 @@ export default function Header(): JSX.Element {
                                     {action.label}
                                   </button>
                                 ) : null}
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    navigate(detailsPathFor(item || {}))
+                                    setOpenPanel(false)
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50 whitespace-nowrap"
+                                >
+                                  More details
+                                </button>
 
                                 {activeTab === 'unread' ? (
                                   <button

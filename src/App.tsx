@@ -11,6 +11,8 @@
  */
 
 import './lib/ensureGlobals'
+import './lib/notificationShims'
+import './lib/missingGlobalAutoShim'
 import React from 'react'
 import { HashRouter, Routes, Route } from 'react-router'
 
