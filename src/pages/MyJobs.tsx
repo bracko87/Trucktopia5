@@ -5,7 +5,7 @@
  *
  * Fixes:
  * - Do NOT rely on user.company_id being present on the auth user object.
- * - Resolve carrier company id from public.users / trucks / companies.
+ * - Resolve carrier company id via Supabase client queries from public.users / user_trucks / companies.
  * - Use the authenticated session access_token (RLS-safe) instead of anon bearer.
  * - URL-encode PostgREST select strings to avoid subtle parsing issues.
  * - Fetch + map origin/destination client companies so JobCard shows company blocks.
@@ -129,45 +129,61 @@ function buildHeaders(accessToken?: string | null) {
  * resolveCarrierCompanyId
  *
  * Robustly resolve carrier company id even when user.company_id is missing from auth context.
+ * Uses Supabase client queries to avoid fragile direct REST fallback lookups.
  */
-async function resolveCarrierCompanyId(authUserId: string, accessToken?: string | null): Promise<string | null> {
-  const headers = buildHeaders(accessToken)
-
+async function resolveCarrierCompanyId(authUserId: string): Promise<string | null> {
   // 1) public.users by auth_user_id
   try {
-    const url = `${API_BASE}/rest/v1/users?select=company_id&auth_user_id=eq.${encodeURIComponent(authUserId)}&limit=1`
-    const res = await fetch(url, { headers })
-    if (res.ok) {
-      const rows = (await res.json().catch(() => [])) as any[]
-      const cid = rows?.[0]?.company_id ?? null
-      if (cid) return String(cid)
-    }
+    const { data, error } = await supabase
+      .from('users')
+      .select('company_id')
+      .eq('auth_user_id', authUserId)
+      .limit(1)
+      .maybeSingle()
+
+    if (!error && data?.company_id) return String(data.company_id)
   } catch {
     // ignore
   }
 
-  // 2) user_trucks by owner_user_id -> owner_company_id
+  // 2) user_trucks by owner_user_auth_id (preferred in this schema)
   try {
-    const url = `${API_BASE}/rest/v1/user_trucks?select=owner_company_id&owner_user_id=eq.${encodeURIComponent(authUserId)}&limit=1`
-    const res = await fetch(url, { headers })
-    if (res.ok) {
-      const rows = (await res.json().catch(() => [])) as any[]
-      const cid = rows?.[0]?.owner_company_id ?? null
-      if (cid) return String(cid)
-    }
+    const { data, error } = await supabase
+      .from('user_trucks')
+      .select('owner_company_id')
+      .eq('owner_user_auth_id', authUserId)
+      .limit(1)
+      .maybeSingle()
+
+    if (!error && data?.owner_company_id) return String(data.owner_company_id)
   } catch {
     // ignore
   }
 
-  // 3) companies by owner_id
+  // 3) legacy fallback: user_trucks.owner_user_id
   try {
-    const url = `${API_BASE}/rest/v1/companies?select=id&owner_id=eq.${encodeURIComponent(authUserId)}&limit=1`
-    const res = await fetch(url, { headers })
-    if (res.ok) {
-      const rows = (await res.json().catch(() => [])) as any[]
-      const cid = rows?.[0]?.id ?? null
-      if (cid) return String(cid)
-    }
+    const { data, error } = await supabase
+      .from('user_trucks')
+      .select('owner_company_id')
+      .eq('owner_user_id', authUserId)
+      .limit(1)
+      .maybeSingle()
+
+    if (!error && data?.owner_company_id) return String(data.owner_company_id)
+  } catch {
+    // ignore
+  }
+
+  // 4) companies by owner_id
+  try {
+    const { data, error } = await supabase
+      .from('companies')
+      .select('id')
+      .eq('owner_id', authUserId)
+      .limit(1)
+      .maybeSingle()
+
+    if (!error && data?.id) return String(data.id)
   } catch {
     // ignore
   }
@@ -211,7 +227,7 @@ export default function MyJobs(): JSX.Element {
       const carrierCompanyId =
         (user as any)?.company_id ??
         (user as any)?.companyId ??
-        (await resolveCarrierCompanyId(String(authUserId), accessToken))
+        (await resolveCarrierCompanyId(String(authUserId)))
 
       if (!carrierCompanyId) {
         setJobs([])

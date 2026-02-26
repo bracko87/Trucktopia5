@@ -1,0 +1,236 @@
+/**
+ * Notifications.tsx
+ *
+ * In-app notifications center page. Shows unread/read tabs, allows marking
+ * a single notification as read, and marking all unread ones as read.
+ *
+ * Uses Layout and AuthContext provided by the application.
+ */
+
+import React, { useEffect, useMemo, useState } from 'react'
+import Layout from '../components/Layout'
+import { useAuth } from '../context/AuthContext'
+import type { AppNotification } from '../lib/notifications'
+import {
+  fetchNotificationsByReadState,
+  markAllNotificationsRead,
+  markNotificationRead,
+  resolvePublicUserId,
+} from '../lib/notifications'
+
+/**
+ * isAdminNotification
+ *
+ * Determine whether a notification is an "Admin" one based on its type.
+ * Treats any type starting with "ADMIN" (case-insensitive) as admin.
+ *
+ * @param type - Notification type string from the database.
+ * @returns True if the notification should be labeled as Admin.
+ */
+function isAdminNotification(type: string): boolean {
+  if (!type) return false
+  return type.toUpperCase().startsWith('ADMIN')
+}
+
+/**
+ * formatDateTime
+ *
+ * Format an ISO timestamp into a short date+time string suitable for UI.
+ * Falls back to the raw value if parsing fails.
+ *
+ * @param iso - ISO 8601 timestamp string.
+ * @returns Human-readable date and time string.
+ */
+function formatDateTime(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  return date.toLocaleString(undefined, {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  })
+}
+
+/**
+ * NotificationsPage
+ *
+ * Main notifications center page component.
+ *
+ * @returns JSX.Element
+ */
+export default function NotificationsPage(): JSX.Element {
+  const { user } = useAuth()
+  const [publicUserId, setPublicUserId] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState<'unread' | 'read'>('unread')
+  const [unreadItems, setUnreadItems] = useState<AppNotification[]>([])
+  const [readItems, setReadItems] = useState<AppNotification[]>([])
+  const [loading, setLoading] = useState<boolean>(true)
+
+  /**
+   * loadLists
+   *
+   * Load both unread and read notifications for the target public users.id.
+   *
+   * @param targetPublicUserId - The id from public.users table.
+   */
+  async function loadLists(targetPublicUserId: string): Promise<void> {
+    setLoading(true)
+    try {
+      const [unread, read] = await Promise.all([
+        fetchNotificationsByReadState(targetPublicUserId, false, 100),
+        fetchNotificationsByReadState(targetPublicUserId, true, 200),
+      ])
+      setUnreadItems(unread)
+      setReadItems(read)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Resolve public.users.id once we have an authenticated user,
+  // then load the notification lists.
+  useEffect(() => {
+    let mounted = true
+
+    async function init(): Promise<void> {
+      if (!user?.id) {
+        setLoading(false)
+        return
+      }
+
+      const id = await resolvePublicUserId(user.id)
+      if (!mounted) return
+
+      setPublicUserId(id)
+      if (!id) {
+        setLoading(false)
+        return
+      }
+
+      await loadLists(id)
+    }
+
+    void init()
+
+    return () => {
+      mounted = false
+    }
+  }, [user?.id])
+
+  const currentItems = useMemo(
+    () => (activeTab === 'unread' ? unreadItems : readItems),
+    [activeTab, readItems, unreadItems]
+  )
+
+  /**
+   * handleMarkOneAsRead
+   *
+   * Mark a single notification as read and refresh the lists.
+   *
+   * @param item - Notification to mark as read.
+   */
+  async function handleMarkOneAsRead(item: AppNotification): Promise<void> {
+    const ok = await markNotificationRead(item.id)
+    if (!ok || !publicUserId) return
+    await loadLists(publicUserId)
+  }
+
+  /**
+   * handleMarkAllAsRead
+   *
+   * Mark all unread notifications for the current user as read.
+   */
+  async function handleMarkAllAsRead(): Promise<void> {
+    if (!publicUserId) return
+    const ok = await markAllNotificationsRead(publicUserId)
+    if (!ok) return
+    await loadLists(publicUserId)
+  }
+
+  return (
+    <Layout>
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between gap-3 mb-6">
+          <div>
+            <h1 className="text-2xl font-semibold text-slate-900">Notifications</h1>
+            <p className="text-sm text-slate-600 mt-1">
+              Game events and admin announcements in one place.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void handleMarkAllAsRead()}
+            className="px-3 py-2 rounded-md bg-slate-900 text-white text-sm disabled:opacity-50"
+            disabled={!publicUserId || unreadItems.length === 0}
+          >
+            Mark all as read
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 mb-4">
+          <button
+            type="button"
+            className={`px-3 py-1.5 rounded-md text-sm ${
+              activeTab === 'unread' ? 'bg-slate-900 text-white' : 'bg-white border border-slate-300 text-slate-700'
+            }`}
+            onClick={() => setActiveTab('unread')}
+          >
+            Unread ({unreadItems.length})
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1.5 rounded-md text-sm ${
+              activeTab === 'read' ? 'bg-slate-900 text-white' : 'bg-white border border-slate-300 text-slate-700'
+            }`}
+            onClick={() => setActiveTab('read')}
+          >
+            Read ({readItems.length})
+          </button>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+          {loading ? (
+            <div className="p-4 text-sm text-slate-600">Loading notifications…</div>
+          ) : currentItems.length === 0 ? (
+            <div className="p-4 text-sm text-slate-600">No {activeTab} notifications.</div>
+          ) : (
+            <ul className="divide-y divide-slate-200">
+              {currentItems.map((item) => {
+                const admin = isAdminNotification(item.type)
+
+                return (
+                  <li key={item.id} className="p-4 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span
+                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                            admin ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'
+                          }`}
+                        >
+                          {admin ? 'Admin' : 'Game'}
+                        </span>
+                        <span className="text-xs text-slate-500 uppercase tracking-wide">{item.type}</span>
+                      </div>
+                      <p className="text-sm text-slate-900">{item.message}</p>
+                      <p className="text-xs text-slate-500 mt-1">{formatDateTime(item.created_at)}</p>
+                    </div>
+
+                    {activeTab === 'unread' ? (
+                      <button
+                        type="button"
+                        className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-700 hover:bg-slate-50"
+                        onClick={() => void handleMarkOneAsRead(item)}
+                      >
+                        Mark read
+                      </button>
+                    ) : null}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </Layout>
+  )
+}

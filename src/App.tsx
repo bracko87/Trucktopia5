@@ -30,6 +30,7 @@ import FinancesPage from './pages/Finances'
 import MapPage from './pages/Map'
 import FacilitiesPage from './pages/Facilities'
 import ContractJobsPage from './pages/ContractJobs'
+import NotificationsPage from './pages/Notifications'
 
 /* Settings pages */
 import SettingsProfilePage from './pages/Settings/Profile'
@@ -179,6 +180,7 @@ export default function App() {
               <Route path="/my-jobs" element={<MyJobsPage />} />
               <Route path="/finances" element={<FinancesPage />} />
               <Route path="/map" element={<MapPage />} />
+              <Route path="/notifications" element={<NotificationsPage />} />
 
               {/* Settings pages */}
               <Route path="/settings/profile" element={<SettingsProfilePage />} />
@@ -196,6 +198,10 @@ export default function App() {
 
             {/* Global city modal (mounted once at app root) */}
             <CityModal />
+
+            {/* Global market abort listeners/modals */}
+            <OpenAbortModalListener />
+            <AbortJobModal />
 
             {/* Global helper to inject "Return to Trucks" buttons in some screens */}
             <ReturnToTrucksButtonInjector />

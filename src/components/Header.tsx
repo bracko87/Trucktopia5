@@ -13,6 +13,28 @@ import NotificationBell from './common/NotificationBell'
 import { supabase } from '../lib/supabase'
 
 /**
+ * resolvePublicUserId
+ *
+ * Resolves the public.users row id from the authenticated auth uid.
+ */
+async function resolvePublicUserId(authUserId: string): Promise<string | null> {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id')
+      .eq('auth_user_id', authUserId)
+      .limit(1)
+      .maybeSingle()
+
+    if (!error && data?.id) return String(data.id)
+  } catch {
+    // ignore
+  }
+
+  return null
+}
+
+/**
  * Header
  *
  * Renders the top application header. Also preloads company balance and
@@ -20,15 +42,14 @@ import { supabase } from '../lib/supabase'
  *
  * - Loads company balance and dispatches finances:summary for consumers.
  * - Loads unread notifications count and displays it on the bell.
- * - Subscribes to realtime notifications for the current user so the bell updates instantly.
- * - Marks notifications as read when the bell is clicked (so the counter clears).
+ * - Subscribes to realtime notifications for the resolved public user id so the bell updates instantly.
+ * - Clicking the bell opens the notifications page.
  *
  * @returns JSX.Element
  */
 export default function Header(): JSX.Element {
   const { user } = useAuth()
   const [unreadCount, setUnreadCount] = useState<number>(0)
-  const [markingRead, setMarkingRead] = useState<boolean>(false)
 
   /**
    * loadBalance
@@ -70,114 +91,77 @@ export default function Header(): JSX.Element {
       }
     }
 
-    loadBalance()
+    void loadBalance()
   }, [user])
 
   /**
    * Subscribe and load unread count
    *
-   * - Loads initial unread count filtered by user_id.
-   * - Subscribes to Postgres changes on notifications for this user and reloads count on events.
+   * - Resolves the public user id from auth uid.
+   * - Loads initial unread count filtered by public user id.
+   * - Subscribes to Postgres changes on notifications for that public user id.
    */
   useEffect(() => {
     if (!user?.id) return
 
     let mounted = true
+    let currentPublicUserId: string | null = null
+    let channel: ReturnType<typeof supabase.channel> | null = null
 
     async function loadUnread() {
+      if (!currentPublicUserId) return
+
       try {
         const { count, error } = await supabase
           .from('notifications')
           .select('*', { count: 'exact', head: true })
-          .eq('user_id', user.id)
+          .eq('user_id', currentPublicUserId)
           .is('read_at', null)
 
-        if (error) {
-          // eslint-disable-next-line no-console
-          console.debug('loadUnread error', error)
-          return
-        }
-
-        if (!mounted) return
+        if (error || !mounted) return
 
         setUnreadCount(typeof count === 'number' ? count : 0)
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.debug('loadUnread failed', err)
-      }
-    }
-
-    loadUnread()
-
-    // Subscribe to realtime notifications for the current user
-    const channel = supabase
-      .channel('notifications-live')
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'notifications',
-          filter: `user_id=eq.${user.id}`,
-        },
-        (payload) => {
-          // When notifications INSERT/UPDATE/DELETE occur, reload count.
-          // Optionally you can inspect payload.eventType to show a toast on INSERT.
-          void loadUnread()
-        }
-      )
-      .subscribe()
-
-    return () => {
-      mounted = false
-      // Remove subscription on cleanup
-      // supabase.removeChannel is available in this SDK; if using a different SDK version, adjust accordingly.
-      try {
-        supabase.removeChannel(channel)
-      } catch {
-        // ignore removal errors
-      }
-    }
-    // Re-subscribe when user id changes
-  }, [user?.id])
-
-  /**
-   * markNotificationsRead
-   *
-   * Marks all unread notifications as read (sets read_at) and refreshes the
-   * local unread counter. This is called when the user opens the notification
-   * list; server-side validation of race-conditions is expected.
-   */
-  async function markNotificationsRead() {
-    if (!user || markingRead) return
-    setMarkingRead(true)
-    try {
-      await supabase
-        .from('notifications')
-        .update({ read_at: new Date().toISOString() })
-        .is('read_at', null)
-
-      // Clear local counter optimistically
-      setUnreadCount(0)
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('markNotificationsRead failed', err)
-      // On error, attempt to reload exact count (best-effort)
-      try {
-        const { count, error } = await supabase
-          .from('notifications')
-          .select('*', { count: 'exact', head: true })
-          .is('read_at', null)
-        if (!error) {
-          setUnreadCount(typeof count === 'number' ? count : 0)
-        }
       } catch {
         // ignore
       }
-    } finally {
-      setMarkingRead(false)
     }
-  }
+
+    async function initNotifications() {
+      currentPublicUserId = await resolvePublicUserId(user.id)
+      if (!mounted || !currentPublicUserId) return
+
+      await loadUnread()
+
+      channel = supabase
+        .channel(`notifications-live-${currentPublicUserId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'notifications',
+            filter: `user_id=eq.${currentPublicUserId}`,
+          },
+          () => {
+            void loadUnread()
+          }
+        )
+        .subscribe()
+    }
+
+    void initNotifications()
+
+    return () => {
+      mounted = false
+      if (channel) {
+        try {
+          supabase.removeChannel(channel)
+        } catch {
+          // ignore removal errors
+        }
+      }
+    }
+  }, [user?.id])
 
   return (
     <header className="flex items-center justify-between px-6 py-3 bg-black text-white">
@@ -203,9 +187,7 @@ export default function Header(): JSX.Element {
             <NotificationBell
               unreadCount={unreadCount}
               onClick={() => {
-                // Mark notifications read when the bell is clicked.
-                // If you have a notification panel, open it here and call markNotificationsRead()
-                void markNotificationsRead()
+                window.location.href = '/notifications'
               }}
             />
             <SettingsMenu />
