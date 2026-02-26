@@ -28,33 +28,73 @@ export async function resolvePublicUserId(authUserId: string): Promise<string | 
   return data?.id ?? null
 }
 
+/**
+ * resolveNotificationUserIds
+ *
+ * Returns both possible notification user ids:
+ * - auth user id
+ * - resolved public users.id (when available)
+ *
+ * This keeps notification wiring compatible with legacy rows that may have used
+ * either identifier format in notifications.user_id.
+ */
+export async function resolveNotificationUserIds(authUserId: string): Promise<string[]> {
+  const ids = new Set<string>()
+  if (authUserId) ids.add(authUserId)
+
+  const publicId = await resolvePublicUserId(authUserId)
+  if (publicId) ids.add(publicId)
+
+  return Array.from(ids)
+}
+
 export async function fetchNotificationsByReadState(
-  publicUserId: string,
+  userIds: string | string[],
   read: boolean,
   limit = 50
 ): Promise<AppNotification[]> {
   try {
-    const base = supabase
+    const idList = Array.isArray(userIds) ? userIds : [userIds]
+    if (idList.length === 0) return []
+
+    const query = supabase
       .from('notifications')
       .select('id,user_id,type,entity_id,message,created_at,read_at')
-      .eq('user_id', publicUserId)
+      .in('user_id', idList)
       .order('created_at', { ascending: false })
       .limit(limit)
 
-    let res: any
-    if (read) {
-      res = await base.not('read_at', 'is', null)
-    } else {
-      res = await base.is('read_at', null)
-    }
+    const { data, error } = read
+      ? await query.not('read_at', 'is', null)
+      : await query.is('read_at', null)
 
-    if (res.error || !Array.isArray(res.data)) return []
+    if (error || !Array.isArray(data)) return []
 
-    return res.data as AppNotification[]
+    return data as AppNotification[]
   } catch (err) {
     // eslint-disable-next-line no-console
     console.debug('fetchNotificationsByReadState error', err)
     return []
+  }
+}
+
+export async function countUnreadNotifications(userIds: string | string[]): Promise<number> {
+  try {
+    const idList = Array.isArray(userIds) ? userIds : [userIds]
+    if (idList.length === 0) return 0
+
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .in('user_id', idList)
+      .is('read_at', null)
+
+    if (error) return 0
+    return typeof count === 'number' ? count : 0
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.debug('countUnreadNotifications error', err)
+    return 0
   }
 }
 
@@ -71,12 +111,15 @@ export async function markNotificationRead(id: string): Promise<boolean> {
   }
 }
 
-export async function markAllNotificationsRead(publicUserId: string): Promise<boolean> {
+export async function markAllNotificationsRead(userIds: string | string[]): Promise<boolean> {
   try {
+    const idList = Array.isArray(userIds) ? userIds : [userIds]
+    if (idList.length === 0) return false
+
     const { error } = await supabase
       .from('notifications')
       .update({ read_at: new Date().toISOString() })
-      .eq('user_id', publicUserId)
+      .in('user_id', idList)
       .is('read_at', null)
 
     return !error

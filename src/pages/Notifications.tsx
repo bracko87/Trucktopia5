@@ -4,19 +4,39 @@
  * In-app notifications center page. Shows unread/read tabs, allows marking
  * a single notification as read, and marking all unread ones as read.
  *
+ * Kept compatible with updated notification helper signatures that now
+ * accept arrays of user IDs.
+ *
  * Uses Layout and AuthContext provided by the application.
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
 import Layout from '../components/Layout'
 import { useAuth } from '../context/AuthContext'
-import type { AppNotification } from '../lib/notifications'
 import {
+  AppNotification,
   fetchNotificationsByReadState,
   markAllNotificationsRead,
   markNotificationRead,
-  resolvePublicUserId,
+  resolveNotificationUserIds,
 } from '../lib/notifications'
+
+/**
+ * formatDateTime
+ *
+ * Format an ISO timestamp into a readable local date/time string.
+ * Falls back to the raw value if parsing fails.
+ *
+ * @param iso - ISO 8601 timestamp string.
+ * @returns Human-readable date and time string.
+ */
+function formatDateTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString()
+  } catch {
+    return iso
+  }
+}
 
 /**
  * isAdminNotification
@@ -28,26 +48,7 @@ import {
  * @returns True if the notification should be labeled as Admin.
  */
 function isAdminNotification(type: string): boolean {
-  if (!type) return false
   return type.toUpperCase().startsWith('ADMIN')
-}
-
-/**
- * formatDateTime
- *
- * Format an ISO timestamp into a short date+time string suitable for UI.
- * Falls back to the raw value if parsing fails.
- *
- * @param iso - ISO 8601 timestamp string.
- * @returns Human-readable date and time string.
- */
-function formatDateTime(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  return date.toLocaleString(undefined, {
-    dateStyle: 'short',
-    timeStyle: 'short',
-  })
 }
 
 /**
@@ -59,7 +60,7 @@ function formatDateTime(iso: string): string {
  */
 export default function NotificationsPage(): JSX.Element {
   const { user } = useAuth()
-  const [publicUserId, setPublicUserId] = useState<string | null>(null)
+  const [userIds, setUserIds] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState<'unread' | 'read'>('unread')
   const [unreadItems, setUnreadItems] = useState<AppNotification[]>([])
   const [readItems, setReadItems] = useState<AppNotification[]>([])
@@ -68,16 +69,16 @@ export default function NotificationsPage(): JSX.Element {
   /**
    * loadLists
    *
-   * Load both unread and read notifications for the target public users.id.
+   * Load both unread and read notifications for the target notification user IDs.
    *
-   * @param targetPublicUserId - The id from public.users table.
+   * @param targetUserIds - Array of eligible notification user ids.
    */
-  async function loadLists(targetPublicUserId: string): Promise<void> {
+  async function loadLists(targetUserIds: string[]): Promise<void> {
     setLoading(true)
     try {
       const [unread, read] = await Promise.all([
-        fetchNotificationsByReadState(targetPublicUserId, false, 100),
-        fetchNotificationsByReadState(targetPublicUserId, true, 200),
+        fetchNotificationsByReadState(targetUserIds, false, 100),
+        fetchNotificationsByReadState(targetUserIds, true, 200),
       ])
       setUnreadItems(unread)
       setReadItems(read)
@@ -86,7 +87,7 @@ export default function NotificationsPage(): JSX.Element {
     }
   }
 
-  // Resolve public.users.id once we have an authenticated user,
+  // Resolve all eligible notification user ids once we have an authenticated user,
   // then load the notification lists.
   useEffect(() => {
     let mounted = true
@@ -97,16 +98,16 @@ export default function NotificationsPage(): JSX.Element {
         return
       }
 
-      const id = await resolvePublicUserId(user.id)
+      const ids = await resolveNotificationUserIds(user.id)
       if (!mounted) return
 
-      setPublicUserId(id)
-      if (!id) {
+      setUserIds(ids)
+      if (ids.length === 0) {
         setLoading(false)
         return
       }
 
-      await loadLists(id)
+      await loadLists(ids)
     }
 
     void init()
@@ -130,20 +131,20 @@ export default function NotificationsPage(): JSX.Element {
    */
   async function handleMarkOneAsRead(item: AppNotification): Promise<void> {
     const ok = await markNotificationRead(item.id)
-    if (!ok || !publicUserId) return
-    await loadLists(publicUserId)
+    if (!ok || userIds.length === 0) return
+    await loadLists(userIds)
   }
 
   /**
    * handleMarkAllAsRead
    *
-   * Mark all unread notifications for the current user as read.
+   * Mark all unread notifications for the current user scope as read.
    */
   async function handleMarkAllAsRead(): Promise<void> {
-    if (!publicUserId) return
-    const ok = await markAllNotificationsRead(publicUserId)
+    if (userIds.length === 0) return
+    const ok = await markAllNotificationsRead(userIds)
     if (!ok) return
-    await loadLists(publicUserId)
+    await loadLists(userIds)
   }
 
   return (
@@ -161,7 +162,7 @@ export default function NotificationsPage(): JSX.Element {
             type="button"
             onClick={() => void handleMarkAllAsRead()}
             className="px-3 py-2 rounded-md bg-slate-900 text-white text-sm disabled:opacity-50"
-            disabled={!publicUserId || unreadItems.length === 0}
+            disabled={userIds.length === 0 || unreadItems.length === 0}
           >
             Mark all as read
           </button>
@@ -171,7 +172,9 @@ export default function NotificationsPage(): JSX.Element {
           <button
             type="button"
             className={`px-3 py-1.5 rounded-md text-sm ${
-              activeTab === 'unread' ? 'bg-slate-900 text-white' : 'bg-white border border-slate-300 text-slate-700'
+              activeTab === 'unread'
+                ? 'bg-slate-900 text-white'
+                : 'bg-white border border-slate-300 text-slate-700'
             }`}
             onClick={() => setActiveTab('unread')}
           >
@@ -180,7 +183,9 @@ export default function NotificationsPage(): JSX.Element {
           <button
             type="button"
             className={`px-3 py-1.5 rounded-md text-sm ${
-              activeTab === 'read' ? 'bg-slate-900 text-white' : 'bg-white border border-slate-300 text-slate-700'
+              activeTab === 'read'
+                ? 'bg-slate-900 text-white'
+                : 'bg-white border border-slate-300 text-slate-700'
             }`}
             onClick={() => setActiveTab('read')}
           >
@@ -209,10 +214,14 @@ export default function NotificationsPage(): JSX.Element {
                         >
                           {admin ? 'Admin' : 'Game'}
                         </span>
-                        <span className="text-xs text-slate-500 uppercase tracking-wide">{item.type}</span>
+                        <span className="text-xs text-slate-500 uppercase tracking-wide">
+                          {item.type}
+                        </span>
                       </div>
                       <p className="text-sm text-slate-900">{item.message}</p>
-                      <p className="text-xs text-slate-500 mt-1">{formatDateTime(item.created_at)}</p>
+                      <p className="text-xs text-slate-500 mt-1">
+                        {formatDateTime(item.created_at)}
+                      </p>
                     </div>
 
                     {activeTab === 'unread' ? (

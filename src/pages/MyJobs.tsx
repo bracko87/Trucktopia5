@@ -6,8 +6,8 @@
  * Fixes:
  * - Do NOT rely on user.company_id being present on the auth user object.
  * - Resolve carrier company id via Supabase client queries from public.users / user_trucks / companies.
- * - Use the authenticated session access_token (RLS-safe) instead of anon bearer.
- * - URL-encode PostgREST select strings to avoid subtle parsing issues.
+ * - Use authenticated Supabase client queries for page-load data instead of brittle manual REST + API key headers.
+ * - URL-encode PostgREST select strings only where needed for legacy helper reuse.
  * - Fetch + map origin/destination client companies so JobCard shows company blocks.
  * - Fetch + map origin_city_id/destination_city_id so WeatherBadge can resolve weather.
  * - Retry without pickup_ready if backend schema doesn't yet have that column (42703).
@@ -214,7 +214,6 @@ export default function MyJobs(): JSX.Element {
 
     try {
       const session = await supabase.auth.getSession()
-      const accessToken = session.data.session?.access_token ?? null
       const authUserId = session.data.session?.user?.id ?? (user as any)?.id ?? null
 
       if (!authUserId) {
@@ -282,48 +281,54 @@ export default function MyJobs(): JSX.Element {
           ')',
       ].join(',')
 
-      let encodedSelect = encodeURIComponent(select)
+      let activeSelect = select
 
-      const buildAssignmentsUrl = (encoded: string) =>
-        `${API_BASE}/rest/v1/job_assignments` +
-        `?carrier_company_id=eq.${encodeURIComponent(String(carrierCompanyId))}` +
-        `&select=${encoded}` +
-        `&order=accepted_at.desc` +
-        `&limit=500`
+      let { data: jaDataRaw, error: jaErr } = await supabase
+        .from('job_assignments')
+        .select(activeSelect)
+        .eq('carrier_company_id', String(carrierCompanyId))
+        .order('accepted_at', { ascending: false })
+        .limit(500)
 
-      let jaRes = await fetch(buildAssignmentsUrl(encodedSelect), { headers: buildHeaders(accessToken) })
-      if (!jaRes.ok) {
-        const txt = await jaRes.text().catch(() => '')
-        if (shouldRetryWithoutPickupReady(jaRes.status, txt)) {
-          encodedSelect = stripPickupReadyFromEncodedSelect(encodedSelect)
-          jaRes = await fetch(buildAssignmentsUrl(encodedSelect), { headers: buildHeaders(accessToken) })
-        } else {
-          throw new Error(`Failed to load jobs: ${jaRes.status} ${txt}`)
+      if (jaErr) {
+        const errText = `${jaErr.code ?? ''} ${jaErr.message ?? ''} ${jaErr.details ?? ''} ${jaErr.hint ?? ''}`
+
+        if (shouldRetryWithoutPickupReady(400, errText)) {
+          activeSelect = decodeURIComponent(
+            stripPickupReadyFromEncodedSelect(encodeURIComponent(activeSelect))
+          )
+
+          const retryRes = await supabase
+            .from('job_assignments')
+            .select(activeSelect)
+            .eq('carrier_company_id', String(carrierCompanyId))
+            .order('accepted_at', { ascending: false })
+            .limit(500)
+
+          jaDataRaw = retryRes.data
+          jaErr = retryRes.error
         }
       }
 
-      if (!jaRes.ok) {
-        const txt = await jaRes.text().catch(() => '')
-        throw new Error(`Failed to load jobs: ${jaRes.status} ${txt}`)
+      if (jaErr) {
+        throw new Error(`Failed to load jobs: ${jaErr.message ?? 'unknown error'}`)
       }
 
-      const jaData = (await jaRes.json().catch(() => [])) as any[]
+      const jaData = Array.isArray(jaDataRaw) ? jaDataRaw : []
       const assignmentIds = (jaData ?? []).map((r) => r?.id).filter(Boolean) as string[]
 
       // Load driving_sessions for assignments (best-effort)
       const dsByAssignment: Record<string, any> = {}
       if (assignmentIds.length > 0) {
-        const inList = assignmentIds.join(',')
-        const dsUrl =
-          `${API_BASE}/rest/v1/driving_sessions` +
-          `?job_assignment_id=in.(${encodeURIComponent(inList)})` +
-          `&select=id,job_assignment_id,phase,updated_at,pickup_city_id,delivery_city_id` +
-          `&order=updated_at.desc` +
-          `&limit=2000`
+        const { data: dsRowsRaw, error: dsErr } = await supabase
+          .from('driving_sessions')
+          .select('id,job_assignment_id,phase,updated_at,pickup_city_id,delivery_city_id')
+          .in('job_assignment_id', assignmentIds)
+          .order('updated_at', { ascending: false })
+          .limit(2000)
 
-        const dsRes = await fetch(dsUrl, { headers: buildHeaders(accessToken) })
-        if (dsRes.ok) {
-          const dsRows = (await dsRes.json().catch(() => [])) as any[]
+        if (!dsErr) {
+          const dsRows = Array.isArray(dsRowsRaw) ? dsRowsRaw : []
           for (const row of dsRows) {
             const key = String(row.job_assignment_id ?? '')
             if (!key) continue
@@ -331,7 +336,7 @@ export default function MyJobs(): JSX.Element {
           }
         } else {
           // non-fatal
-          console.debug('[MyJobs] driving_sessions fetch failed', await dsRes.text().catch(() => ''))
+          console.debug('[MyJobs] driving_sessions fetch failed', dsErr)
         }
       }
 

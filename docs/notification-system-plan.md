@@ -13,6 +13,20 @@ This document defines **what should become a notification** and how to treat it 
   - `Admin` (blue badge, `type` starts with `ADMIN`)
   - `Game` (amber badge, all other types)
 
+## Where to define notification rules
+
+Use a single source of truth in the database:
+
+1. **DB functions/triggers/cron jobs** are responsible for creating rows in `public.notifications`.
+2. Frontend only reads and marks read/unread.
+3. Each producer inserts with a stable `type` and clear `message`.
+
+Recommended places:
+
+- `supabase/functions/*` for event-based inserts (hire, salary updates, etc.)
+- scheduled SQL function for time-based alerts (insurance expiry, loan due, contract expiry)
+- admin panel endpoint for `ADMIN_*` announcements
+
 ## What should create notifications
 
 Use notifications for events that are:
@@ -22,7 +36,7 @@ Use notifications for events that are:
 3. Status-complete transitions (job, hire, training, repair finished), or
 4. Platform announcements from admin.
 
-Do **not** notify for routine background updates that the user sees immediately in the current screen.
+Do **not** notify for routine background updates already visible on the active screen.
 
 ## Suggested type catalog
 
