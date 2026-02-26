@@ -7,8 +7,9 @@
  * job_assignments row, creating a driving session (if missing), updating
  * truck/trailer statuses and marking only the selected drivers as assigned.
  *
- * This prevents duplicate-insert unique-constraint errors (ux_job_offer_active_assignment)
- * and avoids mass-updating all free staff in a company.
+ * This prevents duplicate-insert unique-constraint errors (ux_job_offer_active_assignment),
+ * avoids mass-updating all free staff in a company, and now blocks finalization when the
+ * selected hired staff driver is already busy (not free/standby).
  *
  * Note: driving_sessions is treated as REQUIRED for active movement lifecycle.
  * If driving_sessions insert is blocked (including RLS), finalization now throws.
@@ -17,7 +18,8 @@
  * - Partial lifecycle enforcement is already implemented:
  *   1) truck uniqueness during active assignment is handled via
  *      ux_job_offer_truck_active_assignment conflict recovery/reuse paths
- *   2) selected drivers are marked as assigned on finalize
+ *   2) selected hired_staff drivers are validated as free/standby before finalize
+ *   3) selected drivers are marked as assigned on finalize
  *      (hired_staff.activity_id = 'assigned')
  */
 
@@ -48,6 +50,7 @@ export interface FinalizeAssignmentOpts {
  * Finalize an assignment by updating an existing job_assignments row (do NOT insert).
  *
  * Steps:
+ * 0) Validate the selected hired_staff driver is still free/standby (when provided).
  * 1) Find an existing assignment for the job_offer that is in an active/assignable state.
  * 2) If found, update the assignment with truck/user and move it to an active status.
  *    - Includes conflict recovery for ux_job_offer_truck_active_assignment to preserve
@@ -106,6 +109,29 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
     Array.isArray(assignment?.drivers) && assignment.drivers.length > 0
       ? String(assignment.drivers[0]?.id ?? '') || null
       : null
+
+  // Guard — prevent assigning a hired staff driver who is already busy.
+  if (selectedDriverId) {
+    try {
+      const { data: driverRow, error: driverErr } = await supabase
+        .from('hired_staff')
+        .select('id,activity_id')
+        .eq('id', selectedDriverId)
+        .limit(1)
+        .maybeSingle()
+
+      if (!driverErr && driverRow?.activity_id) {
+        const activity = String(driverRow.activity_id).toLowerCase()
+        if (!['free', 'standby'].includes(activity)) {
+          throw new Error('Selected driver is already assigned to another task')
+        }
+      }
+    } catch (driverCheckErr) {
+      // eslint-disable-next-line no-console
+      console.error('finalizeAssignmentDirect: driver availability check failed', driverCheckErr)
+      throw driverCheckErr
+    }
+  }
 
   // Prepare minimal update payload for the assignment
   const updatePayload: any = {

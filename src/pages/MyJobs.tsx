@@ -116,7 +116,7 @@ function unhideJobInMarket(jobOfferId: string) {
  */
 const API_BASE = 'https://iiunrkztuhhbdgxzqqgq.supabase.co'
 const SUPABASE_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
 
 function buildHeaders(accessToken?: string | null) {
   return {
@@ -543,7 +543,7 @@ export default function MyJobs(): JSX.Element {
 
         // Fallback path: cancel assignment + explicitly re-open offer so it returns to Market.
         if (!cancelledServerSide && assignmentId) {
-          await fetch(`${API_BASE}/rest/v1/job_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
+          const jaRes = await fetch(`${API_BASE}/rest/v1/job_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
             method: 'PATCH',
             headers: {
               ...buildHeaders(accessToken),
@@ -553,9 +553,13 @@ export default function MyJobs(): JSX.Element {
             body: JSON.stringify({ status: 'cancelled', cancelled_at: new Date().toISOString() }),
           })
 
+          if (!jaRes.ok) {
+            console.debug('[MyJobs] fallback cancel assignment PATCH failed', await jaRes.text().catch(() => ''))
+          }
+
           // Fallback: return offer to market if RPC is unavailable.
           if (jobOfferId) {
-            await fetch(`${API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobOfferId)}`, {
+            const offerRes = await fetch(`${API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobOfferId)}`, {
               method: 'PATCH',
               headers: {
                 ...buildHeaders(accessToken),
@@ -570,6 +574,26 @@ export default function MyJobs(): JSX.Element {
                 accepted_at: null,
               }),
             })
+
+            if (!offerRes.ok) {
+              console.debug('[MyJobs] fallback re-open job_offer PATCH failed', await offerRes.text().catch(() => ''))
+
+              // Last fallback via supabase client (some policies differ between REST and client path).
+              const { error: offerUpdateErr } = await supabase
+                .from('job_offers')
+                .update({
+                  status: 'open',
+                  assigned_user_truck_id: null,
+                  user_id: null,
+                  user_truck_id: null,
+                  accepted_at: null,
+                })
+                .eq('id', jobOfferId)
+
+              if (offerUpdateErr) {
+                console.debug('[MyJobs] supabase fallback re-open failed', offerUpdateErr)
+              }
+            }
           }
         }
 

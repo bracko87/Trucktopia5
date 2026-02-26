@@ -23,6 +23,11 @@
  * - Fixed Staging Cargo filtering so trailer jobs only appear in Cargo while still assigned.
  *   Once they move to active phases (picking_load, in_progress, etc.), they no longer remain in Cargo.
  *   Load-cargo jobs still stay visible while there is remaining payload.
+ *
+ * Latest update:
+ * - Ensured trailer service uses resolved company id state in Staging tabs
+ *   (not only initial auth snapshot), improving trailer fetch reliability
+ *   when company context resolves asynchronously.
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -209,6 +214,7 @@ export default function StagingTabs(): JSX.Element {
   const { user } = useAuth()
   const initialCompanyId =
     (user as any)?.company_id || (user as any)?.companyId || null
+  const [effectiveCompanyId, setEffectiveCompanyId] = useState<string | null>(initialCompanyId)
 
   // Trailers service (new)
   const {
@@ -216,7 +222,20 @@ export default function StagingTabs(): JSX.Element {
     loading: loadingTrailers,
     error: trailersError,
     refresh: refreshTrailers,
-  } = useTrailersService(initialCompanyId || undefined)
+  } = useTrailersService(effectiveCompanyId || undefined)
+
+  useEffect(() => {
+    let mounted = true
+    ;(async () => {
+      const cid = await resolveCompanyId()
+      if (!mounted) return
+      if (cid) setEffectiveCompanyId(String(cid))
+    })()
+    return () => {
+      mounted = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Fallback direct company trucks
   const [companyTrucks, setCompanyTrucks] = useState<TruckCardRow[]>([])
@@ -823,7 +842,7 @@ export default function StagingTabs(): JSX.Element {
             location_city_id: locId,
             // explicit alias: current_location_id for clarity (mapped from stats.current_location_id)
             current_location_id: locId,
-          }
+            }
         })
 
       // Merge: profile drivers first (owner/CEO visible on top), then hired drivers

@@ -45,6 +45,7 @@ function buildDisplayName(row: any): string | null {
  * - Improved Active-name hydration in fallback mode: fallback rows now load and attach
  *   truck/trailer/driver objects by backend IDs (user_trucks, user_trailers, hired_staff/users)
  *   so Active details can show names instead of —.
+ * - Driver linkage now prefers assignment_previews.driver_id over assignment.user_id.
  */
 async function loadActiveAssignmentsFallback(companyId: string) {
   // IMPORTANT: Do not include plain "assigned" here.
@@ -74,8 +75,10 @@ async function loadActiveAssignmentsFallback(companyId: string) {
         'user_id',
         'final_reward',
         'accepted_at',
+        'assignment_preview_id',
         'assigned_payload_kg',
         'payload_remaining_kg',
+        'assignment_preview:assignment_preview_id(driver_id)',
         'job_offer:job_offer_id(' +
           'id,' +
           'transport_mode,' +
@@ -102,7 +105,14 @@ async function loadActiveAssignmentsFallback(companyId: string) {
   // ---- NEW: hydrate related entities (trucks/trailers/drivers) for fallback rows ----
   const truckIds = Array.from(new Set(rows.map((r: any) => r?.user_truck_id).filter(Boolean).map(String)))
   const trailerIds = Array.from(new Set(rows.map((r: any) => r?.user_trailer_id).filter(Boolean).map(String)))
-  const userIds = Array.from(new Set(rows.map((r: any) => r?.user_id).filter(Boolean).map(String)))
+  const userIds = Array.from(
+    new Set(
+      rows
+        .map((r: any) => r?.assignment_preview?.driver_id ?? r?.user_id)
+        .filter(Boolean)
+        .map(String)
+    )
+  )
 
   const truckMap: Record<string, any> = {}
   const trailerMap: Record<string, any> = {}
@@ -247,7 +257,7 @@ async function loadActiveAssignmentsFallback(companyId: string) {
     created_at: a.accepted_at ?? null,
     user_truck_id: a.user_truck_id ?? null,
     user_trailer_id: a.user_trailer_id ?? null,
-    driver_id: a.user_id ?? null,
+    driver_id: a.assignment_preview?.driver_id ?? a.user_id ?? null,
     relocation_ready_at: null,
 
     // NEW: attach hydrated truck on the session row too
@@ -259,7 +269,9 @@ async function loadActiveAssignmentsFallback(companyId: string) {
       // NEW: attach hydrated entities so UI can show names/details
       user_truck: a.user_truck_id ? truckMap[String(a.user_truck_id)] ?? null : null,
       user_trailer: a.user_trailer_id ? trailerMap[String(a.user_trailer_id)] ?? null : null,
-      driver: a.user_id ? driverMap[String(a.user_id)] ?? null : null,
+      driver:
+        (a.assignment_preview?.driver_id ? driverMap[String(a.assignment_preview.driver_id)] ?? null : null) ??
+        (a.user_id ? driverMap[String(a.user_id)] ?? null : null),
 
       resolved_reward:
         a.final_reward ??
@@ -441,9 +453,11 @@ export async function loadOnDutySessions(companyId?: string | null) {
           'user_truck_id',
           'user_trailer_id',
           'user_id',
+          'assignment_preview_id',
           'final_reward',
           'assigned_payload_kg',
           'payload_remaining_kg',
+          'assignment_preview:assignment_preview_id(driver_id)',
           'job_offer:job_offer_id(' +
             'id,' +
             'transport_mode,' +
@@ -483,6 +497,7 @@ export async function loadOnDutySessions(companyId?: string | null) {
       if (a.user_truck_id) truckIds.add(String(a.user_truck_id))
       if (a.user_trailer_id) trailerIds.add(String(a.user_trailer_id))
       if (a.user_id) userIds.add(String(a.user_id))
+      if (a?.assignment_preview?.driver_id) userIds.add(String(a.assignment_preview.driver_id))
     })
 
     // Add drivers/trucks/trailers referenced on sessions (some schemas put these on the session row)
@@ -790,12 +805,14 @@ export async function loadOnDutySessions(companyId?: string | null) {
           (trailerFromAssignmentId ? trailerMap[trailerFromAssignmentId] ?? null : null) ??
           (trailerFromSessionId ? trailerMap[trailerFromSessionId] ?? null : null)
 
-        // Driver resolution: prefer assignment.user_id, then session-level driver_id
-        let driver = (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ?? null
-
-        if (!driver) {
-          if (s.driver_id && driverMap[String(s.driver_id)]) driver = driverMap[String(s.driver_id)]
-        }
+        // Driver resolution: prefer authoritative session driver, then preview-selected driver, then assignment user.
+        const driver =
+          (s.driver_id ? driverMap[String(s.driver_id)] : null) ??
+          (assignment?.assignment_preview?.driver_id
+            ? driverMap[String(assignment.assignment_preview.driver_id)]
+            : null) ??
+          (assignment.user_id ? driverMap[String(assignment.user_id)] : null) ??
+          null
 
         return {
           ...s,
