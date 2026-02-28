@@ -42,6 +42,12 @@
  *   it retries automatically using job_assignments.user_id filtered to users belonging to the company,
  *   and drops payload columns so the Cargo tab stays functional instead of failing.
  *   Existing cargo filtering and remaining-payload behavior is unchanged.
+ *
+ * Latest cargo bridge update:
+ * - Staging Cargo now also includes waiting items from accepted_jobs (status in 'accepted'/'assigned')
+ *   scoped to company users, so newly accepted jobs appear in Staging before they become job_assignments.
+ * - job_assignments remains primary, and rows are deduped by job_offer.id so the same job does not show twice.
+ * - trailer_cargo visibility includes accepted status so newly accepted trailer jobs are visible before assignment.
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -886,6 +892,9 @@ export default function StagingTabs(): JSX.Element {
             location_city_id: locId,
             // explicit alias: current_location_id for clarity (mapped from stats.current_location_id)
             current_location_id: locId,
+            skill1: null,
+            skill2: null,
+            skill3: null,
           }
         })
 
@@ -904,22 +913,20 @@ export default function StagingTabs(): JSX.Element {
   /**
    * fetchAssignedJobs
    *
-   * Loads cargo jobs assigned to the company by querying job_assignments and embedding the job_offer.
+   * Loads cargo jobs available to the company by querying job_assignments and accepted_jobs.
    *
-   * Note: original query included a non-existent job_assignment_id column. That field
-   * has been removed to avoid SQL/postgrest errors.
-   *
-   * Updated for multi-run continuity:
-   * includes active statuses so remaining payload jobs stay visible after a run starts.
-   *
-   * Updated cargo filtering behavior:
-   * - trailer_cargo: only show while status is still "assigned"
-   * - load_cargo: keep visible while there is remaining payload
+   * job_assignments remains the primary source.
+   * accepted_jobs is included for waiting queue continuity so newly accepted jobs
+   * are visible in Staging Cargo before they are promoted into job_assignments.
    *
    * Schema compatibility update:
    * - first attempts to query payload columns using carrier_company_id
    * - if PostgREST returns 42703 for missing payload columns and/or carrier_company_id,
    *   retries automatically using legacy user_id filtering and without payload columns
+   *
+   * Deduping:
+   * - accepted_jobs rows are deduped by job_offer.id against job_assignments rows
+   *   so already-assigned jobs do not appear twice.
    */
   async function fetchAssignedJobs(overrideCompanyId?: string) {
     setLoadingCargo(true)
@@ -999,7 +1006,7 @@ export default function StagingTabs(): JSX.Element {
         return await q
       }
 
-      let { data, error } = await queryAssignments(true, true)
+      let { data: assignmentRowsRaw, error } = await queryAssignments(true, true)
 
       const missingSchemaColumns =
         error &&
@@ -1009,15 +1016,74 @@ export default function StagingTabs(): JSX.Element {
         )
 
       if (missingSchemaColumns) {
-        ;({ data, error } = await queryAssignments(false, false))
+        ;({ data: assignmentRowsRaw, error } = await queryAssignments(false, false))
       }
 
       if (error) throw error
 
-      const normalized = Array.isArray(data) ? data : []
+      const assignmentRows = Array.isArray(assignmentRowsRaw) ? assignmentRowsRaw : []
+
+      // Include waiting queue from accepted_jobs so newly accepted jobs are visible in staging.
+      let acceptedRows: any[] = []
+      if (companyUserIds.length > 0) {
+        const { data: acceptedRaw, error: acceptedErr } = await supabase
+          .from('accepted_jobs')
+          .select(
+            `
+              id,
+              user_id,
+              status,
+              accepted_at,
+              assigned_at,
+              total_payload_kg,
+              remaining_payload_kg,
+              job_offer:job_offer_id(${jobOfferSelect})
+            `
+          )
+          .in('user_id', companyUserIds)
+          .in('status', ['accepted', 'assigned'])
+          .order('accepted_at', { ascending: false })
+          .limit(500)
+
+        if (acceptedErr) {
+          // eslint-disable-next-line no-console
+          console.debug('fetchAssignedJobs: accepted_jobs query failed', acceptedErr)
+        } else {
+          acceptedRows = Array.isArray(acceptedRaw) ? acceptedRaw : []
+        }
+      }
+
+      const normalizedAssignments = assignmentRows.map((row: any) => ({
+        ...row,
+        _source: 'job_assignments',
+      }))
+
+      const assignmentOfferIds = new Set(
+        normalizedAssignments
+          .map((row: any) => row?.job_offer?.id)
+          .filter((id: any) => typeof id === 'string' && id.length > 0)
+      )
+
+      const normalizedAccepted = acceptedRows
+        .filter((row: any) => {
+          const offerId = row?.job_offer?.id
+          return typeof offerId === 'string' && offerId.length > 0 && !assignmentOfferIds.has(offerId)
+        })
+        .map((row: any) => ({
+          id: row.id,
+          status: row.status,
+          accepted_job_id: row.id,
+          assigned_payload_kg: null,
+          payload_remaining_kg:
+            row?.remaining_payload_kg ?? row?.total_payload_kg ?? row?.job_offer?.remaining_payload ?? row?.job_offer?.weight_kg ?? null,
+          job_offer: row.job_offer ?? null,
+          _source: 'accepted_jobs',
+        }))
+
+      const normalized = [...normalizedAssignments, ...normalizedAccepted]
 
       // Keep Cargo list aligned with My Jobs behavior:
-      // - trailer_cargo: one-run jobs should only appear before activation (status=assigned)
+      // - trailer_cargo: one-run jobs should appear before activation (accepted/assigned)
       // - load_cargo: keep visible while there is remaining payload
       const filtered = normalized.filter((row: any) => {
         const job = row?.job_offer ?? {}
@@ -1025,7 +1091,7 @@ export default function StagingTabs(): JSX.Element {
         const status = String(row?.status ?? '').toLowerCase()
 
         if (mode === 'trailer_cargo') {
-          return status === 'assigned'
+          return status === 'assigned' || status === 'accepted'
         }
 
         const rowRemaining = Number(row?.payload_remaining_kg ?? NaN)
@@ -1315,20 +1381,14 @@ export default function StagingTabs(): JSX.Element {
                       (assignment?.cargo?.cargo_type_id as string | null) ??
                       null
 
-                    const basicAvailable =
-                      Boolean(tr && tr.isActive !== false && (tr.status ?? 'available') === 'available')
-
-                    const truck = assignment?.truck
-
                     const compatible = Boolean(
                       tr &&
                         tr.isActive !== false &&
                         (tr.status ?? 'available') === 'available' &&
                         (!jobCargoTypeId || String(tr.cargoTypeId) === String(jobCargoTypeId)) &&
-                        (!truck || gcwAllowsTrailer(truck, tr))
+                        (!assignment?.truck || gcwAllowsTrailer(assignment.truck, tr))
                     )
 
-                    const currentId = String(tr.id ?? tr._raw?.id ?? '')
                     return (
                       <li
                         key={tr.id ?? tr._raw?.id ?? Math.random()}
@@ -1393,7 +1453,6 @@ export default function StagingTabs(): JSX.Element {
               ) : (
                 <ul className="space-y-2">
                   {drivers.map((d) => {
-                    // --- NEW: same-city / assignable check (driver.current_location_id vs truck.location_city_id)
                     const truckCityId =
                       assignment?.truck?.location_city_id ??
                       assignment?.truck?._raw?.location_city_id ??
@@ -1405,7 +1464,6 @@ export default function StagingTabs(): JSX.Element {
                     const canAssign =
                       Boolean(truckCityId) &&
                       Boolean(driverCityId)
-                    // --- END same-city / assignable check
 
                     return (
                       <li
@@ -1478,10 +1536,8 @@ export default function StagingTabs(): JSX.Element {
                                   assignment?.truck?._raw?.location_city_id ??
                                   null
 
-                                // Driver's current location id (explicit alias if present)
                                 const driverCityIdInner = d.current_location_id ?? d.location_city_id ?? null
 
-                                // Relocation required only when both IDs exist and differ.
                                 const needsRelocation = Boolean(
                                   truckCityIdInner &&
                                   driverCityIdInner &&
@@ -1532,7 +1588,7 @@ export default function StagingTabs(): JSX.Element {
               ) : cargoError ? (
                 <div className="text-sm text-red-600">Error loading cargo: {cargoError}</div>
               ) : cargoJobs.length === 0 ? (
-                <div className="text-sm text-slate-500">No assigned cargo.</div>
+                <div className="text-sm text-slate-500">No available cargo.</div>
               ) : (
                 <ul className="space-y-2">
                   {cargoJobs.map((assignment: any) => {
@@ -1554,7 +1610,7 @@ export default function StagingTabs(): JSX.Element {
                     const weight =
                       Number.isFinite(rowRemainingPayload) && rowRemainingPayload > 0
                         ? rowRemainingPayload
-                        : rowStatus === 'assigned'
+                        : rowStatus === 'assigned' || rowStatus === 'accepted'
                         ? (Number.isFinite(offerRemainingPayload)
                             ? offerRemainingPayload
                             : Number.isFinite(offerWeight)
@@ -1568,7 +1624,6 @@ export default function StagingTabs(): JSX.Element {
 
                     const reward = transportMode === 'trailer_cargo' ? job.reward_trailer_cargo : job.reward_load_cargo
 
-                    // Determine if pickup time has arrived. If pickup_time is missing, consider it ready.
                     const pickupMs = pickup ? new Date(String(pickup)).getTime() : null
                     const pickupReady = pickupMs == null ? true : pickupMs <= Date.now()
 
@@ -1577,7 +1632,7 @@ export default function StagingTabs(): JSX.Element {
 
                     return (
                       <li
-                        key={assignment.id}
+                        key={`${assignment._source ?? 'unknown'}:${assignment.id}`}
                         draggable={pickupReady}
                         onDragStart={(ev) => {
                           if (!pickupReady) {
@@ -1589,9 +1644,11 @@ export default function StagingTabs(): JSX.Element {
                             id: assignment.id,
                             label: cargoItemName,
                             status: assignment.status ?? null,
+                            accepted_job_id: assignment.accepted_job_id ?? null,
                             assigned_payload_kg: assignment.assigned_payload_kg ?? null,
                             payload_remaining_kg: assignment.payload_remaining_kg ?? null,
                             job_offer: job,
+                            _source: assignment._source ?? null,
                           }
                           ev.dataTransfer.setData('application/json', JSON.stringify(payload))
                           ev.dataTransfer.setData('text/plain', `cargo:${assignment.id}:${cargoItemName}`)
