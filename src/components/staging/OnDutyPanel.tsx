@@ -1,14 +1,12 @@
 /**
  * src/components/staging/OnDutyPanel.tsx
  *
- * Compact "On duty" panel showing active assignments as single horizontal rows.
- * This file loads driving_sessions and related nested job_assignment -> job_offer info,
- * then renders a compact list. The main goal of the rewrite is to broaden matching
- * logic and accepted phases so assigned rows are not accidentally filtered out.
+ * Compact "On duty" panel showing active assignments.
  *
- * Notes:
- * - UI design / layout are intentionally preserved from the original component.
- * - This file includes additional console.debug logs to help diagnose skipped rows.
+ * This rewrite:
+ * - Avoids querying driving_sessions REST endpoint (not present in some schemas).
+ * - Queries job_assignments directly and uses created_at/ status fields.
+ * - Keeps UI layout and behavior intact while using safe field names.
  */
 
 import React, { useCallback, useEffect, useState } from 'react'
@@ -18,13 +16,14 @@ import { useAuth } from '../../context/AuthContext'
 /**
  * ActiveAssignmentRow
  *
- * Minimal representation of the job_assignment/job_offer used by the panel.
+ * Minimal representation of a job_assignment used by the panel.
  */
 interface ActiveAssignmentRow {
   id: string
-  status: string | null
-  user_truck_id: string | null
-  accepted_at: string | null
+  status?: string | null
+  user_truck_id?: string | null
+  accepted_at?: string | null
+  created_at?: string | null
   job_offer?: {
     id?: string | null
     distance_km?: number | null
@@ -49,9 +48,6 @@ interface TruckInfo {
  * getShortId
  *
  * Return a short readable id for display.
- *
- * @param id full id string
- * @returns shortened id
  */
 function getShortId(id?: string | null) {
   if (!id) return '—'
@@ -62,8 +58,6 @@ function getShortId(id?: string | null) {
  * StatusBadge
  *
  * Small status label for active phases.
- *
- * @param props.status string
  */
 function StatusBadge({ status }: { status?: string | null }) {
   const s = (status ?? '').toLowerCase()
@@ -85,8 +79,6 @@ function StatusBadge({ status }: { status?: string | null }) {
  * ProgressBar
  *
  * Visual progress bar with percentage label.
- *
- * @param props.value numeric progress 0-100
  */
 function ProgressBar({ value }: { value: number }) {
   const v = Math.max(0, Math.min(100, Math.round(value)))
@@ -104,9 +96,6 @@ function ProgressBar({ value }: { value: number }) {
  * normalizePhase
  *
  * Normalize DB phase/status values to lowercase string for consistent UI.
- *
- * @param raw raw phase value
- * @returns normalized phase string
  */
 function normalizePhase(raw: any): string {
   if (raw === undefined || raw === null) return ''
@@ -120,15 +109,8 @@ function normalizePhase(raw: any): string {
 /**
  * OnDutyPanel
  *
- * Main component that loads and renders active driving sessions for a company.
- *
- * Changes in this rewrite:
- * - Query includes common session-level company columns and session truck id.
- * - Company matching is widened to check several possible fields.
- * - Phase acceptance is relaxed: exclude clearly finished/idle states instead of
- *   requiring a small whitelist (safer across schema variations).
- *
- * @param props.companyId optional company id override
+ * Main component that loads and renders active job_assignments for a company.
+ * Uses job_assignments (not driving_sessions) for compatibility.
  */
 export default function OnDutyPanel({ companyId }: { companyId?: string | null }) {
   const { user } = useAuth()
@@ -141,20 +123,8 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
   const [truckMap, setTruckMap] = useState<Record<string, TruckInfo>>({})
   const [driverMap, setDriverMap] = useState<Record<string, string>>({}) // assignmentId -> driver display name
 
-  /**
-   * expanded
-   *
-   * Local UI map tracking which assignment rows are expanded to show details.
-   */
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
-  /**
-   * toggleExpanded
-   *
-   * Toggle the expanded state for a given assignment id so the details block shows/hides.
-   *
-   * @param id assignment id to toggle
-   */
   function toggleExpanded(id: string) {
     setExpanded((prev) => ({
       ...prev,
@@ -162,129 +132,89 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
     }))
   }
 
-  /**
-   * isTerminalPhase
-   *
-   * Return true for phases that should be considered finished/irrelevant for "on duty".
-   *
-   * @param normalized normalized phase string
-   */
   function isTerminalPhase(normalized: string) {
-    return ['idle', 'finished', 'complete', 'completed', 'done', 'cancelled', 'canceled', 'archived'].includes(
-      normalized
-    )
+    return ['idle', 'finished', 'complete', 'completed', 'done', 'cancelled', 'canceled', 'archived'].includes(normalized)
   }
 
   /**
    * fetchOnDuty
    *
-   * Load recent driving_sessions and related nested job_assignment -> job_offer info.
-   * Then perform batch truck lookup and per-assignment driver lookup (best-effort).
+   * Load recent job_assignments and related nested job_offer info.
+   * Then perform truck lookup and best-effort driver lookup.
    */
   const fetchOnDuty = useCallback(async () => {
     setLoading(true)
     setError(null)
 
     try {
-      // Defensive: if no company resolved, we'll show all active sessions (useful for debugging)
-      // but still prefer showing rows belonging to resolvedCompanyId when present.
-      // Fetch session + assignment columns that may contain company/truck references.
-      const { data, error: err } = await supabase
-        .from('driving_sessions')
+      // Fetch recent job_assignments with nested job_offer
+      const q = supabase
+        .from('job_assignments')
         .select(
           `
           id,
-          phase,
+          status,
           user_truck_id,
           user_trailer_id,
           distance_completed_km,
           total_distance_km,
-          phase_started_at,
           created_at,
           carrier_company_id,
           owner_company_id,
           company_id,
-          job_assignment:job_assignment_id(
+          job_offer:job_offer_id(
             id,
-            status,
-            user_truck_id,
-            accepted_at,
-            carrier_company_id,
-            owner_company_id,
-            company_id,
-            job_offer:job_offer_id(
-              id,
-              distance_km,
-              origin_city:origin_city_id(city_name, country_code),
-              destination_city:destination_city_id(city_name, country_code)
-            )
+            distance_km,
+            origin_city:origin_city_id(city_name, country_code),
+            destination_city:destination_city_id(city_name, country_code)
           )
         `
         )
         .order('created_at', { ascending: false })
         .limit(500)
 
+      if (resolvedCompanyId) {
+        // keep company filter if available
+        ;(q as any).eq('carrier_company_id', resolvedCompanyId)
+      }
+
+      const { data, error: err } = await q
       if (err) throw err
 
       const rows = Array.isArray(data) ? (data as any[]) : []
 
-      // Filter: accept rows that are not terminal (idle/finished) and where company
-      // matches resolvedCompanyId when provided. If no resolvedCompanyId, do not filter by company.
+      // Filter: exclude terminal statuses
       const filtered = rows.filter((r) => {
-        const phaseNorm = normalizePhase(r.phase ?? (r.job_assignment?.status ?? null))
-
-        // Skip terminal phases
+        const phaseNorm = normalizePhase(r.status ?? null)
         if (isTerminalPhase(phaseNorm)) return false
 
-        const a = r.job_assignment ?? {}
-
-        /**
-         * Collect a set of possible company-id fields that different schemas may use.
-         * We stringify everything so comparisons are consistent.
-         */
-        const candidates = [
-          a.carrier_company_id,
-          a.owner_company_id,
-          a.company_id,
-          (r as any).carrier_company_id,
-          (r as any).owner_company_id,
-          (r as any).company_id,
-        ]
-          .filter((x) => x !== undefined && x !== null)
-          .map((x) => String(x))
-
-        const resolvedStr = resolvedCompanyId ? String(resolvedCompanyId) : null
-        const match = resolvedStr ? candidates.includes(resolvedStr) : true // if no company resolved, accept
-
-        if (!match) {
-          // Helpful debug: why a row was skipped
-          // eslint-disable-next-line no-console
-          console.debug('OnDutyPanel: skipped driving_session (company mismatch)', {
-            rowId: r.id,
-            phase: phaseNorm,
-            assignmentCompany:
-              a.carrier_company_id ?? a.owner_company_id ?? a.company_id ?? null,
-            sessionCompany:
-              (r as any).carrier_company_id ?? (r as any).owner_company_id ?? (r as any).company_id ?? null,
-            resolvedCompanyId,
-            candidates,
-          })
-          return false
+        // If company filter was used ensure this row belongs to the company when possible
+        if (resolvedCompanyId) {
+          const aCompanyCandidates = [
+            r.carrier_company_id,
+            r.owner_company_id,
+            r.company_id,
+            r.job_offer?.carrier_company_id,
+          ].filter(Boolean)
+          if (aCompanyCandidates.length > 0 && !aCompanyCandidates.map(String).includes(String(resolvedCompanyId))) {
+            // skip rows not belonging to the resolved company
+            return false
+          }
         }
 
         return true
       })
 
-      // Map into local shape and prefer assignment user_truck_id, fall back to session-level user_truck_id
       const mapped: ActiveAssignmentRow[] = filtered.map((row) => {
-        const a = row.job_assignment ?? {}
-        const normalizedStatus = normalizePhase(row.phase ?? a.status ?? null) || null
+        const a = row ?? {}
+        const normalizedStatus = normalizePhase(a.status ?? null) || null
 
         return {
-          id: String(a.id ?? row.id ?? ''),
+          id: String(a.id ?? ''),
           status: normalizedStatus,
-          user_truck_id: a.user_truck_id ?? row.user_truck_id ?? null,
-          accepted_at: a.accepted_at ?? row.phase_started_at ?? null,
+          user_truck_id: a.user_truck_id ?? null,
+          accepted_at: a.accepted_at ?? null,
+          created_at: a.created_at ?? null,
           job_offer: a.job_offer
             ? {
                 id: a.job_offer.id ?? null,
@@ -307,10 +237,7 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
       const truckIds = Array.from(new Set(mapped.map((m) => m.user_truck_id).filter(Boolean))) as string[]
       if (truckIds.length > 0) {
         try {
-          const { data: trucks } = await supabase
-            .from('user_trucks')
-            .select('id,name,registration')
-            .in('id', truckIds)
+          const { data: trucks } = await supabase.from('user_trucks').select('id,name,registration').in('id', truckIds)
           const map: Record<string, TruckInfo> = {}
           if (Array.isArray(trucks)) {
             trucks.forEach((t: any) => {
@@ -319,7 +246,7 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
           }
           setTruckMap(map)
         } catch (e) {
-          // tolerate silently; UI will fallback to ids
+          // tolerate silently
           // eslint-disable-next-line no-console
           console.debug('OnDutyPanel: truck batch fetch failed', e)
         }
@@ -327,7 +254,7 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
         setTruckMap({})
       }
 
-      // Per-assignment driver lookup (best-effort). Tries common column names.
+      // Per-assignment driver lookup (best-effort)
       const driverPromises = mapped.map(async (m) => {
         try {
           const { data: byJobAssignment } = await supabase
@@ -338,9 +265,7 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
             .maybeSingle()
 
           if (byJobAssignment) {
-            const name =
-              byJobAssignment.display_name ??
-              `${byJobAssignment.first_name ?? ''} ${byJobAssignment.last_name ?? ''}`.trim()
+            const name = byJobAssignment.display_name ?? `${byJobAssignment.first_name ?? ''} ${byJobAssignment.last_name ?? ''}`.trim()
             return { id: m.id, name: name || '—' }
           }
 
@@ -352,12 +277,10 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
             .maybeSingle()
 
           if (byAssignment) {
-            const name =
-              byAssignment.display_name ?? `${byAssignment.first_name ?? ''} ${byAssignment.last_name ?? ''}`.trim()
+            const name = byAssignment.display_name ?? `${byAssignment.first_name ?? ''} ${byAssignment.last_name ?? ''}`.trim()
             return { id: m.id, name: name || '—' }
           }
 
-          // Last fallback: none found
           return { id: m.id, name: '—' }
         } catch (e) {
           // eslint-disable-next-line no-console
@@ -483,7 +406,7 @@ export default function OnDutyPanel({ companyId }: { companyId?: string | null }
 
                       <div>
                         <div className="text-xs text-slate-500">Accepted</div>
-                        <div className="font-medium text-slate-800">{a.accepted_at ? new Date(a.accepted_at).toLocaleString() : '—'}</div>
+                        <div className="font-medium text-slate-800">{a.accepted_at ? new Date(a.accepted_at).toLocaleString() : a.created_at ? new Date(a.created_at).toLocaleString() : '—'}</div>
                       </div>
 
                       <div>

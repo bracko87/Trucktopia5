@@ -14,7 +14,7 @@ import Layout from '../components/Layout'
  */
 export default function FacilitiesPage(): JSX.Element {
   return (
-    <Layout>
+    <Layout fullWidth>
       <div className="space-y-6">
         <header>
           <h1 className="text-2xl font-bold">Facilities</h1>

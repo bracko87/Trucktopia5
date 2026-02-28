@@ -1,23 +1,16 @@
 /**
  * MyJobs.tsx
  *
- * Page that lists jobs accepted by the user's company and allows confirming acceptance details.
+ * New flow:
+ * - Uses accepted_jobs as the source of truth for My Jobs
+ * - Uses job_assignments + job_run_executions only as supporting runtime detail
+ * - Adds History button + popup (last 30 days via backend history_visible_until rule)
+ * - Uses cancel_accepted_job RPC for pre-runtime cancellation
  *
- * Fixes:
- * - Do NOT rely on user.company_id being present on the auth user object.
- * - Resolve carrier company id via Supabase client queries from public.users / user_trucks / companies.
- * - Use authenticated Supabase client queries for page-load data instead of brittle manual REST + API key headers.
- * - URL-encode PostgREST select strings only where needed for legacy helper reuse.
- * - Fetch + map origin/destination client companies so JobCard shows company blocks.
- * - Fetch + map origin_city_id/destination_city_id so WeatherBadge can resolve weather.
- * - Retry without pickup_ready if backend schema doesn't yet have that column (42703).
- *
- * Cancellation behavior:
- * - Preferred path uses DB RPC cancel_assignment(p_assignment_id) so backend handles
- *   penalty/session/offer reopen logic.
- * - Fallback path patches job_assignments as cancelled and explicitly reopens job_offers
- *   so the job returns to Market if RPC is unavailable.
- * - After cancel, remove the job from Market's local hidden-id set so it can reappear.
+ * Page mapping:
+ * - Waiting  -> accepted_jobs.status in ('accepted', 'assigned')
+ * - Active   -> accepted_jobs.status = 'in_progress'
+ * - History  -> accepted_jobs.status in ('completed','aborted','cancelled','expired')
  */
 
 import React, { useEffect, useMemo, useState } from 'react'
@@ -28,28 +21,55 @@ import CancelPenaltyModal from '../components/market/CancelPenaltyModal'
 import { useAuth } from '../context/AuthContext'
 import { supabase } from '../lib/supabase'
 
-/**
- * SectionBoxProps
- */
 interface SectionBoxProps {
   title: string
   subtitle?: string
   children: React.ReactNode
   count?: number
+  action?: React.ReactNode
 }
 
-function SectionBox({ title, subtitle, children, count }: SectionBoxProps) {
+interface MyJobRow extends JobRow {
+  accepted_job_id: string
+  accepted_status: string | null
+  accepted_at_raw?: string | null
+  assigned_at_raw?: string | null
+  started_at_raw?: string | null
+  ended_at_raw?: string | null
+  current_job_assignment_id?: string | null
+  current_assignment_preview_id?: string | null
+  runtime_state?: string | null
+  runtime_eta?: string | null
+  run_no?: number | null
+  final_reward?: number | null
+  reputation_delta?: number | null
+  history_visible_until?: string | null
+  cancel_reason?: string | null
+  abort_reason?: string | null
+  expire_reason?: string | null
+
+  // for history popup
+  truck_name?: string | null
+  trailer_name?: string | null
+  driver_names?: string[] | null
+}
+
+function SectionBox({ title, subtitle, children, count, action }: SectionBoxProps) {
   return (
     <section className="bg-white p-6 rounded shadow space-y-4">
-      <header className="flex items-center justify-between">
+      <header className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold">{title}</h2>
           {subtitle && <div className="text-sm text-slate-500 mt-1">{subtitle}</div>}
         </div>
-        <div className="text-sm text-slate-600">
+
+        <div className="flex items-center gap-2">
           {typeof count === 'number' && (
-            <span className="px-3 py-1 bg-slate-50 border border-slate-100 rounded">{count}</span>
+            <span className="px-3 py-1 bg-slate-50 border border-slate-100 rounded text-sm text-slate-600">
+              {count}
+            </span>
           )}
+          {action}
         </div>
       </header>
       <div>{children}</div>
@@ -57,43 +77,91 @@ function SectionBox({ title, subtitle, children, count }: SectionBoxProps) {
   )
 }
 
-/**
- * normalizePhase
- */
-function normalizePhase(phaseRaw: any): string {
-  if (!phaseRaw && phaseRaw !== 0) return ''
-  return String(phaseRaw).toLowerCase().replace(/_/g, ' ')
-}
-
 function pickLogo(obj: any): string | null {
   if (!obj) return null
   return obj.logo ?? obj.logo_url ?? obj.image_url ?? obj.icon_url ?? null
 }
 
-/**
- * Detect schema drift error when pickup_ready is selected but column does not exist.
- */
-function shouldRetryWithoutPickupReady(status: number, bodyText: string): boolean {
-  if (status !== 400) return false
-  const t = String(bodyText ?? '').toLowerCase()
-  return t.includes('42703') && t.includes('pickup_ready')
+function displayName(obj: any): string | null {
+  if (!obj) return null
+  return obj.name ?? obj.full_name ?? obj.display_name ?? obj.username ?? obj.title ?? null
 }
 
-/**
- * Remove pickup_ready from encoded PostgREST select.
- */
-function stripPickupReadyFromEncodedSelect(encodedSelect: string): string {
-  const decoded = decodeURIComponent(encodedSelect)
-  const cleaned = decoded
-    .replace(/,pickup_ready(?=,|\))/g, '')
-    .replace(/pickup_ready,(?=[^)]*\))/g, '')
-  return encodeURIComponent(cleaned)
+function formatDateTime(value?: string | null): string {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleString()
 }
 
-/**
- * Market local hidden jobs key (must match Market page).
- * If your Market page uses a different key, update this constant to match.
- */
+function formatMoney(value?: number | string | null, currency?: string | null): string {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n)) return `0 ${currency ?? ''}`.trim()
+  return `${n.toFixed(2)} ${currency ?? ''}`.trim()
+}
+
+function titleCaseStatus(value?: string | null): string {
+  if (!value) return 'Unknown'
+  return String(value)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (m) => m.toUpperCase())
+}
+
+function terminalReason(job: MyJobRow): string | null {
+  return job.abort_reason ?? job.cancel_reason ?? job.expire_reason ?? null
+}
+
+function statusPillClasses(status?: string | null): string {
+  const s = String(status ?? '').toLowerCase()
+
+  if (s === 'completed') {
+    return 'rounded-full px-2 py-1 border bg-emerald-50 border-emerald-200 text-emerald-700'
+  }
+  if (s === 'cancelled' || s === 'canceled') {
+    return 'rounded-full px-2 py-1 border bg-rose-50 border-rose-200 text-rose-700'
+  }
+  if (s === 'aborted') {
+    return 'rounded-full px-2 py-1 border bg-amber-50 border-amber-200 text-amber-800'
+  }
+  if (s === 'expired') {
+    return 'rounded-full px-2 py-1 border bg-slate-100 border-slate-200 text-slate-700'
+  }
+
+  return 'rounded-full bg-white px-2 py-1 border text-slate-700'
+}
+
+function bestAssignmentTimestamp(row: any): number {
+  const candidates = [row?.delivered_at, row?.started_at, row?.assigned_at]
+    .map((v) => (v ? Date.parse(String(v)) : Number.NaN))
+    .filter((v) => Number.isFinite(v)) as number[]
+
+  if (candidates.length === 0) return 0
+  return Math.max(...candidates)
+}
+
+function preferNewerAssignment(current: any, next: any): any {
+  if (!current) return next
+  if (!next) return current
+  return bestAssignmentTimestamp(next) >= bestAssignmentTimestamp(current) ? next : current
+}
+
+function safeLabel(value?: string | null): string {
+  const text = String(value ?? '').trim()
+  return text.length > 0 ? text : '-'
+}
+
+function assignmentMetaText(job: MyJobRow): string {
+  const drivers = Array.isArray(job.driver_names)
+    ? job.driver_names
+        .map((v) => String(v ?? '').trim())
+        .filter(Boolean)
+    : []
+
+  const driversText = drivers.length > 0 ? drivers.join(', ') : '-'
+
+  return `Truck: ${safeLabel(job.truck_name)} · Trailer: ${safeLabel(job.trailer_name)} · Driver${drivers.length > 1 ? 's' : ''}: ${driversText}`
+}
+
 const HIDDEN_MARKET_JOBS_KEY = 'hidden_market_jobs'
 
 function unhideJobInMarket(jobOfferId: string) {
@@ -106,80 +174,16 @@ function unhideJobInMarket(jobOfferId: string) {
     const next = parsed.map(String).filter((id) => id !== String(jobOfferId))
     localStorage.setItem(HIDDEN_MARKET_JOBS_KEY, JSON.stringify(next))
   } catch {
-    // ignore localStorage parse/write errors
+    // ignore
   }
 }
 
-/**
- * API constants
- * NOTE: In production move anon key to env var.
- */
-const API_BASE = 'https://iiunrkztuhhbdgxzqqgq.supabase.co'
-const SUPABASE_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlpdW5ya3p0dWhoYmRneHpxcWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjcyOTY5MDksImV4cCI6MjA4Mjg3MjkwOX0.PTzYmKHRE5A119E5JD9HKEUSg7NQZJlAn83ehKo5fiM'
-
-function buildHeaders(accessToken?: string | null) {
-  return {
-    apikey: SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${accessToken ?? SUPABASE_ANON_KEY}`,
-  }
-}
-
-/**
- * resolveCarrierCompanyId
- *
- * Robustly resolve carrier company id even when user.company_id is missing from auth context.
- * Uses Supabase client queries to avoid fragile direct REST fallback lookups.
- */
-async function resolveCarrierCompanyId(authUserId: string): Promise<string | null> {
-  // 1) public.users by auth_user_id
+async function resolveAppUserId(authUserId: string): Promise<string | null> {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('company_id')
-      .eq('auth_user_id', authUserId)
-      .limit(1)
-      .maybeSingle()
-
-    if (!error && data?.company_id) return String(data.company_id)
-  } catch {
-    // ignore
-  }
-
-  // 2) user_trucks by owner_user_auth_id (preferred in this schema)
-  try {
-    const { data, error } = await supabase
-      .from('user_trucks')
-      .select('owner_company_id')
-      .eq('owner_user_auth_id', authUserId)
-      .limit(1)
-      .maybeSingle()
-
-    if (!error && data?.owner_company_id) return String(data.owner_company_id)
-  } catch {
-    // ignore
-  }
-
-  // 3) legacy fallback: user_trucks.owner_user_id
-  try {
-    const { data, error } = await supabase
-      .from('user_trucks')
-      .select('owner_company_id')
-      .eq('owner_user_id', authUserId)
-      .limit(1)
-      .maybeSingle()
-
-    if (!error && data?.owner_company_id) return String(data.owner_company_id)
-  } catch {
-    // ignore
-  }
-
-  // 4) companies by owner_id
-  try {
-    const { data, error } = await supabase
-      .from('companies')
       .select('id')
-      .eq('owner_id', authUserId)
+      .eq('auth_user_id', authUserId)
       .limit(1)
       .maybeSingle()
 
@@ -188,33 +192,204 @@ async function resolveCarrierCompanyId(authUserId: string): Promise<string | nul
     // ignore
   }
 
-  return null
+  // fallback for deployments where public.users.id == auth user id
+  return authUserId || null
+}
+
+function HistoryModal({
+  open,
+  jobs,
+  onClose,
+}: {
+  open: boolean
+  jobs: MyJobRow[]
+  onClose: () => void
+}) {
+  const PAGE_SIZE = 10
+  const [page, setPage] = useState(1)
+
+  useEffect(() => {
+    if (open) setPage(1)
+  }, [open])
+
+  const totalPages = Math.max(1, Math.ceil(jobs.length / PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const startIndex = (safePage - 1) * PAGE_SIZE
+  const visibleJobs = jobs.slice(startIndex, startIndex + PAGE_SIZE)
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+      <div className="w-full max-w-5xl max-h-[85vh] overflow-hidden rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-center justify-between border-b px-5 py-4">
+          <div>
+            <h2 className="text-xl font-semibold">Job History</h2>
+            <p className="text-sm text-slate-500">
+              Completed, aborted, cancelled and expired jobs visible for the last 30 days.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border px-3 py-2 text-sm hover:bg-slate-50"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="max-h-[70vh] overflow-y-auto p-5">
+          {jobs.length === 0 ? (
+            <div className="text-sm text-slate-500">No history jobs in the last 30 days.</div>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-3 text-sm text-slate-500">
+                <span>
+                  Showing {startIndex + 1}-{Math.min(startIndex + PAGE_SIZE, jobs.length)} of {jobs.length}
+                </span>
+                <span>
+                  Page {safePage} / {totalPages}
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-3">
+                {visibleJobs.map((job) => (
+                  <div
+                    key={`${job.accepted_job_id}-history`}
+                    className="rounded-xl border border-slate-200 bg-slate-50 p-4"
+                  >
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div className="space-y-2">
+                        <div className="text-base font-semibold">
+                          {job.origin_city_name ?? '—'} → {job.destination_city_name ?? '—'}
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 text-xs">
+                          <span className={statusPillClasses(job.accepted_status)}>
+                            {titleCaseStatus(job.accepted_status)}
+                          </span>
+
+                          {job.transport_mode && (
+                            <span className="rounded-full bg-white px-2 py-1 border">
+                              {titleCaseStatus(job.transport_mode)}
+                            </span>
+                          )}
+
+                          {job.runtime_state && (
+                            <span className="rounded-full bg-white px-2 py-1 border">
+                              Runtime: {titleCaseStatus(job.runtime_state)}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="text-sm text-slate-600">
+                          Payload delivered:{' '}
+                          <strong>{Number(job.delivered_payload_kg ?? 0).toFixed(2)} kg</strong>
+                          {job.total_payload_kg != null && (
+                            <>
+                              {' '}
+                              / {Number(job.total_payload_kg).toFixed(2)} kg
+                            </>
+                          )}
+                          {' '}
+                          · Ended: <strong>{formatDateTime(job.ended_at_raw)}</strong>
+                        </div>
+
+                        <div className="min-h-[20px] text-sm text-slate-600">
+                          {assignmentMetaText(job)}
+                        </div>
+
+                        {terminalReason(job) && (
+                          <div className="text-sm text-amber-700">Reason: {terminalReason(job)}</div>
+                        )}
+                      </div>
+
+                      <div className="min-w-[190px] rounded-xl bg-white border p-3 text-sm space-y-1">
+                        <div className="flex items-center justify-between gap-4">
+                          <span className="text-slate-500">Reward</span>
+                          <strong className="text-emerald-700">
+                            {formatMoney(job.final_reward, job.currency ?? 'USD')}
+                          </strong>
+                        </div>
+                        <div className="flex items-center justify-between gap-4">
+                          <span className="text-slate-500">Reputation</span>
+                          <strong>{Number(job.reputation_delta ?? 0).toFixed(3)}</strong>
+                        </div>
+                        <div className="flex items-center justify-between gap-4">
+                          <span className="text-slate-500">Distance</span>
+                          <strong>{Number(job.distance_km ?? 0).toFixed(2)} km</strong>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {totalPages > 1 && (
+                <div className="flex items-center justify-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={safePage <= 1}
+                    className="rounded-lg border px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-slate-50"
+                  >
+                    Previous
+                  </button>
+
+                  <span className="px-3 text-sm text-slate-600">
+                    {safePage} / {totalPages}
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    disabled={safePage >= totalPages}
+                    className="rounded-lg border px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50 hover:bg-slate-50"
+                  >
+                    Next
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export default function MyJobs(): JSX.Element {
   const { user } = useAuth()
-  const [jobs, setJobs] = useState<JobRow[]>([])
+
+  const [jobs, setJobs] = useState<MyJobRow[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Modal state for accept modal
-  const [selectedJob, setSelectedJob] = useState<JobRow | null>(null)
+  const [selectedJob, setSelectedJob] = useState<MyJobRow | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
 
-  // Modal state for cancel penalty modal
-  const [cancelJob, setCancelJob] = useState<JobRow | null>(null)
+  const [cancelJob, setCancelJob] = useState<MyJobRow | null>(null)
   const [cancelOpen, setCancelOpen] = useState(false)
   const [cancelLoading, setCancelLoading] = useState(false)
   const [cancelPenalty, setCancelPenalty] = useState<number | null>(null)
+
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   async function fetchJobs() {
     setLoading(true)
     setError(null)
 
     try {
-      const session = await supabase.auth.getSession()
-      const authUserId = session.data.session?.user?.id ?? (user as any)?.id ?? null
+      const sessionRes = await supabase.auth.getSession()
+      const authUserId = sessionRes.data.session?.user?.id ?? (user as any)?.id ?? null
 
       if (!authUserId) {
         setJobs([])
@@ -222,222 +397,323 @@ export default function MyJobs(): JSX.Element {
         return
       }
 
-      // Prefer user.company_id if provided, otherwise resolve it robustly
-      const carrierCompanyId =
-        (user as any)?.company_id ??
-        (user as any)?.companyId ??
-        (await resolveCarrierCompanyId(String(authUserId)))
-
-      if (!carrierCompanyId) {
+      const appUserId = await resolveAppUserId(String(authUserId))
+      if (!appUserId) {
         setJobs([])
-        setError('No carrier company linked to your account. Please create or join a company.')
+        setError('Unable to resolve your user profile.')
         return
       }
 
-      // Select assignments and embed job offer.
-      // Include company + city ids for JobCard company block and WeatherBadge.
-      const select = [
-        'id',
-        'status',
-        'accepted_at',
-        'pickup_started_at',
-        'assignment_preview_id',
-        'assigned_payload_kg',
-        'payload_remaining_kg',
-        'job_offer:job_offer_id(' +
-          [
-            'id',
-            'transport_mode',
-            'pickup_time',
-            'delivery_deadline',
-            'distance_km',
-            'weight_kg',
-            'remaining_payload',
-            'volume_m3',
-            'pallets',
-            'currency',
-            'temperature_control',
-            'hazardous',
-            'requires_customs',
-            'special_requirements',
-            'job_offer_type_code',
-            // Optional in some envs -> retry without it if 42703
-            'pickup_ready',
-            'reward_load_cargo',
-            'reward_trailer_cargo',
-
-            'origin_city_id',
-            'destination_city_id',
-
-            'origin_city:origin_city_id(city_name,country_code)',
-            'destination_city:destination_city_id(city_name,country_code)',
-
-            'origin_company:origin_client_company_id(id,name,logo)',
-            'destination_company:destination_client_company_id(id,name,logo)',
-
-            'cargo_type_obj:cargo_type_id(name)',
-            'cargo_item_obj:cargo_item_id(name)',
-          ].join(',') +
-          ')',
-      ].join(',')
-
-      let activeSelect = select
-
-      let { data: jaDataRaw, error: jaErr } = await supabase
-        .from('job_assignments')
-        .select(activeSelect)
-        .eq('carrier_company_id', String(carrierCompanyId))
+      const { data: acceptedRaw, error: acceptedErr } = await supabase
+        .from('accepted_jobs')
+        .select(
+          `
+          id,
+          user_id,
+          status,
+          transport_mode,
+          total_payload_kg,
+          remaining_payload_kg,
+          delivered_payload_kg,
+          accepted_at,
+          assigned_at,
+          started_at,
+          ended_at,
+          current_assignment_preview_id,
+          current_job_assignment_id,
+          final_reward,
+          reputation_delta,
+          cancel_reason,
+          abort_reason,
+          expire_reason,
+          history_visible_until,
+          job_offer:job_offer_id(
+            id,
+            transport_mode,
+            pickup_time,
+            delivery_deadline,
+            distance_km,
+            weight_kg,
+            remaining_payload,
+            volume_m3,
+            pallets,
+            currency,
+            temperature_control,
+            hazardous,
+            requires_customs,
+            special_requirements,
+            job_offer_type_code,
+            reward_load_cargo,
+            reward_trailer_cargo,
+            origin_city_id,
+            destination_city_id,
+            origin_city:origin_city_id(city_name,country_code),
+            destination_city:destination_city_id(city_name,country_code),
+            origin_company:origin_client_company_id(id,name,logo),
+            destination_company:destination_client_company_id(id,name,logo),
+            cargo_type_obj:cargo_type_id(name),
+            cargo_item_obj:cargo_item_id(name)
+          )
+        `
+        )
+        .eq('user_id', String(appUserId))
         .order('accepted_at', { ascending: false })
         .limit(500)
 
-      if (jaErr) {
-        const errText = `${jaErr.code ?? ''} ${jaErr.message ?? ''} ${jaErr.details ?? ''} ${jaErr.hint ?? ''}`
+      if (acceptedErr) {
+        throw new Error(`Failed to load accepted jobs: ${acceptedErr.message}`)
+      }
 
-        if (shouldRetryWithoutPickupReady(400, errText)) {
-          activeSelect = decodeURIComponent(
-            stripPickupReadyFromEncodedSelect(encodeURIComponent(activeSelect))
-          )
+      const acceptedRows = Array.isArray(acceptedRaw) ? acceptedRaw : []
+      const acceptedJobIds = acceptedRows.map((r: any) => r?.id).filter(Boolean) as string[]
+      const assignmentIds = acceptedRows
+        .map((r: any) => r?.current_job_assignment_id)
+        .filter(Boolean) as string[]
 
-          const retryRes = await supabase
+      const assignmentsById: Record<string, any> = {}
+      const assignmentsByAcceptedJobId: Record<string, any> = {}
+      const runtimeByAssignmentId: Record<string, any> = {}
+
+      if (assignmentIds.length > 0 || acceptedJobIds.length > 0) {
+        const selectWithCoDriver = `
+          id,
+          accepted_job_id,
+          status,
+          run_no,
+          run_payload_kg,
+          truck_id,
+          trailer_id,
+          driver_id,
+          co_driver_id,
+          assigned_at,
+          started_at,
+          delivered_at,
+          truck:truck_id(id,name,display_name,plate_number),
+          trailer:trailer_id(id,name,display_name),
+          driver:driver_id(id,name,full_name,display_name,username),
+          co_driver:co_driver_id(id,name,full_name,display_name,username)
+        `
+
+        const selectWithoutCoDriver = `
+          id,
+          accepted_job_id,
+          status,
+          run_no,
+          run_payload_kg,
+          truck_id,
+          trailer_id,
+          driver_id,
+          assigned_at,
+          started_at,
+          delivered_at,
+          truck:truck_id(id,name,display_name,plate_number),
+          trailer:trailer_id(id,name,display_name),
+          driver:driver_id(id,name,full_name,display_name,username)
+        `
+
+        const collectedAssignmentRows: any[] = []
+
+        if (assignmentIds.length > 0) {
+          const { data: jaWithCoDriver, error: jaWithCoDriverErr } = await supabase
             .from('job_assignments')
-            .select(activeSelect)
-            .eq('carrier_company_id', String(carrierCompanyId))
-            .order('accepted_at', { ascending: false })
-            .limit(500)
+            .select(selectWithCoDriver)
+            .in('id', assignmentIds)
 
-          jaDataRaw = retryRes.data
-          jaErr = retryRes.error
-        }
-      }
+          if (!jaWithCoDriverErr && Array.isArray(jaWithCoDriver)) {
+            collectedAssignmentRows.push(...jaWithCoDriver)
+          } else {
+            const { data: jaRaw, error: jaErr } = await supabase
+              .from('job_assignments')
+              .select(selectWithoutCoDriver)
+              .in('id', assignmentIds)
 
-      if (jaErr) {
-        throw new Error(`Failed to load jobs: ${jaErr.message ?? 'unknown error'}`)
-      }
-
-      const jaData = Array.isArray(jaDataRaw) ? jaDataRaw : []
-      const assignmentIds = (jaData ?? []).map((r) => r?.id).filter(Boolean) as string[]
-
-      // Load driving_sessions for assignments (best-effort)
-      const dsByAssignment: Record<string, any> = {}
-      if (assignmentIds.length > 0) {
-        const { data: dsRowsRaw, error: dsErr } = await supabase
-          .from('driving_sessions')
-          .select('id,job_assignment_id,phase,updated_at,pickup_city_id,delivery_city_id')
-          .in('job_assignment_id', assignmentIds)
-          .order('updated_at', { ascending: false })
-          .limit(2000)
-
-        if (!dsErr) {
-          const dsRows = Array.isArray(dsRowsRaw) ? dsRowsRaw : []
-          for (const row of dsRows) {
-            const key = String(row.job_assignment_id ?? '')
-            if (!key) continue
-            if (!dsByAssignment[key]) dsByAssignment[key] = row
+            if (!jaErr && Array.isArray(jaRaw)) {
+              collectedAssignmentRows.push(...jaRaw)
+            }
           }
-        } else {
-          // non-fatal
-          console.debug('[MyJobs] driving_sessions fetch failed', dsErr)
+        }
+
+        // fallback: for history rows where current_job_assignment_id is null,
+        // try to resolve the latest assignment by accepted_job_id
+        if (acceptedJobIds.length > 0) {
+          const { data: jaByAcceptedWithCoDriver, error: jaByAcceptedWithCoDriverErr } = await supabase
+            .from('job_assignments')
+            .select(selectWithCoDriver)
+            .in('accepted_job_id', acceptedJobIds)
+
+          if (!jaByAcceptedWithCoDriverErr && Array.isArray(jaByAcceptedWithCoDriver)) {
+            collectedAssignmentRows.push(...jaByAcceptedWithCoDriver)
+          } else {
+            const { data: jaByAcceptedRaw, error: jaByAcceptedErr } = await supabase
+              .from('job_assignments')
+              .select(selectWithoutCoDriver)
+              .in('accepted_job_id', acceptedJobIds)
+
+            if (!jaByAcceptedErr && Array.isArray(jaByAcceptedRaw)) {
+              collectedAssignmentRows.push(...jaByAcceptedRaw)
+            }
+          }
+        }
+
+        for (const row of collectedAssignmentRows) {
+          if (row?.id) {
+            const idKey = String(row.id)
+            assignmentsById[idKey] = preferNewerAssignment(assignmentsById[idKey], row)
+          }
+
+          if (row?.accepted_job_id) {
+            const acceptedKey = String(row.accepted_job_id)
+            assignmentsByAcceptedJobId[acceptedKey] = preferNewerAssignment(
+              assignmentsByAcceptedJobId[acceptedKey],
+              row
+            )
+          }
+        }
+
+        if (assignmentIds.length > 0) {
+          const { data: jreRaw, error: jreErr } = await supabase
+            .from('job_run_executions')
+            .select(
+              'id,job_assignment_id,state,current_leg,current_city_id,pickup_city_id,delivery_city_id,distance_completed_km,total_distance_km,state_eta,updated_at'
+            )
+            .in('job_assignment_id', assignmentIds)
+            .order('updated_at', { ascending: false })
+
+          if (!jreErr && Array.isArray(jreRaw)) {
+            for (const row of jreRaw) {
+              const key = String(row?.job_assignment_id ?? '')
+              if (!key) continue
+              if (!runtimeByAssignmentId[key]) {
+                runtimeByAssignmentId[key] = row
+              }
+            }
+          }
         }
       }
 
-      const mapped: JobRow[] = (jaData ?? []).map((row: any) => {
-        const j = row.job_offer ?? {}
-        const ds = dsByAssignment[String(row.id)] ?? null
+      const mapped: MyJobRow[] = acceptedRows.map((row: any) => {
+        const jobOffer = row.job_offer ?? {}
+        const assignment =
+          (row.current_job_assignment_id
+            ? assignmentsById[String(row.current_job_assignment_id)]
+            : null) ??
+          assignmentsByAcceptedJobId[String(row.id)] ??
+          null
 
-        const originCompany = j.origin_company ?? null
-        const destinationCompany = j.destination_company ?? null
+        const runtime = row.current_job_assignment_id
+          ? runtimeByAssignmentId[String(row.current_job_assignment_id)]
+          : null
 
-        const authoritativePhase = ds?.phase ?? row.status ?? null
-        const normalizedStatus = normalizePhase(authoritativePhase)
-        const rowStatus = String(row.status ?? '').toLowerCase()
+        const originCompany = jobOffer.origin_company ?? null
+        const destinationCompany = jobOffer.destination_company ?? null
 
-        const rowRemainingPayload = Number(row?.payload_remaining_kg ?? NaN)
-        const rowAssignedPayload = Number(row?.assigned_payload_kg ?? NaN)
+        const computedStatus = runtime?.state ?? row.status ?? null
 
-        let displayPayload = j.remaining_payload ?? j.weight_kg ?? null
-        if (rowStatus === 'assigned' && Number.isFinite(rowRemainingPayload) && rowRemainingPayload >= 0) {
-          displayPayload = rowRemainingPayload
-        } else if (
-          ['picking_load', 'to_pickup', 'in_progress', 'delivering', 'in_transit'].includes(rowStatus) &&
-          Number.isFinite(rowAssignedPayload) &&
-          rowAssignedPayload > 0
-        ) {
-          displayPayload = rowAssignedPayload
-        }
+        const truckObj = assignment?.truck ?? null
+        const trailerObj = assignment?.trailer ?? null
+        const driverObj = assignment?.driver ?? null
+        const coDriverObj = assignment?.co_driver ?? null
 
-        const deliveryDeadline = j.delivery_deadline ?? null
-        const isDeadlineExpired =
-          deliveryDeadline != null && !Number.isNaN(Date.parse(String(deliveryDeadline)))
-            ? new Date(String(deliveryDeadline)) < new Date()
-            : false
+        const truckName =
+          displayName(truckObj) ??
+          (truckObj?.plate_number ? String(truckObj.plate_number) : null) ??
+          (assignment?.truck_id ? `Truck #${assignment.truck_id}` : null) ??
+          '-'
+
+        const trailerName =
+          displayName(trailerObj) ??
+          (assignment?.trailer_id ? `Trailer #${assignment.trailer_id}` : null) ??
+          '-'
+
+        const driverName =
+          displayName(driverObj) ??
+          (assignment?.driver_id ? `Driver #${assignment.driver_id}` : null) ??
+          null
+
+        const coDriverName =
+          displayName(coDriverObj) ??
+          (assignment?.co_driver_id ? `Driver #${assignment.co_driver_id}` : null) ??
+          null
+
+        const driverNames = [driverName, coDriverName].filter(Boolean) as string[]
 
         return {
-          // JobCard expects JobRow.id = job_offer.id
-          id: j.id,
-          pickup_time: j.pickup_time ?? null,
-          delivery_deadline: j.delivery_deadline ?? null,
-          transport_mode: j.transport_mode ?? null,
-          weight_kg: j.weight_kg ?? null,
-          remaining_payload: displayPayload,
-          volume_m3: j.volume_m3 ?? null,
-          pallets: j.pallets ?? null,
-          reward_trailer_cargo: j.reward_trailer_cargo ?? null,
-          reward_load_cargo: j.reward_load_cargo ?? null,
-          distance_km: j.distance_km ?? null,
+          // JobCard base
+          id: jobOffer.id,
+          pickup_time: jobOffer.pickup_time ?? null,
+          delivery_deadline: jobOffer.delivery_deadline ?? null,
+          transport_mode: row.transport_mode ?? jobOffer.transport_mode ?? null,
+          weight_kg: jobOffer.weight_kg ?? null,
+          remaining_payload: row.remaining_payload_kg ?? jobOffer.remaining_payload ?? null,
+          volume_m3: jobOffer.volume_m3 ?? null,
+          pallets: jobOffer.pallets ?? null,
+          reward_trailer_cargo: jobOffer.reward_trailer_cargo ?? null,
+          reward_load_cargo: jobOffer.reward_load_cargo ?? null,
+          distance_km: jobOffer.distance_km ?? null,
+          currency: jobOffer.currency ?? 'USD',
+          temperature_control: jobOffer.temperature_control ?? null,
+          hazardous: jobOffer.hazardous ?? null,
+          requires_customs: jobOffer.requires_customs ?? null,
+          special_requirements: jobOffer.special_requirements ?? null,
+          job_offer_type_code: jobOffer.job_offer_type_code ?? null,
+          pickup_ready: null,
 
-          currency: j.currency ?? null,
-          temperature_control: j.temperature_control ?? null,
-          hazardous: j.hazardous ?? null,
-          requires_customs: j.requires_customs ?? null,
-          special_requirements: j.special_requirements ?? null,
-          job_offer_type_code: j.job_offer_type_code ?? null,
-          pickup_ready: typeof j.pickup_ready === 'boolean' ? j.pickup_ready : null,
+          origin_city_id: jobOffer.origin_city_id ?? null,
+          destination_city_id: jobOffer.destination_city_id ?? null,
+          origin_city_name: jobOffer.origin_city?.city_name ?? null,
+          destination_city_name: jobOffer.destination_city?.city_name ?? null,
+          origin_country_code: jobOffer.origin_city?.country_code ?? null,
+          destination_country_code: jobOffer.destination_city?.country_code ?? null,
+          cargo_type: jobOffer.cargo_type_obj?.name ?? null,
+          cargo_item: jobOffer.cargo_item_obj?.name ?? null,
 
-          origin_city_id: j.origin_city_id ?? null,
-          destination_city_id: j.destination_city_id ?? null,
-
-          origin_city_name: j.origin_city?.city_name ?? null,
-          destination_city_name: j.destination_city?.city_name ?? null,
-          origin_country_code: j.origin_city?.country_code ?? null,
-          destination_country_code: j.destination_city?.country_code ?? null,
-
-          cargo_type: j.cargo_type_obj?.name ?? null,
-          cargo_item: j.cargo_item_obj?.name ?? null,
-
-          // assignment metadata
-          status: row.status ?? null,
-          assignment_status: row.status ?? null,
-          payload_remaining_kg: row.payload_remaining_kg ?? null,
-          assigned_payload_kg: row.assigned_payload_kg ?? null,
-
-          // driving session fields (authoritative)
-          driving_session_phase: ds?.phase ?? null,
-          driving_session_pickup_city_id: ds?.pickup_city_id ?? null,
-          driving_session_delivery_city_id: ds?.delivery_city_id ?? null,
-          driving_session_updated_at: ds?.updated_at ?? null,
-
-          computed_status: normalizedStatus,
-
-          pickup_started_at: row.pickup_started_at ?? null,
-
-          // IMPORTANT: keep assignment id for cancel flows
-          assignment_id: row.id ?? null,
-
-          // keep preview id if present (used in your confirm flow)
-          assignment_preview_id: row.assignment_preview_id ?? null,
-
-          // optional UI helper
-          is_deadline_expired: isDeadlineExpired,
-
-          // company fields (used by JobCard company block)
           origin_client_company_id: originCompany?.id ?? null,
           origin_client_company_name: originCompany?.name ?? null,
           origin_client_company_logo: pickLogo(originCompany),
-
           destination_client_company_id: destinationCompany?.id ?? null,
           destination_client_company_name: destinationCompany?.name ?? null,
           destination_client_company_logo: pickLogo(destinationCompany),
-        } as JobRow
+
+          // compatibility props used by JobCard / page actions
+          status: row.status ?? null,
+          assignment_status: assignment?.status ?? row.status ?? null,
+          payload_remaining_kg: row.remaining_payload_kg ?? null,
+          assigned_payload_kg: assignment?.run_payload_kg ?? null,
+          assignment_id: row.current_job_assignment_id ?? assignment?.id ?? null,
+          assignment_preview_id: row.current_assignment_preview_id ?? null,
+          computed_status: computedStatus,
+          pickup_started_at: row.started_at ?? null,
+          driving_session_phase: runtime?.state ?? null,
+          driving_session_pickup_city_id: runtime?.pickup_city_id ?? null,
+          driving_session_delivery_city_id: runtime?.delivery_city_id ?? null,
+          driving_session_updated_at: runtime?.updated_at ?? null,
+
+          // accepted job extras
+          accepted_job_id: String(row.id),
+          accepted_status: row.status ?? null,
+          accepted_at_raw: row.accepted_at ?? null,
+          assigned_at_raw: row.assigned_at ?? null,
+          started_at_raw: row.started_at ?? null,
+          ended_at_raw: row.ended_at ?? assignment?.delivered_at ?? null,
+          current_job_assignment_id: row.current_job_assignment_id ?? assignment?.id ?? null,
+          current_assignment_preview_id: row.current_assignment_preview_id ?? null,
+          runtime_state: runtime?.state ?? null,
+          runtime_eta: runtime?.state_eta ?? null,
+          run_no: assignment?.run_no ?? null,
+          total_payload_kg: row.total_payload_kg ?? null,
+          delivered_payload_kg: row.delivered_payload_kg ?? null,
+          final_reward: row.final_reward ?? 0,
+          reputation_delta: row.reputation_delta ?? 0,
+          history_visible_until: row.history_visible_until ?? null,
+          cancel_reason: row.cancel_reason ?? null,
+          abort_reason: row.abort_reason ?? null,
+          expire_reason: row.expire_reason ?? null,
+
+          // history popup extras
+          truck_name: truckName,
+          trailer_name: trailerName,
+          driver_names: driverNames,
+        } as MyJobRow
       })
 
       setJobs(mapped)
@@ -452,91 +728,45 @@ export default function MyJobs(): JSX.Element {
   useEffect(() => {
     fetchJobs()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id, (user as any)?.company_id])
+  }, [user?.id])
 
-  async function handleOpenConfirm(job: JobRow) {
-    const selectedDriverId = localStorage.getItem('staging_selected_driver') ?? null
-    const previewId = (job as any)?.assignment_preview_id ?? (job as any)?.preview_id ?? null
-
-    if (previewId && selectedDriverId) {
-      try {
-        const session = await supabase.auth.getSession()
-        const accessToken = session.data.session?.access_token ?? null
-
-        const res = await fetch(`${API_BASE}/rest/v1/assignment_previews?id=eq.${encodeURIComponent(previewId)}`, {
-          method: 'PATCH',
-          headers: {
-            ...buildHeaders(accessToken),
-            'Content-Type': 'application/json',
-            Prefer: 'return=representation',
-          },
-          body: JSON.stringify({ driver_id: selectedDriverId }),
-        })
-
-        if (!res.ok) {
-          console.debug('[MyJobs] Failed to update assignment_previews driver_id:', await res.text().catch(() => ''))
-        }
-      } catch (e) {
-        console.debug('[MyJobs] Exception updating preview driver', e)
-      }
-    }
-
+  function handleOpenConfirm(job: MyJobRow) {
     setSelectedJob(job)
     setConfirmOpen(true)
   }
 
-  async function handleConfirmAccept(truckId: string) {
+  async function handleConfirmAccept(_truckId: string) {
     if (!selectedJob) return
-    void truckId // reserved for future server patch flow
-    setJobs((s) => s.filter((j) => j.id !== selectedJob.id))
 
     setSuccessMessage(
-      `Confirmed: ${selectedJob.origin_city_name ?? '—'} → ${selectedJob.destination_city_name ?? '—'} (${selectedJob.transport_mode ?? '—'})`
+      `Ready to continue assignment for ${selectedJob.origin_city_name ?? '—'} → ${selectedJob.destination_city_name ?? '—'}.`
     )
 
     setConfirmOpen(false)
     setSelectedJob(null)
     window.setTimeout(() => setSuccessMessage(null), 5000)
+    await fetchJobs()
   }
 
-  function handleCancelLoad(job: JobRow) {
-    setJobs((s) => s.filter((j) => j.id !== job.id))
-    setSuccessMessage(`Cancelled load: ${job.origin_city_name ?? '—'} → ${job.destination_city_name ?? '—'}`)
-    window.setTimeout(() => setSuccessMessage(null), 5000)
-  }
-
-  async function openCancelModal(job: JobRow) {
+  function openCancelModal(job: MyJobRow) {
     setCancelJob(job)
-    setCancelPenalty(null)
     setCancelOpen(true)
 
-    try {
-      const session = await supabase.auth.getSession()
-      const accessToken = session.data.session?.access_token ?? null
-
-      const assignmentId = (job as any)?.assignment_id ?? job.id
-      if (!assignmentId) return
-
-      const url = `${API_BASE}/rest/v1/job_assignments?id=eq.${encodeURIComponent(assignmentId)}&select=accepted_at`
-      const res = await fetch(url, { headers: buildHeaders(accessToken) })
-      if (!res.ok) return
-
-      const rows = (await res.json().catch(() => [])) as any[]
-      if (!rows || rows.length === 0) return
-
-      const acceptedAt = rows[0].accepted_at ? Date.parse(String(rows[0].accepted_at)) : null
-      if (!acceptedAt) return
-
-      const hours = (Date.now() - acceptedAt) / (1000 * 60 * 60)
-      if (hours <= 12) setCancelPenalty(0)
-      else {
-        const pct = Math.min(1.2, 0.01 * Math.floor(hours))
-        const estimatedBase = 100
-        setCancelPenalty(Math.round(estimatedBase * pct * 100) / 100)
-      }
-    } catch (e) {
-      console.debug('[MyJobs] Exception fetching penalty', e)
+    const acceptedAt = job.accepted_at_raw ? Date.parse(String(job.accepted_at_raw)) : null
+    if (!acceptedAt) {
+      setCancelPenalty(null)
+      return
     }
+
+    const hours = (Date.now() - acceptedAt) / (1000 * 60 * 60)
+    if (hours <= 12) {
+      setCancelPenalty(0)
+      return
+    }
+
+    const pct = Math.min(1.2, 0.01 * Math.floor(hours))
+    const estimatedBase = 100
+    setCancelPenalty(Math.round(estimatedBase * pct * 100) / 100)
   }
 
   async function handleConfirmCancel() {
@@ -544,89 +774,45 @@ export default function MyJobs(): JSX.Element {
     setCancelLoading(true)
 
     try {
-      try {
-        const session = await supabase.auth.getSession()
-        const accessToken = session.data.session?.access_token ?? null
+      const sessionRes = await supabase.auth.getSession()
+      const authUserId = sessionRes.data.session?.user?.id ?? (user as any)?.id ?? null
 
-        const assignmentId = (cancelJob as any)?.assignment_id ?? cancelJob.id
-        const jobOfferId = cancelJob.id // JobRow.id is job_offer.id in this page mapping
-        let cancelledServerSide = false
-
-        // Preferred path: DB function handles penalty + offer re-open + session updates.
-        if (assignmentId) {
-          const { error: rpcErr } = await supabase.rpc('cancel_assignment', { p_assignment_id: assignmentId })
-          if (!rpcErr) {
-            cancelledServerSide = true
-          } else {
-            console.debug('[MyJobs] cancel_assignment rpc failed, using fallback patch path', rpcErr)
-          }
-        }
-
-        // Fallback path: cancel assignment + explicitly re-open offer so it returns to Market.
-        if (!cancelledServerSide && assignmentId) {
-          const jaRes = await fetch(`${API_BASE}/rest/v1/job_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
-            method: 'PATCH',
-            headers: {
-              ...buildHeaders(accessToken),
-              'Content-Type': 'application/json',
-              Prefer: 'return=representation',
-            },
-            body: JSON.stringify({ status: 'cancelled', cancelled_at: new Date().toISOString() }),
-          })
-
-          if (!jaRes.ok) {
-            console.debug('[MyJobs] fallback cancel assignment PATCH failed', await jaRes.text().catch(() => ''))
-          }
-
-          // Fallback: return offer to market if RPC is unavailable.
-          if (jobOfferId) {
-            const offerRes = await fetch(`${API_BASE}/rest/v1/job_offers?id=eq.${encodeURIComponent(jobOfferId)}`, {
-              method: 'PATCH',
-              headers: {
-                ...buildHeaders(accessToken),
-                'Content-Type': 'application/json',
-                Prefer: 'return=representation',
-              },
-              body: JSON.stringify({
-                status: 'open',
-                assigned_user_truck_id: null,
-                user_id: null,
-                user_truck_id: null,
-                accepted_at: null,
-              }),
-            })
-
-            if (!offerRes.ok) {
-              console.debug('[MyJobs] fallback re-open job_offer PATCH failed', await offerRes.text().catch(() => ''))
-
-              // Last fallback via supabase client (some policies differ between REST and client path).
-              const { error: offerUpdateErr } = await supabase
-                .from('job_offers')
-                .update({
-                  status: 'open',
-                  assigned_user_truck_id: null,
-                  user_id: null,
-                  user_truck_id: null,
-                  accepted_at: null,
-                })
-                .eq('id', jobOfferId)
-
-              if (offerUpdateErr) {
-                console.debug('[MyJobs] supabase fallback re-open failed', offerUpdateErr)
-              }
-            }
-          }
-        }
-
-        // Ensure reopened job can actually reappear in Market UI.
-        if (jobOfferId) {
-          unhideJobInMarket(String(jobOfferId))
-        }
-      } catch (e) {
-        console.debug('[MyJobs] server cancellation attempt failed', e)
+      if (!authUserId) {
+        throw new Error('Please log in')
       }
 
-      handleCancelLoad(cancelJob)
+      const appUserId = await resolveAppUserId(String(authUserId))
+      if (!appUserId) {
+        throw new Error('Unable to resolve your user profile.')
+      }
+
+      const acceptedJobId = cancelJob.accepted_job_id
+      if (!acceptedJobId) {
+        throw new Error('Missing accepted job id.')
+      }
+
+      const { error: rpcErr } = await supabase.rpc('cancel_accepted_job', {
+        p_accepted_job_id: acceptedJobId,
+        p_user_id: appUserId,
+        p_cancel_reason: 'cancelled_from_my_jobs',
+      })
+
+      if (rpcErr) {
+        throw new Error(rpcErr.message ?? 'Failed to cancel job')
+      }
+
+      if (cancelJob.id) {
+        unhideJobInMarket(String(cancelJob.id))
+      }
+
+      setSuccessMessage(
+        `Cancelled: ${cancelJob.origin_city_name ?? '—'} → ${cancelJob.destination_city_name ?? '—'}`
+      )
+      window.setTimeout(() => setSuccessMessage(null), 5000)
+
+      await fetchJobs()
+    } catch (e: any) {
+      setError(e?.message ?? String(e))
     } finally {
       setCancelLoading(false)
       setCancelOpen(false)
@@ -635,101 +821,57 @@ export default function MyJobs(): JSX.Element {
     }
   }
 
-  const { waitingJobs, activeJobs } = useMemo(() => {
-    const wait: JobRow[] = []
-    const active: JobRow[] = []
+  const { waitingJobs, activeJobs, historyJobs } = useMemo(() => {
+    const now = Date.now()
 
-    for (const j of jobs) {
-      const status = (j as any)?.computed_status ?? (j.status ?? '').toString().toLowerCase()
-      const rowRemaining = Number((j as any)?.payload_remaining_kg ?? (j as any)?.remaining_payload ?? NaN)
+    const waiting = jobs.filter((j) => ['accepted', 'assigned'].includes(String(j.accepted_status ?? '')))
+    const active = jobs.filter((j) => String(j.accepted_status ?? '') === 'in_progress')
+    const history = jobs.filter((j) => {
+      const s = String(j.accepted_status ?? '')
+      if (!['completed', 'aborted', 'cancelled', 'expired'].includes(s)) return false
 
-      if (status === 'assigned') {
-        wait.push(j)
-        continue
-      }
+      if (!j.history_visible_until) return true
+      const t = Date.parse(String(j.history_visible_until))
+      if (Number.isNaN(t)) return true
+      return t > now
+    })
 
-      if (status === 'completed' || status === 'cancelled') continue
-
-      // Keep remainder visible in Waiting even while one run is active.
-      if (Number.isFinite(rowRemaining) && rowRemaining > 0) {
-        wait.push(
-          {
-            ...(j as any),
-            computed_status: 'assigned',
-            assignment_status: 'assigned',
-            remaining_payload: rowRemaining,
-          } as JobRow
-        )
-      }
-
-      active.push(j)
+    return {
+      waitingJobs: waiting,
+      activeJobs: active,
+      historyJobs: history,
     }
-
-    return { waitingJobs: wait, activeJobs: active }
   }, [jobs])
-
-  const content = (
-    <div className="flex flex-col gap-4">
-      {loading && <div className="text-sm text-slate-500">Loading jobs…</div>}
-      {error && <div className="text-sm text-rose-600">{error}</div>}
-      {!loading && jobs.length === 0 && !error && <div className="text-sm text-slate-500">No jobs found.</div>}
-
-      <SectionBox
-        title="Waiting"
-        subtitle="Assignments awaiting confirmation (status: assigned)"
-        count={waitingJobs.length}
-      >
-        {waitingJobs.length === 0 ? (
-          <div className="text-sm text-slate-500">No waiting jobs.</div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {waitingJobs.map((job) => (
-              <JobCard
-                key={`${(job as any)?.assignment_id ?? job.id}-waiting`}
-                job={job}
-                onAccept={(j) => handleOpenConfirm(j)}
-                onView={() => {}}
-                variant="waiting"
-                actionsVariant="my-jobs"
-                onCancel={(j) => openCancelModal(j)}
-              />
-            ))}
-          </div>
-        )}
-      </SectionBox>
-
-      <SectionBox
-        title="Active"
-        subtitle="Active assignments (authoritative: driving_sessions.phase)"
-        count={activeJobs.length}
-      >
-        {activeJobs.length === 0 ? (
-          <div className="text-sm text-slate-500">No active jobs.</div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {activeJobs.map((job) => (
-              <JobCard
-                key={`${(job as any)?.assignment_id ?? job.id}-active`}
-                job={job}
-                onAccept={(j) => handleOpenConfirm(j)}
-                onView={() => {}}
-                variant="active"
-                actionsVariant="my-jobs"
-                onCancel={(j) => openCancelModal(j)}
-              />
-            ))}
-          </div>
-        )}
-      </SectionBox>
-    </div>
-  )
 
   return (
     <Layout fullWidth>
       <div className="space-y-4">
-        <header>
-          <h1 className="text-2xl font-bold">My Jobs</h1>
-          <p className="text-sm text-black/70">Jobs your company accepted and is performing</p>
+        <header className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">My Jobs</h1>
+            <p className="text-sm text-black/70">Jobs your company accepted and is performing</p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setHistoryOpen(true)}
+              className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-700 hover:bg-emerald-100"
+            >
+              History
+              <span className="rounded-full bg-white px-2 py-0.5 text-xs border border-emerald-200">
+                {historyJobs.length}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => fetchJobs()}
+              className="rounded-lg border px-4 py-2 text-sm hover:bg-slate-50"
+            >
+              Refresh
+            </button>
+          </div>
         </header>
 
         {successMessage && (
@@ -738,12 +880,87 @@ export default function MyJobs(): JSX.Element {
           </div>
         )}
 
-        <div>{content}</div>
+        {loading && <div className="text-sm text-slate-500">Loading jobs…</div>}
+        {error && <div className="text-sm text-rose-600">{error}</div>}
+        {!loading && jobs.length === 0 && !error && (
+          <div className="text-sm text-slate-500">No jobs found.</div>
+        )}
+
+        <div className="flex flex-col gap-4">
+          <SectionBox
+            title="Waiting"
+            subtitle="Accepted jobs not yet running"
+            count={waitingJobs.length}
+          >
+            {waitingJobs.length === 0 ? (
+              <div className="text-sm text-slate-500">No waiting jobs.</div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {waitingJobs.map((job) => (
+                  <JobCard
+                    key={`${job.accepted_job_id}-waiting`}
+                    job={job}
+                    onAccept={(j) => handleOpenConfirm(j as MyJobRow)}
+                    onView={() => {}}
+                    variant="waiting"
+                    actionsVariant="my-jobs"
+                    onCancel={(j) => openCancelModal(j as MyJobRow)}
+                  />
+                ))}
+              </div>
+            )}
+          </SectionBox>
+
+          <SectionBox
+            title="Active"
+            subtitle="Jobs currently running (runtime state is authoritative)"
+            count={activeJobs.length}
+          >
+            {activeJobs.length === 0 ? (
+              <div className="text-sm text-slate-500">No active jobs.</div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {activeJobs.map((job) => (
+                  <div key={`${job.accepted_job_id}-active`} className="space-y-2">
+                    <JobCard
+                      job={job}
+                      onAccept={(j) => handleOpenConfirm(j as MyJobRow)}
+                      onView={() => {}}
+                      variant="active"
+                      actionsVariant="my-jobs"
+                    />
+
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span>
+                          Runtime: <strong>{titleCaseStatus(job.runtime_state ?? 'in_progress')}</strong>
+                        </span>
+                        {job.run_no != null && (
+                          <span>
+                            Run: <strong>{job.run_no}</strong>
+                          </span>
+                        )}
+                        {job.runtime_eta && (
+                          <span>
+                            ETA: <strong>{formatDateTime(job.runtime_eta)}</strong>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </SectionBox>
+        </div>
 
         <ConfirmAcceptModal
           open={confirmOpen}
           job={selectedJob}
-          onClose={() => setConfirmOpen(false)}
+          onClose={() => {
+            setConfirmOpen(false)
+            setSelectedJob(null)
+          }}
           onConfirm={handleConfirmAccept}
         />
 
@@ -751,7 +968,7 @@ export default function MyJobs(): JSX.Element {
           open={cancelOpen}
           loading={cancelLoading}
           penalty={cancelPenalty}
-          assignmentId={(cancelJob as any)?.assignment_id ?? (cancelJob as any)?.id}
+          assignmentId={cancelJob?.current_job_assignment_id ?? null}
           onClose={() => {
             setCancelOpen(false)
             setCancelJob(null)
@@ -760,6 +977,12 @@ export default function MyJobs(): JSX.Element {
           onConfirm={async () => {
             await handleConfirmCancel()
           }}
+        />
+
+        <HistoryModal
+          open={historyOpen}
+          jobs={historyJobs}
+          onClose={() => setHistoryOpen(false)}
         />
       </div>
     </Layout>

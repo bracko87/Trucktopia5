@@ -19,7 +19,8 @@
  *   7) accept optional companyId prop and pass it to StagingAssignmentsPanel.
  *   8) relax finalize preconditions so valid assignment context can finalize
  *      even if preview RPC did not return preview id/data.
- *   9) add safer hired_staff schema fallback when both location columns are absent.
+ *   9) update hired_staff driver-city lookup to prefer actual schema variants
+ *      (current_location_id / current_city_id) and avoid noisy location_city_id-first fetches.
  *   10) treat driving_sessions policy failures during preview creation as local preview fallback.
  *   11) normalize driving_sessions RLS / duplicate errors into user-friendly modal messages
  *       during both preview creation and finalize.
@@ -1096,6 +1097,7 @@ export default function AssignmentPanel({
    * 1) search provided drivers prop
    * 2) search assignment.drivers for _raw or direct fields
    * 3) if city not present, attempt a best-effort DB lookup on hired_staff
+   *    using current_location_id / current_city_id schema variants
    *
    * @param previewUuid preview id to update
    * @param driverId driver id to set (string) or null to clear
@@ -1143,55 +1145,45 @@ export default function AssignmentPanel({
 
       // At this point driverObj may still lack a city id. Best-effort DB fetch:
       let driverCityId: string | null =
-        driverObj?.current_location_id ?? driverObj?.location_city_id ?? null
+        driverObj?.current_location_id ?? driverObj?.current_city_id ?? driverObj?.location_city_id ?? null
 
       if (!driverCityId) {
         try {
-          // Schema differs across environments; try a wide select first, then fallback.
           let staffRow: any = null
           let staffErr: any = null
 
+          // Schema differs across environments; prefer currently-known columns first.
           const wide = await supabase
             .from('hired_staff')
-            .select('id, current_location_id, location_city_id')
+            .select('id, current_location_id, current_city_id')
             .eq('id', driverId)
             .maybeSingle()
 
           staffRow = wide.data
           staffErr = wide.error
 
-          const staffErrMsg = String(staffErr?.message ?? '').toLowerCase()
-          const staffErrCode = String((staffErr as any)?.code ?? '')
-
-          if (
-            staffErr &&
-            (staffErrCode === '42703' || staffErrMsg.includes('current_location_id'))
-          ) {
+          if (staffErr && String(staffErr?.message ?? '').toLowerCase().includes('current_city_id')) {
             const fallback = await supabase
               .from('hired_staff')
-              .select('id, location_city_id')
+              .select('id, current_location_id')
               .eq('id', driverId)
               .maybeSingle()
-
             staffRow = fallback.data
             staffErr = fallback.error
           }
 
-          // Safer final fallback for schemas missing both location columns.
-          // This prevents noisy hard failures; city will remain null.
-          if (staffErr && String(staffErr?.message ?? '').toLowerCase().includes('location_city_id')) {
+          if (staffErr && String(staffErr?.message ?? '').toLowerCase().includes('current_location_id')) {
             const fallback2 = await supabase
               .from('hired_staff')
               .select('id')
               .eq('id', driverId)
               .maybeSingle()
-
             staffRow = fallback2.data
             staffErr = fallback2.error
           }
 
           if (!staffErr && staffRow) {
-            driverCityId = staffRow.current_location_id ?? staffRow.location_city_id ?? null
+            driverCityId = staffRow.current_location_id ?? staffRow.current_city_id ?? null
           }
         } catch (e) {
           console.debug('[AssignmentPanel] updatePreviewDriverInDB hired_staff lookup failed', e)

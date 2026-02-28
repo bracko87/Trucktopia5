@@ -695,7 +695,7 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
       ]
 
       let reserveErr: any = null
-      let reservedRows: Array<{ id: string }> | null = null
+      let reservationAttempted = false
 
       for (const payload of reservationVariants) {
         const res = await supabase
@@ -703,11 +703,10 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
           .update(payload)
           .in('id', driverIds)
           .in('activity_id', ['free', 'standby', 'FREE', 'STANDBY'])
-          .select('id')
 
         if (!res.error) {
           reserveErr = null
-          reservedRows = Array.isArray(res.data) ? (res.data as Array<{ id: string }>) : []
+          reservationAttempted = true
           break
         }
 
@@ -729,13 +728,44 @@ export async function finalizeAssignmentDirect(opts: FinalizeAssignmentOpts) {
         throw reserveErr
       }
 
-      const reservedCount = Array.isArray(reservedRows) ? reservedRows.length : 0
-      if (reservedCount !== driverIds.length) {
-        const reservedIds = new Set((reservedRows ?? []).map((r) => String(r.id)))
-        const missing = driverIds.filter((id) => !reservedIds.has(String(id)))
-        throw new Error(
-          `Driver reservation failed for ${missing.length} selected driver(s). Please refresh staging and choose available drivers again.`
-        )
+      if (reservationAttempted) {
+        // Verify reservation when RLS allows reads. In stricter environments the read may be blocked,
+        // in which case we keep the finalize flow based on successful guarded update above.
+        const verifyRes = await supabase
+          .from('hired_staff')
+          .select('id, activity_id')
+          .in('id', driverIds)
+
+        if (verifyRes.error) {
+          const code = String(verifyRes.error?.code ?? '')
+          const msg = String(verifyRes.error?.message ?? '').toLowerCase()
+          const readBlocked = code === '42501' || msg.includes('row-level security policy')
+          if (!readBlocked) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              'finalizeAssignmentDirect: hired_staff reservation verify failed; continuing with guarded update result',
+              verifyRes.error
+            )
+          }
+        } else {
+          const rows = Array.isArray(verifyRes.data)
+            ? (verifyRes.data as Array<{ id: string; activity_id?: string | null }>)
+            : []
+
+          const reservedIds = new Set(
+            rows
+              .filter((r) => String(r?.activity_id ?? '').toLowerCase() === 'assigned')
+              .map((r) => String(r.id))
+          )
+
+          const missing = driverIds.filter((id) => !reservedIds.has(String(id)))
+
+          if (missing.length > 0) {
+            throw new Error(
+              `Driver reservation failed for ${missing.length} selected driver(s). Please refresh staging and choose available drivers again.`
+            )
+          }
+        }
       }
     } catch (e) {
       // eslint-disable-next-line no-console

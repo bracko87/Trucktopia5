@@ -227,6 +227,56 @@ function parseRegistration(reg?: string | null): [string, string] {
 }
 
 /**
+ * normalizeRegistration
+ *
+ * Ensure registration is always saved in normalized form:
+ * - 2-letter uppercase prefix
+ * - up to 4 numeric digits
+ */
+function normalizeRegistration(prefix?: string | null, digits?: string | null): string {
+  const rawPrefix = String(prefix ?? '')
+    .replace(/[^A-Za-z]/g, '')
+    .toUpperCase()
+
+  const safePrefix =
+    rawPrefix.length >= 2
+      ? rawPrefix.slice(0, 2)
+      : rawPrefix.length === 1
+        ? `${rawPrefix}X`
+        : 'XX'
+
+  const safeDigits = String(digits ?? '')
+    .replace(/\D/g, '')
+    .slice(0, 4)
+
+  return `${safePrefix}${safeDigits}`
+}
+
+/**
+ * deriveRegistrationDigitsSeed
+ *
+ * Generate a fallback digits seed for a registration:
+ * - Prefer digits parsed from fallbackReg
+ * - Otherwise derive last 4 digits from the truckId (non-digits stripped)
+ * - Finally fall back to '1'
+ *
+ * @param truckId - truck UUID
+ * @param fallbackReg - optional fallback registration string
+ * @returns up to 4 digit string
+ */
+function deriveRegistrationDigitsSeed(truckId?: string | null, fallbackReg?: string | null): string {
+  const [, fallbackDigits] = parseRegistration(fallbackReg)
+  if (fallbackDigits) return fallbackDigits.slice(0, 4)
+
+  const digitsFromId = String(truckId ?? '')
+    .replace(/\D/g, '')
+    .slice(-4)
+
+  if (digitsFromId) return digitsFromId
+  return '1'
+}
+
+/**
  * HubOption
  *
  * Minimal hub representation used in the selector.
@@ -332,13 +382,38 @@ export default function TruckCard({
   const [editInput, setEditInput] = useState<string>(name)
 
   // Registration state
-  const [registration, setRegistration] = useState<string | null>(((truck as any)?.registration as string) ?? defaultRegistration ?? null)
+  const [registration, setRegistration] = useState<string | null>(
+    ((truck as any)?.registration as string) ?? defaultRegistration ?? null
+  )
   const [savingRegistration, setSavingRegistration] = useState<boolean>(false)
   const [registrationDigits, setRegistrationDigits] = useState<string>('')
+  const registrationDigitsRef = React.useRef<string>('')
+  const [hydratingRegistration, setHydratingRegistration] = useState<boolean>(false)
+  const registrationHydratedForTruckRef = React.useRef<string | null>(null)
+
+  /**
+   * syncRegistrationState
+   *
+   * Keep the local registration and digit inputs in sync.
+   *
+   * @param nextRegistration - next registration string or null
+   */
+  const syncRegistrationState = React.useCallback((nextRegistration: string | null) => {
+    const normalized = typeof nextRegistration === 'string' ? nextRegistration : null
+    const [, nextDigitsRaw] = parseRegistration(normalized)
+    const nextDigits = nextDigitsRaw.slice(0, 4)
+
+    registrationDigitsRef.current = nextDigits
+    setRegistration(normalized)
+    setRegistrationDigits(nextDigits)
+  }, [])
 
   useEffect(() => {
     const [, d] = parseRegistration(registration ?? defaultRegistration ?? null)
-    setRegistrationDigits(d.slice(0, 4))
+    const nextDigits = d.slice(0, 4)
+
+    registrationDigitsRef.current = nextDigits
+    setRegistrationDigits((prev) => (prev === nextDigits ? prev : nextDigits))
   }, [registration, defaultRegistration])
 
   // Hub selection
@@ -605,7 +680,9 @@ export default function TruckCard({
           const row = res.data[0] as any
 
           if (typeof row.name === 'string') setName(row.name)
-          if (typeof row.registration === 'string') setRegistration(row.registration)
+          if (Object.prototype.hasOwnProperty.call(row, 'registration')) {
+            syncRegistrationState(typeof row.registration === 'string' ? row.registration : null)
+          }
 
           // Hub remains hub (separate from current location)
           if (typeof row.hub === 'string') setHubCity(row.hub)
@@ -665,7 +742,110 @@ export default function TruckCard({
     return () => {
       mounted = false
     }
-  }, [id, isMarket])
+  }, [id, isMarket, syncRegistrationState])
+
+  // Auto-hydrate missing registration when possible.
+  useEffect(() => {
+    if (isMarket || !id) return
+    if (savingRegistration || hydratingRegistration) return
+
+    const currentReg = typeof registration === 'string' ? registration.trim() : ''
+    if (currentReg) return
+
+    if (registrationHydratedForTruckRef.current === id) return
+
+    const fallbackPrefix = parseRegistration(defaultRegistration ?? null)[0]
+    const sourceCity =
+      hubCity ??
+      currentCity ??
+      (truck as any)?.hub ??
+      (truck as any)?.location_city_name ??
+      null
+
+    const prefix = sourceCity ? makePrefixFromCity(sourceCity) : fallbackPrefix
+    const digits = registrationDigitsRef.current || deriveRegistrationDigitsSeed(id, defaultRegistration ?? null)
+    const generatedRegistration = normalizeRegistration(prefix, digits)
+
+    if (!generatedRegistration) return
+
+    registrationHydratedForTruckRef.current = id
+
+    let cancelled = false
+
+    ;(async () => {
+      setHydratingRegistration(true)
+
+      try {
+        // Only set registration if it is still NULL in DB
+        const res = await supabaseFetch(
+          `/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}&registration=is.null`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ registration: generatedRegistration }),
+            headers: {
+              'Content-Type': 'application/json',
+              Prefer: 'return=representation',
+            },
+          }
+        )
+
+        if (cancelled) return
+
+        if (!res || res.status < 200 || res.status >= 300) {
+          // keep UI honest if DB rejected it (for example unique constraint conflict)
+          syncRegistrationState(null)
+          // eslint-disable-next-line no-console
+          console.error('Failed to auto-hydrate missing registration', res)
+          return
+        }
+
+        if (Array.isArray(res.data) && res.data.length > 0) {
+          const returned = res.data[0] as any
+          syncRegistrationState(
+            typeof returned?.registration === 'string'
+              ? returned.registration
+              : generatedRegistration
+          )
+        } else {
+          // PATCH may return no rows if registration was already set by another process
+          const verify = await supabaseFetch(
+            `/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}&select=registration&limit=1`,
+            { method: 'GET' }
+          )
+
+          if (cancelled) return
+
+          const row = Array.isArray(verify?.data) ? verify.data[0] : null
+          syncRegistrationState(typeof row?.registration === 'string' ? row.registration : null)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          syncRegistrationState(null)
+          // eslint-disable-next-line no-console
+          console.error('Error auto-hydrating missing registration', err)
+        }
+      } finally {
+        if (!cancelled) {
+          setHydratingRegistration(false)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    id,
+    isMarket,
+    registration,
+    savingRegistration,
+    hydratingRegistration,
+    defaultRegistration,
+    hubCity,
+    currentCity,
+    truck,
+    syncRegistrationState,
+  ])
 
   // Load hubs for owner
   useEffect(() => {
@@ -744,27 +924,44 @@ export default function TruckCard({
    * Persist registration to public.user_trucks.registration.
    */
   async function handleSaveRegistration(newReg: string) {
+    const [rawPrefix, rawDigits] = parseRegistration(newReg)
+    const normalizedRegistration = normalizeRegistration(rawPrefix, rawDigits)
+
     if (isMarket) {
-      setRegistration(newReg)
+      syncRegistrationState(normalizedRegistration)
       return
     }
+
     const prev = registration
-    setRegistration(newReg)
+    syncRegistrationState(normalizedRegistration)
+
     if (!id) return
+
     setSavingRegistration(true)
     try {
       const res = await supabaseFetch(`/rest/v1/user_trucks?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH',
-        body: JSON.stringify({ registration: newReg }),
+        body: JSON.stringify({ registration: normalizedRegistration }),
         headers: { 'Content-Type': 'application/json', Prefer: 'return=representation' },
       })
+
       if (!res || res.status < 200 || res.status >= 300) {
-        setRegistration(prev)
+        syncRegistrationState(prev ?? null)
         // eslint-disable-next-line no-console
         console.error('Failed to persist registration', res)
+        return
+      }
+
+      if (Array.isArray(res.data) && res.data.length > 0) {
+        const returned = res.data[0] as any
+        if (Object.prototype.hasOwnProperty.call(returned, 'registration')) {
+          syncRegistrationState(
+            typeof returned.registration === 'string' ? returned.registration : null
+          )
+        }
       }
     } catch (err) {
-      setRegistration(prev)
+      syncRegistrationState(prev ?? null)
       // eslint-disable-next-line no-console
       console.error('Error saving registration', err)
     } finally {
@@ -786,15 +983,15 @@ export default function TruckCard({
     const selectedCity = selected?.city ?? null
     const selectedCityId = selected?.city_id ?? null
 
-    const [, currentDigits] = parseRegistration(registration ?? defaultRegistration ?? null)
+    const currentDigits = registrationDigitsRef.current
     const newPrefix = makePrefixFromCity(selectedCity)
     const newDigits = currentDigits && currentDigits.length > 0 ? currentDigits : '1'
-    const newRegistration = `${newPrefix}${newDigits}`
+    const newRegistration = normalizeRegistration(newPrefix, newDigits)
 
     setHubCity(selectedCity)
     // Since this action also updates location_city_id, keep current location in sync optimistically
     setCurrentCity(selectedCity)
-    setRegistration(newRegistration)
+    syncRegistrationState(newRegistration)
 
     if (isMarket) {
       return
@@ -818,21 +1015,29 @@ export default function TruckCard({
       if (!res || res.status < 200 || res.status >= 300) {
         setHubCity(prevHub)
         setCurrentCity(prevCurrentCity)
-        setRegistration(prevRegistration)
+        syncRegistrationState(prevRegistration ?? null)
         // eslint-disable-next-line no-console
         console.error('Failed to persist hub/location/registration', res)
       } else {
         if (res.data && Array.isArray(res.data) && res.data.length > 0) {
           const returned = res.data[0] as any
-          if (returned.registration) setRegistration(returned.registration)
-          if (returned.hub) setHubCity(returned.hub)
+
+          if (Object.prototype.hasOwnProperty.call(returned, 'registration')) {
+            syncRegistrationState(
+              typeof returned.registration === 'string' ? returned.registration : newRegistration
+            )
+          }
+
+          if (Object.prototype.hasOwnProperty.call(returned, 'hub')) {
+            setHubCity(typeof returned.hub === 'string' ? returned.hub : null)
+          }
           // Keep currentCity as optimistic selected city unless a later refresh resolves precise value
         }
       }
     } catch (err) {
       setHubCity(prevHub)
       setCurrentCity(prevCurrentCity)
-      setRegistration(prevRegistration)
+      syncRegistrationState(prevRegistration ?? null)
       // eslint-disable-next-line no-console
       console.error('Error saving hub/location/registration', err)
     } finally {
@@ -1335,14 +1540,14 @@ export default function TruckCard({
                     <RegistrationInput
                       value={registrationDigits}
                       onChange={(d) => {
-                        setRegistrationDigits(d)
                         const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
-                        setRegistration(`${prefix}${d}`)
+                        syncRegistrationState(normalizeRegistration(prefix, d))
                       }}
                       region={parseRegistration(registration ?? defaultRegistration ?? null)[0]}
                       onSave={() => {
                         const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
-                        handleSaveRegistration(`${prefix}${registrationDigits}`)
+                        const latestRegistration = normalizeRegistration(prefix, registrationDigitsRef.current)
+                        void handleSaveRegistration(latestRegistration)
                       }}
                       disabled={savingRegistration || isMarket || isActionLocked}
                       className="ml-3"

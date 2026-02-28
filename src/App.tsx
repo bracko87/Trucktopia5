@@ -45,6 +45,10 @@ import SettingsContactPage from './pages/Settings/Contact'
 import SettingsInvitePage from './pages/Settings/Invite'
 import SettingsProPage from './pages/Settings/Pro'
 
+/* New pages */
+import StatisticsPage from './pages/Statistics'
+import GameDatabasePage from './pages/GameDatabase'
+
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { GameTimeProvider } from './lib/time'
 import { StaffFilterProvider } from './context/StaffFilterContext'
@@ -57,9 +61,6 @@ import CityModal from './components/city/CityModal'
 import CityClickHandler from './components/city/CityClickHandler'
 import OpenAbortModalListener from './components/market/OpenAbortModalListener'
 import AbortJobModal from './components/market/AbortJobModal'
-/* Note: StaffCategoryInfoInjector import removed because the file was not resolvable
-   If you want the injector re-enabled, restore the component file at:
-   src/components/staff/StaffCategoryInfoInjector.tsx and re-add the import below. */
 
 /**
  * InstallmentCostEmphasis
@@ -125,17 +126,6 @@ function AppTimeWrapper({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * RouteTypographyPatch
- *
- * Runtime patch that upgrades route rows' typography and flag sizes to improve
- * visual hierarchy. Implemented as a separate patch component under
- * src/components/patches so we can keep the small changes non-invasive.
- */
-import RouteTypographyPatch from './components/patches/RouteTypographyPatch'
-import DeadlineColorPatch from './components/patches/DeadlineColorPatch'
-import CountryOptionCasePatch from './components/patches/CountryOptionCasePatch'
-
-/**
  * App
  *
  * Defines application routes. Uses HashRouter for SPA routing inside the iframe environment.
@@ -185,6 +175,10 @@ export default function App() {
               <Route path="/map" element={<MapPage />} />
               <Route path="/notifications" element={<NotificationsPage />} />
 
+              {/* New pages */}
+              <Route path="/statistics" element={<StatisticsPage />} />
+              <Route path="/game-database" element={<GameDatabasePage />} />
+
               {/* Settings pages */}
               <Route path="/settings/profile" element={<SettingsProfilePage />} />
               <Route path="/settings/inbox" element={<SettingsInboxPage />} />
@@ -223,3 +217,8 @@ export default function App() {
     </HashRouter>
   )
 }
+
+/* Runtime patches imported after App to avoid circular hooks during module init */
+import RouteTypographyPatch from './components/patches/RouteTypographyPatch'
+import DeadlineColorPatch from './components/patches/DeadlineColorPatch'
+import CountryOptionCasePatch from './components/patches/CountryOptionCasePatch'

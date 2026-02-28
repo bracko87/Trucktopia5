@@ -11,6 +11,12 @@
  * Notes:
  * - This file is additive and intentionally does not change existing pages/components.
  * - Future changes should prefer creating parallel files or importing from this service.
+ *
+ * Important:
+ * - The schema-sensitive truck query is not defined here.
+ * - The failing `cities:location_city_id(name)` query must be fixed in:
+ *   - ../lib/trucksApi
+ *   - and/or ../lib/db/modules/publicTrucks
  */
 
 import React, { useEffect, useState, useCallback } from 'react'
@@ -125,9 +131,7 @@ export function useTrucksService(opts?: { mode?: TrucksFetchMode }) {
   }, [mode])
 
   useEffect(() => {
-    // Initial load
     void load()
-    // We intentionally do not include load in deps beyond mode to keep behavior stable
   }, [load])
 
   return {

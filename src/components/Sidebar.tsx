@@ -3,9 +3,13 @@
  *
  * Collapsible main navigation sidebar used across authenticated pages.
  *
- * FIX:
- * - Logout should NOT reload the page (reload breaks in iframe/preview environments).
- * - Just call supabase.auth.signOut() and navigate to /login (replace).
+ * Includes:
+ * - Primary navigation items (My Company → Map)
+ * - Secondary navigation items (Statistics, Game Database) separated by a divider
+ *
+ * Logout:
+ * - Does NOT reload the page (reload breaks in iframe/preview environments).
+ * - Calls supabase.auth.signOut() and navigates to /login (replace).
  */
 
 import React, { useEffect, useRef, useState } from 'react'
@@ -24,6 +28,8 @@ import {
   LogOut,
   Building2,
   Handshake,
+  BarChart2,
+  Database,
 } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import { supabase } from '../lib/supabase'
@@ -73,7 +79,8 @@ function SidebarItem({ label, subtitle, to, icon, collapsed }: SidebarItemProps)
 /**
  * Sidebar
  *
- * Main collapsible navigation sidebar, including sign-out control.
+ * Main collapsible navigation sidebar, including sign-out control and
+ * secondary section (Statistics, Game Database) separated by a divider.
  */
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
@@ -158,6 +165,21 @@ export default function Sidebar() {
     },
   ]
 
+  const secondaryItems: Array<{ label: string; subtitle?: string; to: string; icon: React.ReactNode }> = [
+    {
+      label: 'Statistics',
+      subtitle: 'Business metrics',
+      to: '/statistics',
+      icon: <BarChart2 size={18} className="text-white" />,
+    },
+    {
+      label: 'Game Database',
+      subtitle: 'Trucks & cargo',
+      to: '/game-database',
+      icon: <Database size={18} className="text-white" />,
+    },
+  ]
+
   function toggleCollapsed() {
     setCollapsed((s) => !s)
   }
@@ -222,6 +244,20 @@ export default function Sidebar() {
         {/* Navigation */}
         <nav className="px-2 mt-2 flex-1 overflow-y-auto space-y-1">
           {items.map((it) => (
+            <SidebarItem
+              key={it.label}
+              label={it.label}
+              subtitle={it.subtitle}
+              to={it.to}
+              icon={it.icon}
+              collapsed={collapsed}
+            />
+          ))}
+
+          {/* Divider between primary and secondary nav groups */}
+          <div className="border-t border-white/20 my-2" />
+
+          {secondaryItems.map((it) => (
             <SidebarItem
               key={it.label}
               label={it.label}

@@ -3,15 +3,13 @@
  *
  * Page listing company staff with quick stats and role-based tabs.
  *
- * This file contains the data loading logic and exposes a reload function
- * that can be passed down to child components so they can trigger a fresh
- * fetch after performing updates (salary changes, etc).
+ * This version fixes the stats mismatch by deriving the top counters
+ * from the same `staff` array that is passed into StaffTabs.
  */
 
 import React from 'react'
 import { useNavigate } from 'react-router'
 import Layout from '../components/Layout'
-import StaffStats from '../components/staff/StaffStats'
 import StaffTabs from '../components/staff/StaffTabs'
 import StaffEffectsOverview from '../components/staff/StaffEffectsOverview'
 import { fetchHiredStaff, StaffMember, FetchHiredStaffResult } from '../lib/staffApi'
@@ -19,6 +17,54 @@ import { fetchUserCompanyId } from '../lib/userApi'
 import { UserPlus } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { useHiredStaffChangedListener } from '../lib/hiredStaffEvents'
+
+type StaffRoleCounts = {
+  drivers: number
+  mechanics: number
+  dispatchers: number
+  managers: number
+  directors: number
+}
+
+function createEmptyRoleCounts(): StaffRoleCounts {
+  return {
+    drivers: 0,
+    mechanics: 0,
+    dispatchers: 0,
+    managers: 0,
+    directors: 0,
+  }
+}
+
+/**
+ * Normalizes a staff member role into one of the tab buckets.
+ * This checks a few common field names so it remains resilient
+ * even if StaffMember uses a slightly different property shape.
+ */
+function getStaffRole(member: StaffMember): keyof StaffRoleCounts | null {
+  const rawRole = [
+    (member as any).role,
+    (member as any).staff_type,
+    (member as any).staffType,
+    (member as any).position,
+    (member as any).job_title,
+    (member as any).jobTitle,
+    (member as any).category,
+    (member as any).type,
+  ].find((value) => typeof value === 'string' && value.trim().length > 0)
+
+  if (!rawRole) return null
+
+  const value = String(rawRole).trim().toLowerCase()
+
+  if (value.includes('driver')) return 'drivers'
+  if (value.includes('mechanic')) return 'mechanics'
+  if (value.includes('dispatch')) return 'dispatchers'
+  if (value.includes('manager')) return 'managers'
+  if (value.includes('director')) return 'directors'
+
+  return null
+}
 
 /**
  * StaffPage
@@ -38,6 +84,7 @@ export default function StaffPage(): JSX.Element {
   const [error, setError] = React.useState<string | null>(null)
 
   const isMounted = React.useRef(true)
+
   React.useEffect(() => {
     isMounted.current = true
     return () => {
@@ -53,6 +100,7 @@ export default function StaffPage(): JSX.Element {
    */
   const load = React.useCallback(async () => {
     if (!isMounted.current) return
+
     setLoading(true)
     setError(null)
 
@@ -63,6 +111,7 @@ export default function StaffPage(): JSX.Element {
       }
 
       const companyId = await fetchUserCompanyId(user.id)
+
       if (!companyId) {
         if (isMounted.current) setStaff([])
         return
@@ -124,6 +173,7 @@ export default function StaffPage(): JSX.Element {
         if (isMounted.current) load()
       }, 1500)
     })
+
     return cleanup
   }, [load])
 
@@ -137,6 +187,19 @@ export default function StaffPage(): JSX.Element {
     load()
   }, [load])
 
+  /**
+   * Derive the top stats from the exact same `staff` array used by StaffTabs.
+   * This guarantees the red block and green tabs stay in sync.
+   */
+  const roleCounts = React.useMemo<StaffRoleCounts>(() => {
+    return staff.reduce<StaffRoleCounts>((acc, member) => {
+      const role = getStaffRole(member)
+      if (role) acc[role] += 1
+      return acc
+    }, createEmptyRoleCounts())
+  }, [staff])
+
+  const totalStaff = React.useMemo(() => staff.length, [staff])
 
   return (
     <Layout fullWidth>
@@ -157,14 +220,43 @@ export default function StaffPage(): JSX.Element {
         </div>
 
         <div className="mt-4 space-y-4">
-          <StaffStats mode="company" />
+          {/* Top stats now use the same loaded `staff` state as StaffTabs */}
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-5 shadow-sm">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p className="text-sm text-slate-500">Total staff</p>
+                <p className="text-4xl font-bold text-slate-900">
+                  {loading ? '0' : totalStaff}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-sm font-medium text-slate-700">
+                  {loading ? '0' : roleCounts.drivers} Drivers
+                </span>
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-sm font-medium text-slate-700">
+                  {loading ? '0' : roleCounts.mechanics} Mechanics
+                </span>
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-sm font-medium text-slate-700">
+                  {loading ? '0' : roleCounts.dispatchers} Dispatchers
+                </span>
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-sm font-medium text-slate-700">
+                  {loading ? '0' : roleCounts.managers} Managers
+                </span>
+                <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-sm font-medium text-slate-700">
+                  {loading ? '0' : roleCounts.directors} Directors
+                </span>
+              </div>
+            </div>
+          </div>
 
           {loading ? (
-            <div className="p-6 bg-white rounded shadow-sm text-center text-slate-500">Loading staff…</div>
+            <div className="p-6 bg-white rounded shadow-sm text-center text-slate-500">
+              Loading staff…
+            </div>
           ) : (
             <>
               <StaffTabs staff={staff} onSalaryUpdated={reloadStaff} />
-              {/* Re-enable the Staff Skills & Position Effects overview (keeps original layout) */}
               <StaffEffectsOverview />
             </>
           )}

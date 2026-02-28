@@ -12,6 +12,7 @@ import ModalShell from '../common/ModalShell'
 import { computeMaintenanceCost, createMaintenanceCheck, fetchMaintenanceChecks } from '../../services/maintenanceService'
 import type { MaintenanceCheck } from '../../services/maintenanceService'
 import { supabaseFetch } from '../../lib/supabase'
+import { addTruckLog } from '../../lib/truckLogs'
 import ExpandableBreakdown from '../common/ExpandableBreakdown'
 
 /**
@@ -244,6 +245,36 @@ export default function MaintenanceModal({ truckId, open, onClose, onDone, truck
 
       const res = await createMaintenanceCheck(payload)
       if (res && res.success) {
+        const selectedEstimate = garageType === 'owner_hub' ? estOwner : garageType === 'city' ? estCity : estRemote
+
+        try {
+          await addTruckLog({
+            truckId,
+            eventType: 'maintenance_check_created',
+            message:
+              garageType === 'owner_hub'
+                ? 'Truck sent to company repair garage'
+                : garageType === 'city'
+                  ? 'Truck sent to city repair garage'
+                  : 'Truck sent to remote repair garage',
+            payload: {
+              garage_type: garageType,
+              performed_at: performedAt,
+              odometer_km: od,
+              notes: notes?.trim() || null,
+              current_mileage_km: authoritativeRow?.mileage_km ?? currentMileage,
+              next_maintenance_km: authoritativeRow?.next_maintenance_km ?? nextMaintenanceKm,
+              total_cost_cents: selectedEstimate?.serviceCostCents ?? null,
+              duration_hours: selectedEstimate?.durationHours ?? null,
+            },
+            source: 'ui',
+          })
+        } catch (logErr) {
+          // Do not fail the main action if logging fails
+          // eslint-disable-next-line no-console
+          console.error('Failed to create maintenance log', logErr)
+        }
+
         if (onDone) onDone()
         onClose()
       } else {

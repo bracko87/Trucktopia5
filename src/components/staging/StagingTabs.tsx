@@ -896,7 +896,6 @@ export default function StagingTabs(): JSX.Element {
         .select(`
           id,
           status,
-          accepted_at,
           assigned_payload_kg,
           payload_remaining_kg,
           job_offer:job_offer_id(
@@ -931,7 +930,7 @@ export default function StagingTabs(): JSX.Element {
           'delivering',
           'DELIVERING',
         ])
-        .order('accepted_at', { ascending: false })
+        .order('created_at', { ascending: false })
 
       if (error) throw error
 
