@@ -131,7 +131,7 @@ function statusPillClasses(status?: string | null): string {
 }
 
 function bestAssignmentTimestamp(row: any): number {
-  const candidates = [row?.delivered_at, row?.started_at, row?.assigned_at]
+  const candidates = [row?.delivered_at, row?.started_at, row?.assigned_at, row?.accepted_at]
     .map((v) => (v ? Date.parse(String(v)) : Number.NaN))
     .filter((v) => Number.isFinite(v)) as number[]
 
@@ -297,8 +297,7 @@ function HistoryModal({
                               {' '}
                               / {Number(job.total_payload_kg).toFixed(2)} kg
                             </>
-                          )}
-                          {' '}
+                          )}{' '}
                           · Ended: <strong>{formatDateTime(job.ended_at_raw)}</strong>
                         </div>
 
@@ -475,9 +474,10 @@ export default function MyJobs(): JSX.Element {
       const runtimeByAssignmentId: Record<string, any> = {}
 
       if (assignmentIds.length > 0 || acceptedJobIds.length > 0) {
-        const selectWithCoDriver = `
+        const assignmentSelect = `
           id,
           accepted_job_id,
+          job_offer_id,
           status,
           run_no,
           run_payload_kg,
@@ -488,27 +488,7 @@ export default function MyJobs(): JSX.Element {
           assigned_at,
           started_at,
           delivered_at,
-          truck:truck_id(id,name,display_name,plate_number),
-          trailer:trailer_id(id,name,display_name),
-          driver:driver_id(id,name,full_name,display_name,username),
-          co_driver:co_driver_id(id,name,full_name,display_name,username)
-        `
-
-        const selectWithoutCoDriver = `
-          id,
-          accepted_job_id,
-          status,
-          run_no,
-          run_payload_kg,
-          truck_id,
-          trailer_id,
-          driver_id,
-          assigned_at,
-          started_at,
-          delivered_at,
-          truck:truck_id(id,name,display_name,plate_number),
-          trailer:trailer_id(id,name,display_name),
-          driver:driver_id(id,name,full_name,display_name,username)
+          accepted_at
         `
 
         const collectedAssignmentRows: any[] = []
@@ -516,7 +496,7 @@ export default function MyJobs(): JSX.Element {
         if (assignmentIds.length > 0) {
           const { data: jaWithCoDriver, error: jaWithCoDriverErr } = await supabase
             .from('job_assignments')
-            .select(selectWithCoDriver)
+            .select(assignmentSelect)
             .in('id', assignmentIds)
 
           if (!jaWithCoDriverErr && Array.isArray(jaWithCoDriver)) {
@@ -524,7 +504,7 @@ export default function MyJobs(): JSX.Element {
           } else {
             const { data: jaRaw, error: jaErr } = await supabase
               .from('job_assignments')
-              .select(selectWithoutCoDriver)
+              .select(assignmentSelect)
               .in('id', assignmentIds)
 
             if (!jaErr && Array.isArray(jaRaw)) {
@@ -538,7 +518,7 @@ export default function MyJobs(): JSX.Element {
         if (acceptedJobIds.length > 0) {
           const { data: jaByAcceptedWithCoDriver, error: jaByAcceptedWithCoDriverErr } = await supabase
             .from('job_assignments')
-            .select(selectWithCoDriver)
+            .select(assignmentSelect)
             .in('accepted_job_id', acceptedJobIds)
 
           if (!jaByAcceptedWithCoDriverErr && Array.isArray(jaByAcceptedWithCoDriver)) {
@@ -546,7 +526,7 @@ export default function MyJobs(): JSX.Element {
           } else {
             const { data: jaByAcceptedRaw, error: jaByAcceptedErr } = await supabase
               .from('job_assignments')
-              .select(selectWithoutCoDriver)
+              .select(assignmentSelect)
               .in('accepted_job_id', acceptedJobIds)
 
             if (!jaByAcceptedErr && Array.isArray(jaByAcceptedRaw)) {
@@ -748,25 +728,53 @@ export default function MyJobs(): JSX.Element {
     await fetchJobs()
   }
 
-  function openCancelModal(job: MyJobRow) {
+  async function openCancelModal(job: MyJobRow) {
     setCancelJob(job)
     setCancelOpen(true)
+    setCancelPenalty(null)
+
+    const assignmentId = job.current_job_assignment_id
+    if (assignmentId) {
+      const { data, error } = await supabase.rpc('get_assignment_cancellation_penalty', {
+        p_assignment_id: assignmentId,
+      })
+
+      if (!error && typeof data === 'number') {
+        setCancelPenalty(data)
+        return
+      }
+    }
 
     const acceptedAt = job.accepted_at_raw ? Date.parse(String(job.accepted_at_raw)) : null
+    const deliveryDeadline = job.delivery_deadline ? Date.parse(String(job.delivery_deadline)) : null
+    const reward = Number(job.final_reward ?? job.reward_load_cargo ?? job.reward_trailer_cargo ?? 0)
+
     if (!acceptedAt) {
       setCancelPenalty(null)
       return
     }
 
-    const hours = (Date.now() - acceptedAt) / (1000 * 60 * 60)
-    if (hours <= 12) {
+    const nowMs = Date.now()
+    const freeLimit = acceptedAt + 12 * 60 * 60 * 1000
+
+    if (nowMs <= freeLimit) {
       setCancelPenalty(0)
       return
     }
 
-    const pct = Math.min(1.2, 0.01 * Math.floor(hours))
-    const estimatedBase = 100
-    setCancelPenalty(Math.round(estimatedBase * pct * 100) / 100)
+    if (deliveryDeadline && nowMs > deliveryDeadline) {
+      setCancelPenalty(Math.round(reward * 1.2 * 100) / 100)
+      return
+    }
+
+    if (!deliveryDeadline || deliveryDeadline <= freeLimit) {
+      setCancelPenalty(Math.round(reward * 100) / 100)
+      return
+    }
+
+    const progress = (nowMs - freeLimit) / (deliveryDeadline - freeLimit)
+    const penalty = reward * Math.max(0, Math.min(1, progress))
+    setCancelPenalty(Math.round(penalty * 100) / 100)
   }
 
   async function handleConfirmCancel() {
@@ -791,6 +799,20 @@ export default function MyJobs(): JSX.Element {
         throw new Error('Missing accepted job id.')
       }
 
+      let assignmentId = cancelJob.current_job_assignment_id
+      if (!assignmentId) {
+        const { data: latestAssignment } = await supabase
+          .from('job_assignments')
+          .select('id,assigned_at,started_at')
+          .eq('accepted_job_id', acceptedJobId)
+          .order('started_at', { ascending: false, nullsFirst: false })
+          .order('assigned_at', { ascending: false, nullsFirst: false })
+          .limit(1)
+          .maybeSingle()
+
+        assignmentId = latestAssignment?.id ? String(latestAssignment.id) : null
+      }
+
       const { error: rpcErr } = await supabase.rpc('cancel_accepted_job', {
         p_accepted_job_id: acceptedJobId,
         p_user_id: appUserId,
@@ -798,7 +820,17 @@ export default function MyJobs(): JSX.Element {
       })
 
       if (rpcErr) {
-        throw new Error(rpcErr.message ?? 'Failed to cancel job')
+        if (!assignmentId) {
+          throw new Error(rpcErr.message ?? 'Failed to cancel job')
+        }
+
+        const { error: assignmentCancelErr } = await supabase.rpc('cancel_assignment', {
+          p_assignment_id: assignmentId,
+        })
+
+        if (assignmentCancelErr) {
+          throw new Error(assignmentCancelErr.message ?? rpcErr.message ?? 'Failed to cancel job')
+        }
       }
 
       if (cancelJob.id) {
@@ -904,7 +936,9 @@ export default function MyJobs(): JSX.Element {
                     onView={() => {}}
                     variant="waiting"
                     actionsVariant="my-jobs"
-                    onCancel={(j) => openCancelModal(j as MyJobRow)}
+                    onCancel={(j) => {
+                      void openCancelModal(j as MyJobRow)
+                    }}
                   />
                 ))}
               </div>
