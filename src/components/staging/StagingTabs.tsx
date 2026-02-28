@@ -34,6 +34,14 @@
  *   AssignmentPanel to pass the resolved company id (effectiveCompanyId), instead
  *   of only the initial auth snapshot (initialCompanyId). This keeps Active
  *   loading aligned with the rest of staging tabs when company id resolves asynchronously.
+ *
+ * Current update:
+ * - Fixed the Staging Cargo loader to be schema-compatible across legacy Supabase environments.
+ *   It first tries job_assignments filtered by carrier_company_id and includes payload columns.
+ *   If PostgREST returns 42703 because carrier_company_id and/or payload columns do not exist,
+ *   it retries automatically using job_assignments.user_id filtered to users belonging to the company,
+ *   and drops payload columns so the Cargo tab stays functional instead of failing.
+ *   Existing cargo filtering and remaining-payload behavior is unchanged.
  */
 
 import React, { useEffect, useMemo, useState, useRef } from 'react'
@@ -544,6 +552,36 @@ export default function StagingTabs(): JSX.Element {
   }
 
   /**
+   * resolveCompanyUserIds
+   *
+   * Resolve all user identifiers associated with a company. Used as a legacy
+   * fallback when job_assignments does not expose carrier_company_id.
+   */
+  async function resolveCompanyUserIds(companyId: string): Promise<string[]> {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('auth_user_id,id')
+        .eq('company_id', companyId)
+        .limit(500)
+
+      if (error) return []
+
+      const ids = new Set<string>()
+      for (const row of data ?? []) {
+        const authId = (row as any)?.auth_user_id
+        const userId = (row as any)?.id
+        if (authId) ids.add(String(authId))
+        if (userId) ids.add(String(userId))
+      }
+
+      return Array.from(ids)
+    } catch {
+      return []
+    }
+  }
+
+  /**
    * fetchCompanyTrucksForStaging
    *
    * Direct fallback loader that fetches company trucks with status='available'.
@@ -848,7 +886,7 @@ export default function StagingTabs(): JSX.Element {
             location_city_id: locId,
             // explicit alias: current_location_id for clarity (mapped from stats.current_location_id)
             current_location_id: locId,
-            }
+          }
         })
 
       // Merge: profile drivers first (owner/CEO visible on top), then hired drivers
@@ -877,6 +915,11 @@ export default function StagingTabs(): JSX.Element {
    * Updated cargo filtering behavior:
    * - trailer_cargo: only show while status is still "assigned"
    * - load_cargo: keep visible while there is remaining payload
+   *
+   * Schema compatibility update:
+   * - first attempts to query payload columns using carrier_company_id
+   * - if PostgREST returns 42703 for missing payload columns and/or carrier_company_id,
+   *   retries automatically using legacy user_id filtering and without payload columns
    */
   async function fetchAssignedJobs(overrideCompanyId?: string) {
     setLoadingCargo(true)
@@ -891,46 +934,83 @@ export default function StagingTabs(): JSX.Element {
         return
       }
 
-      const { data, error } = await supabase
-        .from('job_assignments')
-        .select(`
-          id,
-          status,
-          assigned_payload_kg,
-          payload_remaining_kg,
-          job_offer:job_offer_id(
-            id,
-            remaining_payload,
-            transport_mode,
-            pickup_time,
-            delivery_deadline,
-            distance_km,
-            weight_kg,
-            volume_m3,
-            pallets,
-            reward_load_cargo,
-            reward_trailer_cargo,
-            cargo_item_id,
-            cargo_type_id,
-            cargo_items:cargo_item_id(name),
-            cargo_types:cargo_type_id(name),
-            origin_city:origin_city_id(city_name, country_code, id),
-            destination_city:destination_city_id(city_name, country_code, id)
+      const companyUserIds = await resolveCompanyUserIds(cid)
+
+      const jobOfferSelect = `
+        id,
+        remaining_payload,
+        transport_mode,
+        pickup_time,
+        delivery_deadline,
+        distance_km,
+        weight_kg,
+        volume_m3,
+        pallets,
+        reward_load_cargo,
+        reward_trailer_cargo,
+        cargo_item_id,
+        cargo_type_id,
+        cargo_items:cargo_item_id(name),
+        cargo_types:cargo_type_id(name),
+        origin_city:origin_city_id(city_name, country_code, id),
+        destination_city:destination_city_id(city_name, country_code, id)
+      `
+
+      const activeStatuses = [
+        'assigned',
+        'picking_load',
+        'PICKING_LOAD',
+        'to_pickup',
+        'TO_PICKUP',
+        'in_progress',
+        'IN_PROGRESS',
+        'delivering',
+        'DELIVERING',
+      ]
+
+      async function queryAssignments(includePayloadColumns: boolean, useCarrierFilter: boolean) {
+        const payloadColumns = includePayloadColumns
+          ? 'assigned_payload_kg,payload_remaining_kg,'
+          : ''
+
+        let q = supabase
+          .from('job_assignments')
+          .select(
+            `
+              id,
+              status,
+              user_id,
+              ${payloadColumns}
+              job_offer:job_offer_id(${jobOfferSelect})
+            `
           )
-        `)
-        .eq('carrier_company_id', cid)
-        .in('status', [
-          'assigned',
-          'picking_load',
-          'PICKING_LOAD',
-          'to_pickup',
-          'TO_PICKUP',
-          'in_progress',
-          'IN_PROGRESS',
-          'delivering',
-          'DELIVERING',
-        ])
-        .order('created_at', { ascending: false })
+          .in('status', activeStatuses)
+          .order('created_at', { ascending: false })
+
+        if (useCarrierFilter) {
+          q = (q as any).eq('carrier_company_id', cid)
+        } else {
+          if (companyUserIds.length === 0) {
+            return { data: [], error: null as any }
+          }
+          q = (q as any).in('user_id', companyUserIds)
+        }
+
+        return await q
+      }
+
+      let { data, error } = await queryAssignments(true, true)
+
+      const missingSchemaColumns =
+        error &&
+        (error as any)?.code === '42703' &&
+        /assigned_payload_kg|payload_remaining_kg|carrier_company_id/i.test(
+          String((error as any)?.message ?? '')
+        )
+
+      if (missingSchemaColumns) {
+        ;({ data, error } = await queryAssignments(false, false))
+      }
 
       if (error) throw error
 
@@ -1268,7 +1348,6 @@ export default function StagingTabs(): JSX.Element {
                         <div>
                           <div className="font-medium text-slate-800 flex items-center gap-2">
                             <span>{tr.label || `Trailer ${String((tr.id ?? tr._raw?.id ?? '')).substring(0, 8)}`}</span>
-
                           </div>
                           <div className="text-xs text-slate-500 mt-1 flex flex-wrap gap-3">
                             {tr.locationCityName && (
@@ -1351,7 +1430,6 @@ export default function StagingTabs(): JSX.Element {
                               </div>
                             ) : null}
                             <div className="font-medium text-slate-800 flex items-center gap-2">
-
                               <span>{d.name ?? `${d.first_name ?? ''} ${d.last_name ?? ''}`}</span>
                             </div>
                           </div>
@@ -1500,9 +1578,8 @@ export default function StagingTabs(): JSX.Element {
                     return (
                       <li
                         key={assignment.id}
-                        draggable={pickupReady} // only draggable when pickup is ready
+                        draggable={pickupReady}
                         onDragStart={(ev) => {
-                          // Prevent drag when pickup not ready
                           if (!pickupReady) {
                             ev.preventDefault()
                             return
@@ -1576,10 +1653,6 @@ export default function StagingTabs(): JSX.Element {
                           )}
 
                           {deadline && (() => {
-                            /**
-                             * Determine if the deadline has passed and render with
-                             * a red emphasis when expired or green when upcoming.
-                             */
                             const isExpired = new Date(String(deadline)) < new Date()
                             return (
                               <span>

@@ -1556,15 +1556,24 @@ export default function TruckCard({
                     <button
                       type="button"
                       onClick={() => {
-                        if (selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')) return
-                        handleChangeHub(selectedHubId)
+                        const selectedHubCityId = hubs.find((h) => h.city === hubCity)?.id ?? ''
+                        const hubChanged = selectedHubId !== selectedHubCityId
+
+                        if (hubChanged) {
+                          void handleChangeHub(selectedHubId)
+                          return
+                        }
+
+                        const prefix = parseRegistration(registration ?? defaultRegistration ?? null)[0]
+                        const latestRegistration = normalizeRegistration(prefix, registrationDigitsRef.current)
+                        void handleSaveRegistration(latestRegistration)
                       }}
                       disabled={
                         savingHub ||
-                        isActionLocked ||
-                        selectedHubId === (hubs.find((h) => h.city === hubCity)?.id ?? '')
+                        savingRegistration ||
+                        isActionLocked
                       }
-                      className={`text-sm px-3 py-1 rounded border ${savingHub || isActionLocked ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
+                      className={`text-sm px-3 py-1 rounded border ${savingHub || savingRegistration || isActionLocked ? 'bg-slate-100 text-slate-400 border-slate-200' : 'bg-white hover:bg-slate-100 border-slate-200'}`}
                       title={inTransit ? `Truck in transit until ${availableFromAt ? new Date(availableFromAt).toLocaleString() : 'delivery completes'}` : undefined}
                     >
                       Apply
