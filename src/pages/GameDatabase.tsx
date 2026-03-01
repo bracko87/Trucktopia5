@@ -5,6 +5,17 @@
  * - Countries & Cities
  * - Truck & Trailer Models
  * - Cargo Types & Items
+ *
+ * Updates:
+ * - Lazy tab loading (Geography first; Assets/Cargo on demand)
+ * - Per-tab loading/error state
+ * - Resilient selectWithFallback() for schema drift
+ * - job_offers uses city IDs / join-based safe loading (no origin_city/destination_city text dependency)
+ * - user_trailers uses master_trailer_id only
+ * - RPC-first analytics:
+ *   - game_db_city_demand
+ *   - game_db_asset_top_owners
+ *   - game_db_cargo_item_analytics
  */
 
 import React from 'react'
@@ -87,10 +98,12 @@ type JobOfferRow = {
   id: string
   cargo_type_id?: string | null
   cargo_item_id?: string | null
-  origin_city?: string | null
-  destination_city?: string | null
-  origin_country?: string | null
-  destination_country?: string | null
+  origin_city_id?: string | null
+  destination_city_id?: string | null
+  origin_city_name?: string | null
+  destination_city_name?: string | null
+  origin_country_name?: string | null
+  destination_country_name?: string | null
   created_at?: string | null
 }
 
@@ -103,7 +116,6 @@ type UserTruckRow = {
 
 type UserTrailerRow = {
   id: string
-  trailer_model_id?: string | null
   master_trailer_id?: string | null
   owner_company_id?: string | null
   status?: string | null
@@ -136,6 +148,41 @@ function topN(counts: Record<string, number>, limit: number): ChartDatum[] {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, limit)
     .map(([name, value]) => ({ name, value }))
+}
+
+async function selectWithFallback(
+  table: string,
+  selectors: string[],
+  opts: { orderBy?: string | string[]; limit?: number } = {}
+): Promise<{ data: any[]; usedSelector?: string; error?: any }> {
+  let lastErr: any = null
+
+  for (const selector of selectors) {
+    let query = supabase.from(table).select(selector)
+
+    if (opts.orderBy) {
+      const fields = Array.isArray(opts.orderBy) ? opts.orderBy : [opts.orderBy]
+      fields.forEach((field) => {
+        query = query.order(field)
+      })
+    }
+
+    if (typeof opts.limit === 'number') {
+      query = query.limit(opts.limit)
+    }
+
+    const res = await query
+    if (!res.error) {
+      return {
+        data: Array.isArray(res.data) ? res.data : [],
+        usedSelector: selector,
+      }
+    }
+
+    lastErr = res.error
+  }
+
+  return { data: [], error: lastErr }
 }
 
 function CompanyQuickModal({
@@ -200,19 +247,36 @@ function CompanyQuickModal({
 export default function GameDatabasePage(): JSX.Element {
   const [activeTab, setActiveTab] = React.useState<MainTab>('geography')
 
-  const [loading, setLoading] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
+  const [loading, setLoading] = React.useState<Record<MainTab, boolean>>({
+    geography: false,
+    assets: false,
+    cargo: false,
+  })
+
+  const [error, setError] = React.useState<Record<MainTab, string | null>>({
+    geography: null,
+    assets: null,
+    cargo: null,
+  })
+
+  const [loadedTabs, setLoadedTabs] = React.useState<Record<MainTab, boolean>>({
+    geography: false,
+    assets: false,
+    cargo: false,
+  })
 
   const [cities, setCities] = React.useState<CityRow[]>([])
   const [clientCompanies, setClientCompanies] = React.useState<ClientCompanyRow[]>([])
   const [userCompanies, setUserCompanies] = React.useState<UserCompanyRow[]>([])
+
   const [truckModels, setTruckModels] = React.useState<AssetModelRow[]>([])
   const [trailerModels, setTrailerModels] = React.useState<AssetModelRow[]>([])
-  const [cargoTypes, setCargoTypes] = React.useState<CargoTypeRow[]>([])
-  const [cargoItems, setCargoItems] = React.useState<CargoItemRow[]>([])
-  const [jobOffers, setJobOffers] = React.useState<JobOfferRow[]>([])
   const [userTrucks, setUserTrucks] = React.useState<UserTruckRow[]>([])
   const [userTrailers, setUserTrailers] = React.useState<UserTrailerRow[]>([])
+
+  const [cargoTypes, setCargoTypes] = React.useState<CargoTypeRow[]>([])
+  const [cargoItems, setCargoItems] = React.useState<CargoItemRow[]>([])
+  const [cargoJobs, setCargoJobs] = React.useState<JobOfferRow[]>([])
 
   const [selectedCountry, setSelectedCountry] = React.useState('')
   const [selectedCity, setSelectedCity] = React.useState('')
@@ -221,131 +285,31 @@ export default function GameDatabasePage(): JSX.Element {
   const [assetKind, setAssetKind] = React.useState<AssetKind>('truck')
   const [selectedMake, setSelectedMake] = React.useState('')
   const [selectedModelId, setSelectedModelId] = React.useState('')
+  const [assetTopCompanies, setAssetTopCompanies] = React.useState<ChartDatum[]>([])
 
   const [selectedCargoTypeId, setSelectedCargoTypeId] = React.useState('')
   const [selectedCargoItemId, setSelectedCargoItemId] = React.useState('')
   const [timeRange, setTimeRange] = React.useState<TimeRange>('7d')
 
-  React.useEffect(() => {
-    let mounted = true
+  const [cityDemand, setCityDemand] = React.useState<{
+    importTop: ChartDatum[]
+    exportTop: ChartDatum[]
+  }>({ importTop: [], exportTop: [] })
 
-    async function loadAll() {
-      setLoading(true)
-      setError(null)
+  const [cargoUsageCount, setCargoUsageCount] = React.useState(0)
+  const [cargoTopImport, setCargoTopImport] = React.useState<ChartDatum[]>([])
+  const [cargoTopExport, setCargoTopExport] = React.useState<ChartDatum[]>([])
 
-      try {
-        const [
-          citiesRes,
-          clientRes,
-          companiesRes,
-          truckModelsRes,
-          trailerModelsRes,
-          cargoTypesRes,
-          cargoItemsRes,
-          jobsRes,
-          userTrucksRes,
-          userTrailersRes,
-        ] = await Promise.all([
-          supabase
-            .from('cities')
-            .select('id,city_name,country_name,country_code')
-            .order('country_name')
-            .order('city_name')
-            .limit(2000),
-          supabase
-            .from('client_companies')
-            .select('id,name,country,city,is_active')
-            .order('name')
-            .limit(2000),
-          supabase
-            .from('companies')
-            .select('id,name,hub_city,hub_country,trucks,trailers,employees,balance')
-            .order('name')
-            .limit(2000),
-          supabase.from('truck_models').select('*').order('make').order('model').limit(2000),
-          supabase.from('trailer_models').select('*').order('make').order('model').limit(2000),
-          supabase
-            .from('cargo_types')
-            .select('id,name,description')
-            .order('name')
-            .limit(1000),
-          supabase
-            .from('cargo_items')
-            .select('id,name,cargo_type_id,typical_weight_kg,typical_volume_m3,is_hazardous')
-            .order('name')
-            .limit(3000),
-          supabase
-            .from('job_offers')
-            .select(
-              'id,cargo_type_id,cargo_item_id,origin_city,destination_city,origin_country,destination_country,created_at'
-            )
-            .order('created_at', { ascending: false })
-            .limit(5000),
-          supabase
-            .from('user_trucks')
-            .select('id,master_truck_id,owner_company_id,status')
-            .limit(5000),
-          supabase
-            .from('user_trailers')
-            .select('id,trailer_model_id,master_trailer_id,owner_company_id,status')
-            .limit(5000),
-        ])
+  const setTabLoading = React.useCallback((tab: MainTab, value: boolean) => {
+    setLoading((prev) => ({ ...prev, [tab]: value }))
+  }, [])
 
-        const maybeErr = [
-          citiesRes.error,
-          clientRes.error,
-          companiesRes.error,
-          truckModelsRes.error,
-          trailerModelsRes.error,
-          cargoTypesRes.error,
-          cargoItemsRes.error,
-          jobsRes.error,
-          userTrucksRes.error,
-          userTrailersRes.error,
-        ].find(Boolean)
+  const setTabError = React.useCallback((tab: MainTab, value: string | null) => {
+    setError((prev) => ({ ...prev, [tab]: value }))
+  }, [])
 
-        if (maybeErr) throw maybeErr
-        if (!mounted) return
-
-        setCities(Array.isArray(citiesRes.data) ? (citiesRes.data as CityRow[]) : [])
-        setClientCompanies(
-          Array.isArray(clientRes.data) ? (clientRes.data as ClientCompanyRow[]) : []
-        )
-        setUserCompanies(
-          Array.isArray(companiesRes.data) ? (companiesRes.data as UserCompanyRow[]) : []
-        )
-        setTruckModels(
-          Array.isArray(truckModelsRes.data) ? (truckModelsRes.data as AssetModelRow[]) : []
-        )
-        setTrailerModels(
-          Array.isArray(trailerModelsRes.data) ? (trailerModelsRes.data as AssetModelRow[]) : []
-        )
-        setCargoTypes(
-          Array.isArray(cargoTypesRes.data) ? (cargoTypesRes.data as CargoTypeRow[]) : []
-        )
-        setCargoItems(
-          Array.isArray(cargoItemsRes.data) ? (cargoItemsRes.data as CargoItemRow[]) : []
-        )
-        setJobOffers(Array.isArray(jobsRes.data) ? (jobsRes.data as JobOfferRow[]) : [])
-        setUserTrucks(
-          Array.isArray(userTrucksRes.data) ? (userTrucksRes.data as UserTruckRow[]) : []
-        )
-        setUserTrailers(
-          Array.isArray(userTrailersRes.data) ? (userTrailersRes.data as UserTrailerRow[]) : []
-        )
-      } catch (err: unknown) {
-        if (!mounted) return
-        setError(err instanceof Error ? err.message : 'Failed to load database explorer data.')
-      } finally {
-        if (mounted) setLoading(false)
-      }
-    }
-
-    void loadAll()
-
-    return () => {
-      mounted = false
-    }
+  const setTabLoaded = React.useCallback((tab: MainTab, value: boolean) => {
+    setLoadedTabs((prev) => ({ ...prev, [tab]: value }))
   }, [])
 
   const cargoTypeNameById = React.useMemo(() => {
@@ -353,9 +317,7 @@ export default function GameDatabasePage(): JSX.Element {
 
     cargoTypes.forEach((ct) => {
       const id = normalize(ct.id)
-      if (id) {
-        map[id] = normalize(ct.name) || 'Unnamed cargo type'
-      }
+      if (id) map[id] = normalize(ct.name) || 'Unnamed cargo type'
     })
 
     return map
@@ -366,13 +328,202 @@ export default function GameDatabasePage(): JSX.Element {
 
     cargoItems.forEach((ci) => {
       const id = normalize(ci.id)
-      if (id) {
-        map[id] = normalize(ci.name) || 'Unnamed cargo item'
-      }
+      if (id) map[id] = normalize(ci.name) || 'Unnamed cargo item'
     })
 
     return map
   }, [cargoItems])
+
+  const cityById = React.useMemo(() => {
+    const map: Record<string, CityRow> = {}
+
+    cities.forEach((c) => {
+      const id = normalize(c.id)
+      if (id) map[id] = c
+    })
+
+    return map
+  }, [cities])
+
+  const getJobCargoLabel = React.useCallback(
+    (job: JobOfferRow): string => {
+      const itemName = cargoItemNameById[normalize(job.cargo_item_id)]
+      if (itemName) return itemName
+
+      const typeName = cargoTypeNameById[normalize(job.cargo_type_id)]
+      if (typeName) return typeName
+
+      return 'Unknown cargo'
+    },
+    [cargoItemNameById, cargoTypeNameById]
+  )
+
+  const hydrateJobRows = React.useCallback(
+    (rows: any[]): JobOfferRow[] => {
+      return rows.map((row: any) => {
+        const originJoin = row?.origin_city
+        const destinationJoin = row?.destination_city
+
+        const originCityId = normalize(row?.origin_city_id) || null
+        const destinationCityId = normalize(row?.destination_city_id) || null
+
+        const originLookup = originCityId ? cityById[originCityId] : undefined
+        const destinationLookup = destinationCityId ? cityById[destinationCityId] : undefined
+
+        return {
+          id: normalize(row?.id),
+          cargo_type_id: normalize(row?.cargo_type_id) || null,
+          cargo_item_id: normalize(row?.cargo_item_id) || null,
+          origin_city_id: originCityId,
+          destination_city_id: destinationCityId,
+          origin_city_name:
+            normalize(originJoin?.city_name) || normalize(originLookup?.city_name) || null,
+          destination_city_name:
+            normalize(destinationJoin?.city_name) ||
+            normalize(destinationLookup?.city_name) ||
+            null,
+          origin_country_name:
+            normalize(originJoin?.country_name) || normalize(originLookup?.country_name) || null,
+          destination_country_name:
+            normalize(destinationJoin?.country_name) ||
+            normalize(destinationLookup?.country_name) ||
+            null,
+          created_at: normalize(row?.created_at) || null,
+        }
+      })
+    },
+    [cityById]
+  )
+
+  const loadGeography = React.useCallback(async () => {
+    setTabLoading('geography', true)
+    setTabError('geography', null)
+
+    try {
+      const [citiesRes, clientRes, companiesRes] = await Promise.all([
+        selectWithFallback(
+          'cities',
+          ['id,city_name,country_name,country_code'],
+          { orderBy: ['country_name', 'city_name'], limit: 2000 }
+        ),
+        selectWithFallback(
+          'client_companies',
+          ['id,name,country,city,is_active'],
+          { orderBy: 'name', limit: 2000 }
+        ),
+        selectWithFallback(
+          'companies',
+          ['id,name,hub_city,hub_country,trucks,trailers,employees,balance'],
+          { orderBy: 'name', limit: 2000 }
+        ),
+      ])
+
+      if (citiesRes.error && clientRes.error && companiesRes.error) {
+        throw citiesRes.error || clientRes.error || companiesRes.error
+      }
+
+      setCities(citiesRes.data as CityRow[])
+      setClientCompanies(clientRes.data as ClientCompanyRow[])
+      setUserCompanies(companiesRes.data as UserCompanyRow[])
+    } catch (err: unknown) {
+      setTabError(
+        'geography',
+        err instanceof Error ? err.message : 'Failed to load geography data.'
+      )
+    } finally {
+      setTabLoading('geography', false)
+      setTabLoaded('geography', true)
+    }
+  }, [setTabError, setTabLoaded, setTabLoading])
+
+  const loadAssets = React.useCallback(async () => {
+    setTabLoading('assets', true)
+    setTabError('assets', null)
+
+    try {
+      const [truckRes, trailerRes, userTrucksRes, userTrailersRes] = await Promise.all([
+        selectWithFallback('truck_models', ['*'], { orderBy: 'make', limit: 2000 }),
+        selectWithFallback('trailer_models', ['*'], { orderBy: 'make', limit: 2000 }),
+        selectWithFallback(
+          'user_trucks',
+          ['id,master_truck_id,owner_company_id,status'],
+          { limit: 5000 }
+        ),
+        // trailer_model_id does not exist in some DBs; prefer master_trailer_id
+        selectWithFallback(
+          'user_trailers',
+          ['id,master_trailer_id,owner_company_id,status'],
+          { limit: 5000 }
+        ),
+      ])
+
+      if (truckRes.error && trailerRes.error && userTrucksRes.error && userTrailersRes.error) {
+        throw truckRes.error || trailerRes.error || userTrucksRes.error || userTrailersRes.error
+      }
+
+      setTruckModels(truckRes.data as AssetModelRow[])
+      setTrailerModels(trailerRes.data as AssetModelRow[])
+      setUserTrucks(userTrucksRes.data as UserTruckRow[])
+      setUserTrailers(userTrailersRes.data as UserTrailerRow[])
+    } catch (err: unknown) {
+      setTabError('assets', err instanceof Error ? err.message : 'Failed to load assets data.')
+    } finally {
+      setTabLoading('assets', false)
+      setTabLoaded('assets', true)
+    }
+  }, [setTabError, setTabLoaded, setTabLoading])
+
+  const loadCargo = React.useCallback(async () => {
+    setTabLoading('cargo', true)
+    setTabError('cargo', null)
+
+    try {
+      const [cargoTypesRes, cargoItemsRes, jobsRes] = await Promise.all([
+        selectWithFallback(
+          'cargo_types',
+          ['id,name,description'],
+          { orderBy: 'name', limit: 1000 }
+        ),
+        selectWithFallback(
+          'cargo_items',
+          ['id,name,cargo_type_id,typical_weight_kg,typical_volume_m3,is_hazardous'],
+          { orderBy: 'name', limit: 3000 }
+        ),
+        selectWithFallback(
+          'job_offers',
+          [
+            // Prefer join-based read via origin_city_id/destination_city_id
+            'id,cargo_type_id,cargo_item_id,origin_city_id,destination_city_id,created_at,origin_city:cities!job_offers_origin_city_id_fkey(city_name,country_name),destination_city:cities!job_offers_destination_city_id_fkey(city_name,country_name)',
+            // Fallback if FK alias names differ: still use *_city_id and hydrate from cities map
+            'id,cargo_type_id,cargo_item_id,origin_city_id,destination_city_id,created_at',
+          ],
+          { orderBy: 'created_at', limit: 5000 }
+        ),
+      ])
+
+      if (cargoTypesRes.error && cargoItemsRes.error && jobsRes.error) {
+        throw cargoTypesRes.error || cargoItemsRes.error || jobsRes.error
+      }
+
+      setCargoTypes(cargoTypesRes.data as CargoTypeRow[])
+      setCargoItems(cargoItemsRes.data as CargoItemRow[])
+      setCargoJobs(hydrateJobRows(jobsRes.data))
+    } catch (err: unknown) {
+      setTabError('cargo', err instanceof Error ? err.message : 'Failed to load cargo data.')
+    } finally {
+      setTabLoading('cargo', false)
+      setTabLoaded('cargo', true)
+    }
+  }, [hydrateJobRows, setTabError, setTabLoaded, setTabLoading])
+
+  React.useEffect(() => {
+    void loadGeography()
+  }, [loadGeography])
+
+  React.useEffect(() => {
+    if (activeTab === 'assets' && !loadedTabs.assets) void loadAssets()
+    if (activeTab === 'cargo' && !loadedTabs.cargo) void loadCargo()
+  }, [activeTab, loadedTabs.assets, loadedTabs.cargo, loadAssets, loadCargo])
 
   const countryOptions = React.useMemo(() => {
     const set = new Set<string>()
@@ -432,35 +583,58 @@ export default function GameDatabasePage(): JSX.Element {
     )
   }, [userCompanies, selectedCountry, selectedCity])
 
-  const getJobCargoLabel = React.useCallback(
-    (job: JobOfferRow): string => {
-      const itemName = cargoItemNameById[normalize(job.cargo_item_id)]
-      if (itemName) return itemName
+  React.useEffect(() => {
+    async function loadCityDemand() {
+      if (!selectedCity) {
+        setCityDemand({ importTop: [], exportTop: [] })
+        return
+      }
 
-      const typeName = cargoTypeNameById[normalize(job.cargo_type_id)]
-      if (typeName) return typeName
+      const rpc = await supabase.rpc('game_db_city_demand', {
+        p_city_name: selectedCity,
+        p_country_name: selectedCountry || null,
+        p_limit: 5,
+      })
 
-      return 'Unknown cargo'
-    },
-    [cargoItemNameById, cargoTypeNameById]
-  )
+      if (!rpc.error) {
+        const rows = Array.isArray(rpc.data) ? rpc.data : []
+        setCityDemand({
+          importTop: rows
+            .filter((r: any) => r.direction === 'import')
+            .map((r: any) => ({
+              name: normalize(r.cargo_type_name) || 'Unknown',
+              value: Number(r.jobs_count ?? 0),
+            })),
+          exportTop: rows
+            .filter((r: any) => r.direction === 'export')
+            .map((r: any) => ({
+              name: normalize(r.cargo_type_name) || 'Unknown',
+              value: Number(r.jobs_count ?? 0),
+            })),
+        })
+        return
+      }
 
-  const cityImportExport = React.useMemo(() => {
-    const importRows = jobOffers.filter(
-      (j) =>
-        sameText(j.destination_country, selectedCountry) &&
-        sameText(j.destination_city, selectedCity)
-    )
+      const importRows = cargoJobs.filter(
+        (j) =>
+          sameText(j.destination_country_name, selectedCountry) &&
+          sameText(j.destination_city_name, selectedCity)
+      )
 
-    const exportRows = jobOffers.filter(
-      (j) => sameText(j.origin_country, selectedCountry) && sameText(j.origin_city, selectedCity)
-    )
+      const exportRows = cargoJobs.filter(
+        (j) =>
+          sameText(j.origin_country_name, selectedCountry) &&
+          sameText(j.origin_city_name, selectedCity)
+      )
 
-    return {
-      importTop: topN(countByKey(importRows, getJobCargoLabel), 8),
-      exportTop: topN(countByKey(exportRows, getJobCargoLabel), 8),
+      setCityDemand({
+        importTop: topN(countByKey(importRows, getJobCargoLabel), 8),
+        exportTop: topN(countByKey(exportRows, getJobCargoLabel), 8),
+      })
     }
-  }, [jobOffers, selectedCountry, selectedCity, getJobCargoLabel])
+
+    void loadCityDemand()
+  }, [selectedCity, selectedCountry, cargoJobs, getJobCargoLabel])
 
   const assetModels = assetKind === 'truck' ? truckModels : trailerModels
 
@@ -487,7 +661,11 @@ export default function GameDatabasePage(): JSX.Element {
   }, [makeOptions, selectedMake])
 
   const modelOptions = React.useMemo(() => {
-    return assetModels.filter((m) => sameText(m.make || m.producer || m.brand, selectedMake))
+    return assetModels
+      .filter((m) => sameText(m.make || m.producer || m.brand, selectedMake))
+      .sort((a, b) =>
+        normalize(a.model || a.name || a.id).localeCompare(normalize(b.model || b.name || b.id))
+      )
   }, [assetModels, selectedMake])
 
   React.useEffect(() => {
@@ -511,94 +689,132 @@ export default function GameDatabasePage(): JSX.Element {
       return userTrucks.filter((u) => sameText(u.master_truck_id, selectedAsset.id)).length
     }
 
-    return userTrailers.filter((u) => {
-      const modelId = normalize(u.trailer_model_id || u.master_trailer_id)
-      return sameText(modelId, selectedAsset.id)
-    }).length
+    return userTrailers.filter((u) => sameText(u.master_trailer_id, selectedAsset.id)).length
   }, [selectedAsset, assetKind, userTrucks, userTrailers])
 
-  const topCompaniesForAsset = React.useMemo(() => {
-    if (!selectedAsset) return []
-
-    const rows =
-      assetKind === 'truck'
-        ? userTrucks.filter((u) => sameText(u.master_truck_id, selectedAsset.id))
-        : userTrailers.filter((u) =>
-            sameText(u.trailer_model_id || u.master_trailer_id, selectedAsset.id)
-          )
-
-    const byCompany = countByKey(rows, (row) => {
-      const ownerId = (row as UserTruckRow | UserTrailerRow).owner_company_id
-      const company = userCompanies.find((c) => sameText(c.id, ownerId))
-      return company?.name ?? 'Unknown company'
-    })
-
-    return topN(byCompany, 5)
-  }, [selectedAsset, assetKind, userTrucks, userTrailers, userCompanies])
-
   React.useEffect(() => {
-    if (cargoTypes.length === 0) {
-      if (selectedCargoTypeId) setSelectedCargoTypeId('')
-      return
+    async function loadAssetTopCompanies() {
+      if (!selectedAsset) {
+        setAssetTopCompanies([])
+        return
+      }
+
+      const rpc = await supabase.rpc('game_db_asset_top_owners', {
+        p_asset_kind: assetKind,
+        p_model_id: selectedAsset.id,
+        p_limit: 5,
+      })
+
+      if (!rpc.error) {
+        const rows = Array.isArray(rpc.data) ? rpc.data : []
+        setAssetTopCompanies(
+          rows.map((r: any) => ({
+            name: normalize(r.company_name) || 'Unknown company',
+            value: Number(r.units_count ?? 0),
+          }))
+        )
+        return
+      }
+
+      const fallbackRows =
+        assetKind === 'truck'
+          ? userTrucks.filter((u) => normalize(u.master_truck_id) === normalize(selectedAsset.id))
+          : userTrailers.filter(
+              (u) => normalize(u.master_trailer_id) === normalize(selectedAsset.id)
+            )
+
+      const byCompany = countByKey(fallbackRows, (r: any) => {
+        const company = userCompanies.find((c) => sameText(c.id, r.owner_company_id))
+        return company?.name ?? 'Unknown company'
+      })
+
+      setAssetTopCompanies(topN(byCompany, 5))
     }
 
-    const found = cargoTypes.some((ct) => sameText(ct.id, selectedCargoTypeId))
-    if (!found) setSelectedCargoTypeId(normalize(cargoTypes[0]?.id))
+    void loadAssetTopCompanies()
+  }, [assetKind, selectedAsset, userTrucks, userTrailers, userCompanies])
+
+  React.useEffect(() => {
+    if (!selectedCargoTypeId && cargoTypes[0]?.id) {
+      setSelectedCargoTypeId(cargoTypes[0].id)
+    }
   }, [cargoTypes, selectedCargoTypeId])
 
-  const itemsForType = React.useMemo(() => {
-    return cargoItems.filter((ci) => sameText(ci.cargo_type_id, selectedCargoTypeId))
-  }, [cargoItems, selectedCargoTypeId])
+  const itemsForType = React.useMemo(
+    () => cargoItems.filter((ci) => sameText(ci.cargo_type_id, selectedCargoTypeId)),
+    [cargoItems, selectedCargoTypeId]
+  )
 
   React.useEffect(() => {
     if (itemsForType.length === 0) {
-      if (selectedCargoItemId) setSelectedCargoItemId('')
+      setSelectedCargoItemId('')
       return
     }
 
-    const found = itemsForType.some((ci) => sameText(ci.id, selectedCargoItemId))
-    if (!found) setSelectedCargoItemId(normalize(itemsForType[0]?.id))
+    if (!itemsForType.some((i) => sameText(i.id, selectedCargoItemId))) {
+      setSelectedCargoItemId(itemsForType[0]?.id ?? '')
+    }
   }, [itemsForType, selectedCargoItemId])
 
-  const filteredJobsByRange = React.useMemo(() => {
-    const now = Date.now()
-    const rangeMs =
-      timeRange === '7d'
-        ? 7 * 24 * 60 * 60 * 1000
-        : 30 * 24 * 60 * 60 * 1000
+  React.useEffect(() => {
+    async function loadCargoAnalytics() {
+      if (!selectedCargoItemId) {
+        setCargoUsageCount(0)
+        setCargoTopImport([])
+        setCargoTopExport([])
+        return
+      }
 
-    return jobOffers.filter((j) => {
-      const ts = new Date(j.created_at ?? '').getTime()
-      if (!Number.isFinite(ts)) return false
-      return now - ts <= rangeMs
-    })
-  }, [jobOffers, timeRange])
+      const days = timeRange === '7d' ? 7 : 30
 
-  const usageForSelectedItem = React.useMemo(() => {
-    if (!selectedCargoItemId) return 0
+      const rpc = await supabase.rpc('game_db_cargo_item_analytics', {
+        p_cargo_item_id: selectedCargoItemId,
+        p_days: days,
+        p_limit: 5,
+      })
 
-    return filteredJobsByRange.filter((j) => sameText(j.cargo_item_id, selectedCargoItemId)).length
-  }, [filteredJobsByRange, selectedCargoItemId])
+      if (!rpc.error) {
+        const rows = Array.isArray(rpc.data) ? rpc.data : []
+        setCargoUsageCount(
+          Number(rows[0]?.usage_count ?? rows.reduce((sum: number, r: any) => sum + Number(r.jobs_count ?? 0), 0))
+        )
+        setCargoTopImport(
+          rows
+            .filter((r: any) => r.direction === 'import')
+            .map((r: any) => ({
+              name: normalize(r.city_name) || 'Unknown',
+              value: Number(r.jobs_count ?? 0),
+            }))
+        )
+        setCargoTopExport(
+          rows
+            .filter((r: any) => r.direction === 'export')
+            .map((r: any) => ({
+              name: normalize(r.city_name) || 'Unknown',
+              value: Number(r.jobs_count ?? 0),
+            }))
+        )
+        return
+      }
 
-  const topImportCitiesForItem = React.useMemo(() => {
-    return topN(
-      countByKey(
-        filteredJobsByRange.filter((j) => sameText(j.cargo_item_id, selectedCargoItemId)),
-        (j) => normalize(j.destination_city)
-      ),
-      5
-    )
-  }, [filteredJobsByRange, selectedCargoItemId])
+      const now = Date.now()
+      const rangeMs = days * 24 * 60 * 60 * 1000
 
-  const topExportCitiesForItem = React.useMemo(() => {
-    return topN(
-      countByKey(
-        filteredJobsByRange.filter((j) => sameText(j.cargo_item_id, selectedCargoItemId)),
-        (j) => normalize(j.origin_city)
-      ),
-      5
-    )
-  }, [filteredJobsByRange, selectedCargoItemId])
+      const filtered = cargoJobs.filter((j) => {
+        const ts = new Date(j.created_at ?? '').getTime()
+        return Number.isFinite(ts) && now - ts <= rangeMs && sameText(j.cargo_item_id, selectedCargoItemId)
+      })
+
+      setCargoUsageCount(filtered.length)
+      setCargoTopImport(topN(countByKey(filtered, (j) => normalize(j.destination_city_name)), 5))
+      setCargoTopExport(topN(countByKey(filtered, (j) => normalize(j.origin_city_name)), 5))
+    }
+
+    void loadCargoAnalytics()
+  }, [selectedCargoItemId, timeRange, cargoJobs])
+
+  const currentTabLoading = loading[activeTab]
+  const currentTabError = error[activeTab]
 
   return (
     <Layout fullWidth>
@@ -632,19 +848,19 @@ export default function GameDatabasePage(): JSX.Element {
           </div>
 
           <div className="p-4 sm:p-5">
-            {loading && (
+            {currentTabLoading && (
               <div className="rounded border border-black/10 bg-black/[0.02] px-4 py-3 text-sm text-black/70">
-                Loading database explorer data...
+                Loading {activeTab} data...
               </div>
             )}
 
-            {!loading && error && (
+            {!currentTabLoading && currentTabError && (
               <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                {error}
+                {currentTabError}
               </div>
             )}
 
-            {!loading && !error && activeTab === 'geography' && (
+            {!currentTabLoading && !currentTabError && activeTab === 'geography' && (
               <div className="space-y-5">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <select
@@ -718,7 +934,7 @@ export default function GameDatabasePage(): JSX.Element {
                       Top import demand ({selectedCity || '—'})
                     </h3>
                     <ResponsiveContainer width="100%" height="88%">
-                      <BarChart data={cityImportExport.importTop}>
+                      <BarChart data={cityDemand.importTop}>
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="name" hide />
                         <YAxis allowDecimals={false} />
@@ -733,7 +949,7 @@ export default function GameDatabasePage(): JSX.Element {
                       Top export demand ({selectedCity || '—'})
                     </h3>
                     <ResponsiveContainer width="100%" height="88%">
-                      <BarChart data={cityImportExport.exportTop}>
+                      <BarChart data={cityDemand.exportTop}>
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="name" hide />
                         <YAxis allowDecimals={false} />
@@ -746,7 +962,7 @@ export default function GameDatabasePage(): JSX.Element {
               </div>
             )}
 
-            {!loading && !error && activeTab === 'assets' && (
+            {!currentTabLoading && !currentTabError && activeTab === 'assets' && (
               <div className="space-y-4">
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                   <select
@@ -793,8 +1009,8 @@ export default function GameDatabasePage(): JSX.Element {
                   ) : (
                     <div className="space-y-2">
                       <div className="font-semibold text-base">
-                        {normalize(selectedAsset.make)}{' '}
-                        {normalize(selectedAsset.model || selectedAsset.name)}
+                        {normalize(selectedAsset.make || selectedAsset.producer || selectedAsset.brand)}{' '}
+                        {normalize(selectedAsset.model || selectedAsset.name || selectedAsset.id)}
                       </div>
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -806,9 +1022,7 @@ export default function GameDatabasePage(): JSX.Element {
                               className="rounded border border-black/10 px-2 py-1 bg-black/[0.02]"
                             >
                               <span className="text-black/60">{k}: </span>
-                              <span>
-                                {typeof v === 'object' ? JSON.stringify(v) : String(v)}
-                              </span>
+                              <span>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
                             </div>
                           ))}
                       </div>
@@ -851,7 +1065,7 @@ export default function GameDatabasePage(): JSX.Element {
                       Top 5 companies by selected {assetKind}
                     </h3>
                     <ResponsiveContainer width="100%" height="88%">
-                      <BarChart data={topCompaniesForAsset}>
+                      <BarChart data={assetTopCompanies}>
                         <CartesianGrid strokeDasharray="3 3" />
                         <XAxis dataKey="name" hide />
                         <YAxis allowDecimals={false} />
@@ -864,7 +1078,7 @@ export default function GameDatabasePage(): JSX.Element {
               </div>
             )}
 
-            {!loading && !error && activeTab === 'cargo' && (
+            {!currentTabLoading && !currentTabError && activeTab === 'cargo' && (
               <div className="space-y-4">
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
                   <select
@@ -918,13 +1132,13 @@ export default function GameDatabasePage(): JSX.Element {
 
                 <div className="rounded border border-black/10 p-3 text-sm">
                   Usage in job offers ({timeRange}):{' '}
-                  <span className="font-semibold">{usageForSelectedItem}</span>
+                  <span className="font-semibold">{cargoUsageCount}</span>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                   {[
-                    { title: 'Top 5 import cities', data: topImportCitiesForItem },
-                    { title: 'Top 5 export cities', data: topExportCitiesForItem },
+                    { title: 'Top 5 import cities', data: cargoTopImport },
+                    { title: 'Top 5 export cities', data: cargoTopExport },
                   ].map((block, idx) => (
                     <div key={block.title} className="rounded border border-black/10 p-3 h-72">
                       <h3 className="text-sm font-semibold mb-1">{block.title}</h3>

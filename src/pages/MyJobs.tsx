@@ -5,7 +5,7 @@
  * - Uses accepted_jobs as the source of truth for My Jobs
  * - Uses job_assignments + job_run_executions only as supporting runtime detail
  * - Adds History button + popup (last 30 days via backend history_visible_until rule)
- * - Uses cancel_accepted_job RPC for pre-runtime cancellation
+ * - Cancel path avoids cancel_accepted_job because some DBs fail on missing sync_job_market_visibility()
  *
  * Page mapping:
  * - Waiting  -> accepted_jobs.status in ('accepted', 'assigned')
@@ -82,11 +82,6 @@ function pickLogo(obj: any): string | null {
   return obj.logo ?? obj.logo_url ?? obj.image_url ?? obj.icon_url ?? null
 }
 
-function displayName(obj: any): string | null {
-  if (!obj) return null
-  return obj.name ?? obj.full_name ?? obj.display_name ?? obj.username ?? obj.title ?? null
-}
-
 function formatDateTime(value?: string | null): string {
   if (!value) return '—'
   const d = new Date(value)
@@ -131,7 +126,7 @@ function statusPillClasses(status?: string | null): string {
 }
 
 function bestAssignmentTimestamp(row: any): number {
-  const candidates = [row?.delivered_at, row?.started_at, row?.assigned_at, row?.accepted_at]
+  const candidates = [row?.delivered_at, row?.started_at, row?.assigned_at]
     .map((v) => (v ? Date.parse(String(v)) : Number.NaN))
     .filter((v) => Number.isFinite(v)) as number[]
 
@@ -494,44 +489,26 @@ export default function MyJobs(): JSX.Element {
         const collectedAssignmentRows: any[] = []
 
         if (assignmentIds.length > 0) {
-          const { data: jaWithCoDriver, error: jaWithCoDriverErr } = await supabase
+          const { data: jaRaw, error: jaErr } = await supabase
             .from('job_assignments')
             .select(assignmentSelect)
             .in('id', assignmentIds)
 
-          if (!jaWithCoDriverErr && Array.isArray(jaWithCoDriver)) {
-            collectedAssignmentRows.push(...jaWithCoDriver)
-          } else {
-            const { data: jaRaw, error: jaErr } = await supabase
-              .from('job_assignments')
-              .select(assignmentSelect)
-              .in('id', assignmentIds)
-
-            if (!jaErr && Array.isArray(jaRaw)) {
-              collectedAssignmentRows.push(...jaRaw)
-            }
+          if (!jaErr && Array.isArray(jaRaw)) {
+            collectedAssignmentRows.push(...jaRaw)
           }
         }
 
         // fallback: for history rows where current_job_assignment_id is null,
         // try to resolve the latest assignment by accepted_job_id
         if (acceptedJobIds.length > 0) {
-          const { data: jaByAcceptedWithCoDriver, error: jaByAcceptedWithCoDriverErr } = await supabase
+          const { data: jaByAcceptedRaw, error: jaByAcceptedErr } = await supabase
             .from('job_assignments')
             .select(assignmentSelect)
             .in('accepted_job_id', acceptedJobIds)
 
-          if (!jaByAcceptedWithCoDriverErr && Array.isArray(jaByAcceptedWithCoDriver)) {
-            collectedAssignmentRows.push(...jaByAcceptedWithCoDriver)
-          } else {
-            const { data: jaByAcceptedRaw, error: jaByAcceptedErr } = await supabase
-              .from('job_assignments')
-              .select(assignmentSelect)
-              .in('accepted_job_id', acceptedJobIds)
-
-            if (!jaByAcceptedErr && Array.isArray(jaByAcceptedRaw)) {
-              collectedAssignmentRows.push(...jaByAcceptedRaw)
-            }
+          if (!jaByAcceptedErr && Array.isArray(jaByAcceptedRaw)) {
+            collectedAssignmentRows.push(...jaByAcceptedRaw)
           }
         }
 
@@ -589,33 +566,13 @@ export default function MyJobs(): JSX.Element {
 
         const computedStatus = runtime?.state ?? row.status ?? null
 
-        const truckObj = assignment?.truck ?? null
-        const trailerObj = assignment?.trailer ?? null
-        const driverObj = assignment?.driver ?? null
-        const coDriverObj = assignment?.co_driver ?? null
+        const truckName = assignment?.truck_id ? `Truck #${assignment.truck_id}` : '-'
+        const trailerName = assignment?.trailer_id ? `Trailer #${assignment.trailer_id}` : '-'
 
-        const truckName =
-          displayName(truckObj) ??
-          (truckObj?.plate_number ? String(truckObj.plate_number) : null) ??
-          (assignment?.truck_id ? `Truck #${assignment.truck_id}` : null) ??
-          '-'
-
-        const trailerName =
-          displayName(trailerObj) ??
-          (assignment?.trailer_id ? `Trailer #${assignment.trailer_id}` : null) ??
-          '-'
-
-        const driverName =
-          displayName(driverObj) ??
-          (assignment?.driver_id ? `Driver #${assignment.driver_id}` : null) ??
-          null
-
-        const coDriverName =
-          displayName(coDriverObj) ??
-          (assignment?.co_driver_id ? `Driver #${assignment.co_driver_id}` : null) ??
-          null
-
-        const driverNames = [driverName, coDriverName].filter(Boolean) as string[]
+        const driverNames = [
+          assignment?.driver_id ? `Driver #${assignment.driver_id}` : null,
+          assignment?.co_driver_id ? `Driver #${assignment.co_driver_id}` : null,
+        ].filter(Boolean) as string[]
 
         return {
           // JobCard base
@@ -733,6 +690,22 @@ export default function MyJobs(): JSX.Element {
     setCancelOpen(true)
     setCancelPenalty(null)
 
+    const acceptedAt = job.accepted_at_raw ? Date.parse(String(job.accepted_at_raw)) : Number.NaN
+    const assignedAt = job.assigned_at_raw ? Date.parse(String(job.assigned_at_raw)) : Number.NaN
+    const deliveryDeadline = job.delivery_deadline ? Date.parse(String(job.delivery_deadline)) : Number.NaN
+
+    const rewardCandidates = [job.final_reward, job.reward_load_cargo, job.reward_trailer_cargo]
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v) && v > 0)
+
+    const reward = rewardCandidates.length > 0 ? rewardCandidates[0] : 0
+
+    const nowMs = Date.now()
+    const hardDeadlinePenalty =
+      Number.isFinite(deliveryDeadline) && nowMs > deliveryDeadline
+        ? Math.round(reward * 1.2 * 100) / 100
+        : null
+
     const assignmentId = job.current_job_assignment_id
     if (assignmentId) {
       const { data, error } = await supabase.rpc('get_assignment_cancellation_penalty', {
@@ -740,34 +713,40 @@ export default function MyJobs(): JSX.Element {
       })
 
       if (!error && typeof data === 'number') {
+        if (hardDeadlinePenalty !== null) {
+          setCancelPenalty(Math.max(data, hardDeadlinePenalty))
+          return
+        }
+
         setCancelPenalty(data)
         return
       }
     }
 
-    const acceptedAt = job.accepted_at_raw ? Date.parse(String(job.accepted_at_raw)) : null
-    const deliveryDeadline = job.delivery_deadline ? Date.parse(String(job.delivery_deadline)) : null
-    const reward = Number(job.final_reward ?? job.reward_load_cargo ?? job.reward_trailer_cargo ?? 0)
+    const baselineTs = Number.isFinite(acceptedAt)
+      ? acceptedAt
+      : Number.isFinite(assignedAt)
+        ? assignedAt
+        : null
 
-    if (!acceptedAt) {
+    if (Number.isFinite(deliveryDeadline) && nowMs > deliveryDeadline) {
+      setCancelPenalty(Math.round(reward * 1.2 * 100) / 100)
+      return
+    }
+
+    if (!baselineTs) {
       setCancelPenalty(null)
       return
     }
 
-    const nowMs = Date.now()
-    const freeLimit = acceptedAt + 12 * 60 * 60 * 1000
+    const freeLimit = baselineTs + 12 * 60 * 60 * 1000
 
     if (nowMs <= freeLimit) {
       setCancelPenalty(0)
       return
     }
 
-    if (deliveryDeadline && nowMs > deliveryDeadline) {
-      setCancelPenalty(Math.round(reward * 1.2 * 100) / 100)
-      return
-    }
-
-    if (!deliveryDeadline || deliveryDeadline <= freeLimit) {
+    if (!Number.isFinite(deliveryDeadline) || deliveryDeadline <= freeLimit) {
       setCancelPenalty(Math.round(reward * 100) / 100)
       return
     }
@@ -813,30 +792,80 @@ export default function MyJobs(): JSX.Element {
         assignmentId = latestAssignment?.id ? String(latestAssignment.id) : null
       }
 
-      const { error: rpcErr } = await supabase.rpc('cancel_accepted_job', {
-        p_accepted_job_id: acceptedJobId,
-        p_user_id: appUserId,
-        p_cancel_reason: 'cancelled_from_my_jobs',
-      })
+      const cancelReason = 'cancelled_from_my_jobs'
+      const nowIso = new Date().toISOString()
+      const deadlineTs = cancelJob.delivery_deadline
+        ? Date.parse(String(cancelJob.delivery_deadline))
+        : Number.NaN
+      const deadlinePassed = Number.isFinite(deadlineTs) ? Date.now() > deadlineTs : false
 
-      if (rpcErr) {
-        if (!assignmentId) {
-          throw new Error(rpcErr.message ?? 'Failed to cancel job')
-        }
+      let cancelled = false
 
+      // NOTE: we intentionally do not call `cancel_accepted_job` because that DB
+      // function depends on `sync_job_market_visibility()` which is missing in
+      // the target environment and causes hard failures.
+      if (assignmentId) {
         const { error: assignmentCancelErr } = await supabase.rpc('cancel_assignment', {
           p_assignment_id: assignmentId,
         })
 
-        if (assignmentCancelErr) {
-          throw new Error(assignmentCancelErr.message ?? rpcErr.message ?? 'Failed to cancel job')
+        if (!assignmentCancelErr) {
+          cancelled = true
         }
+      }
+
+      if (!cancelled) {
+        if (assignmentId) {
+          await supabase
+            .from('job_assignments')
+            .update({
+              status: 'cancelled',
+              cancelled_at: nowIso,
+            })
+            .eq('id', assignmentId)
+        }
+
+        const { error: acceptedUpdateErr } = await supabase
+          .from('accepted_jobs')
+          .update({
+            status: 'cancelled',
+            cancel_reason: cancelReason,
+            current_job_assignment_id: null,
+            ended_at: nowIso,
+          })
+          .eq('id', acceptedJobId)
+          .eq('user_id', appUserId)
+
+        if (acceptedUpdateErr) {
+          throw new Error(acceptedUpdateErr.message ?? 'Failed to cancel job')
+        }
+
+        if (cancelJob.id && !deadlinePassed) {
+          await supabase
+            .from('job_offers')
+            .update({
+              status: 'open',
+              published: true,
+              user_id: null,
+              user_truck_id: null,
+              assigned_user_truck_id: null,
+              accepted_at: null,
+            })
+            .eq('id', String(cancelJob.id))
+        }
+
+        cancelled = true
+      }
+
+      if (!cancelled) {
+        throw new Error('Failed to cancel job')
       }
 
       if (cancelJob.id) {
         unhideJobInMarket(String(cancelJob.id))
       }
 
+      setError(null)
       setSuccessMessage(
         `Cancelled: ${cancelJob.origin_city_name ?? '—'} → ${cancelJob.destination_city_name ?? '—'}`
       )
